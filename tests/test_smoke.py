@@ -457,6 +457,9 @@ async def test_script_library_roundtrip():
 
 
 DESIGN = {
+    "version": 1,
+    "metadata": {"name": "Test project"},
+    "bot": {"username": "TestBot", "avatarUrl": ""},
     "tree": [
         {
             "type": 17,  # Container
@@ -545,10 +548,43 @@ async def test_library_test_suite_runs_isolated_scripts():
             server.SCRIPTS_DIR = original
 
 
+async def test_project_state_validation_and_roundtrip():
+    import bridge
+    from project_state import validate_project
+
+    assert validate_project(DESIGN) is DESIGN
+    code = bridge.design_to_code(DESIGN)
+    s = Session("t-project-state")
+    await run_script(s, code)
+    assert last_msg(s)["v2"][0]["v2"] == "container"
+    for invalid, message in [
+        ({"tree": []}, "version"),
+        ({"version": 1, "tree": [{"type": 999}]}, "supported"),
+        ({"version": 1, "tree": [{"type": 17, "components": "bad"}]}, "array"),
+    ]:
+        try:
+            validate_project(invalid)
+        except (TypeError, ValueError) as error:
+            assert message in str(error)
+        else:
+            raise AssertionError("invalid project was accepted")
+
+
+async def test_bridge_route_validates_before_generation():
+    import json
+
+    import main as server
+
+    response = await server.bridge_design_to_code(_FakeReq(body={"design": DESIGN}))
+    assert json.loads(response.body)["ok"] is True
+    response = await server.bridge_design_to_code(_FakeReq(body={"design": {"version": 1, "tree": []}}))
+    assert response.status == 400
+
+
 async def test_bridge_design_to_code():
     import bridge
 
-    code = bridge.design_to_code(DESIGN["tree"])
+    code = bridge.design_to_code(DESIGN)
     assert "ui.LayoutView(timeout=None)" in code
     assert "ui.Container(" in code and "accent_colour=0x5865f2," in code
     assert 'ui.Section(' in code and 'accessory=ui.Thumbnail("https://x/y.png")' in code
@@ -565,7 +601,7 @@ async def test_design_message_roundtrip():
     import bridge
 
     s = Session("t-v2")
-    await run_script(s, bridge.design_to_code(DESIGN["tree"]))
+    await run_script(s, bridge.design_to_code(DESIGN))
     msg = last_msg(s)
     assert msg["components"] is None  # classic path not used
     v2 = msg["v2"]
@@ -583,7 +619,7 @@ async def test_v2_clickable_components_reach_handler():
     """Buttons/selects nested in a LayoutView must dispatch on_click like classic ones."""
     import bridge
 
-    script = bridge.design_to_code(DESIGN["tree"]) + """
+    script = bridge.design_to_code(DESIGN) + """
 
 async def on_click(interaction, custom_id, values):
     await interaction.response.send_message(f"got {custom_id}: {values}", ephemeral=True)
@@ -633,9 +669,11 @@ async def test_v2_max_component_stress_roundtrip():
          "options": [{"label": str(i), "value": str(i)} for i in range(25)]},
         {"type": 12, "items": [{"media": {"url": "https://example.com/gallery.png"}}]},
         {"type": 14, "divider": True, "spacing": 2}]
-    script = bridge.design_to_code([
-        {"type": 17, "components": children}, {"type": 17, "components": smaller}
-    ]) + """
+    script = bridge.design_to_code({
+        "version": 1, "tree": [
+            {"type": 17, "components": children}, {"type": 17, "components": smaller}
+        ]
+    }) + """
 
 async def on_click(interaction, custom_id, values):
     await interaction.response.send_message(f"got {custom_id}: {values}")
