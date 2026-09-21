@@ -4,3 +4,4 @@ line-length = 100
 [lint.per-file-ignores]
 # `send`, `client`, `print` are injected into the script namespace at runtime.
 "scripts/*.py" = ["F821"]
+"bots/**/*.py" = ["F821"]

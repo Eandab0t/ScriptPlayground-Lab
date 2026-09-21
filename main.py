@@ -35,6 +35,7 @@ from playground import (
 log = logging.getLogger("playground")
 STATIC_DIR = Path(__file__).parent / "static"
 SCRIPTS_DIR = Path(__file__).parent / "scripts"
+WORKSPACES_DIR = Path(__file__).parent / "bots"
 EMBEDER_DIR = Path(__file__).parent / "embeder"
 _DESIGNS_SUBDIR = "designs"
 _MAIN_SCRIPT = "demo"
@@ -94,6 +95,45 @@ async def create_session(_request: web.Request) -> web.Response:
 
 
 _HIDDEN_SCRIPTS = {"vendor_embeder"}  # internal tooling, not runnable demos
+
+
+async def list_workspaces(_request: web.Request) -> web.Response:
+    WORKSPACES_DIR.mkdir(exist_ok=True)
+    workspaces = []
+    for folder in sorted(WORKSPACES_DIR.iterdir()):
+        if not folder.is_dir() or folder.name.startswith("."):
+            continue
+        files = [str(path.relative_to(folder)).replace("\\", "/")
+                 for path in folder.rglob("*.py") if path.is_file()]
+        workspaces.append({"name": folder.name, "files": sorted(files)})
+    return web.json_response({"workspaces": workspaces})
+
+
+def _workspace_file(workspace: str, filename: str = "bot.py") -> Path:
+    if not _SAFE_NAME.match(workspace) or Path(filename).name != filename:
+        raise web.HTTPBadRequest(text="invalid workspace file")
+    path = WORKSPACES_DIR / workspace / filename
+    if path.suffix != ".py":
+        raise web.HTTPBadRequest(text="only Python files are supported")
+    return path
+
+
+async def get_workspace_file(request: web.Request) -> web.Response:
+    path = _workspace_file(request.match_info["workspace"], request.match_info["filename"])
+    if not path.is_file():
+        raise web.HTTPNotFound(text="workspace file not found")
+    return web.json_response({"name": path.name, "code": path.read_text(encoding="utf-8")})
+
+
+async def save_workspace_file(request: web.Request) -> web.Response:
+    path = _workspace_file(request.match_info["workspace"], request.match_info["filename"])
+    body = await request.json()
+    code = body.get("code") or ""
+    if not code.strip():
+        return web.json_response({"ok": False, "error": "Refusing to save empty code."}, status=400)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(code, encoding="utf-8")
+    return web.json_response({"ok": True, "name": path.name})
 
 
 async def list_scripts(_request: web.Request) -> web.Response:
@@ -310,6 +350,9 @@ def build_app() -> web.Application:
     app.on_startup.append(on_startup)
     app.router.add_get("/", index)
     app.router.add_get("/embeder", embeder_page)
+    app.router.add_get("/api/workspaces", list_workspaces)
+    app.router.add_get("/api/workspaces/{workspace}/files/{filename}", get_workspace_file)
+    app.router.add_put("/api/workspaces/{workspace}/files/{filename}", save_workspace_file)
     app.router.add_get("/api/scripts", list_scripts)
     app.router.add_get("/api/scripts/{name}", get_script)
     app.router.add_post("/api/scripts/test", test_scripts)

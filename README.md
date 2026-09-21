@@ -54,6 +54,18 @@ python scripts/vendor_embeder.py   # copies dist + injects the bridge button
 - The builder's webhook test-send is untouched — it still POSTs straight from
   the browser to whatever webhook you paste.
 
+## Folder workspaces and visual blocks
+
+Put a bot folder under `bots/<name>/bot.py`, then choose it in **Bot folder → 📂 Connect**.
+The existing editor runs the connected file against the same offline Discord mock; **Save** writes
+back to that folder. **🧱 Blocks** is a dependency-free starter canvas for message text,
+embed title/description/color, and one button. **Apply to code** generates ordinary discord.py
+that can be edited further, run, and previewed in the chat.
+
+This is intentionally a small bridge, not a full VS Code clone. Blockly is the natural next
+step if the block language grows: its official workflow serializes workspace JSON and generates
+code. Monaco is the natural code-editor upgrade if multi-file IntelliSense becomes necessary.
+
 ## Script library
 
 The bar above the editor is a small local library backed by the `scripts/`

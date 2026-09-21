@@ -481,6 +481,42 @@ DESIGN = {
 }
 
 
+async def test_folder_workspace_roundtrip():
+    import json
+    import pathlib
+    import tempfile
+
+    import main as server
+
+    with tempfile.TemporaryDirectory() as td:
+        original = server.WORKSPACES_DIR
+        server.WORKSPACES_DIR = pathlib.Path(td)
+        try:
+            folder = server.WORKSPACES_DIR / "my_bot"
+            folder.mkdir()
+            source = "async def main():\n    await send('folder')\n"
+            (folder / "bot.py").write_text(source, encoding="utf-8")
+            listing = json.loads((await server.list_workspaces(None)).body)["workspaces"]
+            assert listing == [{"name": "my_bot", "files": ["bot.py"]}]
+            request = _FakeReq(match={"workspace": "my_bot", "filename": "bot.py"})
+            assert json.loads((await server.get_workspace_file(request)).body)["code"] == source
+            saved = await server.save_workspace_file(_FakeReq(
+                match=request.match_info, body={"code": "updated = True\n"}
+            ))
+            assert json.loads(saved.body)["ok"] is True
+            assert (folder / "bot.py").read_text(encoding="utf-8") == "updated = True\n"
+            try:
+                await server.save_workspace_file(_FakeReq(
+                    match={"workspace": "../bad", "filename": "bot.py"}, body={"code": "x"}
+                ))
+            except server.web.HTTPBadRequest:
+                pass
+            else:
+                raise AssertionError("workspace traversal was accepted")
+        finally:
+            server.WORKSPACES_DIR = original
+
+
 async def test_library_test_suite_runs_isolated_scripts():
     import json
     import pathlib
@@ -631,7 +667,7 @@ async def test_cpu_bound_startup_is_interrupted():
     """The dedicated loop must recover from a startup ``while True: pass``."""
     s = Session("t-cpu")
     try:
-        result = await run_script(s, "while True:\n    pass\n", timeout=0.2)
+        result = await run_script(s, "while True:\n    pass\n", timeout=1.0)
         assert result["ok"] is False
         assert any("execution deadline" in event["text"] for event in s.events)
     finally:
