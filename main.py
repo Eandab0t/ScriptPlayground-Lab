@@ -31,6 +31,7 @@ from playground import (
     run_script,
     state,
 )
+from project_state import validate_project
 
 log = logging.getLogger("playground")
 STATIC_DIR = Path(__file__).parent / "static"
@@ -221,21 +222,18 @@ async def embeder_page(request: web.Request) -> web.FileResponse:
 
 
 async def bridge_design_to_code(request: web.Request) -> web.Response:
-    """Builder design (ProjectSession) -> runnable discord.py code.
-
-    `save` optionally stores the design under designs/ (the bridge button does).
-    """
     body = await request.json()
     design = body.get("design")
-    tree = design.get("tree") if isinstance(design, dict) else None
-    if not isinstance(tree, list):
-        return web.json_response({"ok": False, "error": "design.tree must be an array"}, status=400)
+    try:
+        code = bridge.design_to_code(design)
+    except (TypeError, ValueError) as error:
+        return web.json_response({"ok": False, "error": str(error)}, status=400)
     save_name = (body.get("save") or "").strip()
     if save_name:
         if not _SAFE_NAME.match(save_name):
             return web.json_response({"ok": False, "error": "invalid save name"}, status=400)
         _design_path(save_name).write_text(json.dumps(design, indent=2), encoding="utf-8")
-    return web.json_response({"ok": True, "code": bridge.design_to_code(tree)})
+    return web.json_response({"ok": True, "code": code})
 
 
 async def list_designs(_request: web.Request) -> web.Response:
@@ -243,12 +241,12 @@ async def list_designs(_request: web.Request) -> web.Response:
     designs = []
     for f in sorted(d.glob("*.discordv2proj.json")):
         try:
-            data = json.loads(f.read_text(encoding="utf-8"))
+            data = validate_project(json.loads(f.read_text(encoding="utf-8")))
             meta = data.get("metadata") or {}
             name = f.name.removesuffix(".discordv2proj.json")
             designs.append({"name": name, "project": (meta.get("name") or name),
                             "updatedAt": meta.get("updatedAt") or ""})
-        except (OSError, ValueError):
+        except (OSError, TypeError, ValueError):
             continue
     return web.json_response({"designs": designs})
 
@@ -257,7 +255,11 @@ async def get_design(request: web.Request) -> web.Response:
     path = _design_path(request.match_info["name"])
     if not path.exists():
         raise web.HTTPNotFound(text="no such design")
-    return web.Response(body=path.read_text(encoding="utf-8"), content_type="application/json")
+    try:
+        design = validate_project(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, TypeError, ValueError) as error:
+        raise web.HTTPBadRequest(text=f"invalid project: {error}") from error
+    return web.json_response(design)
 
 
 async def get_state(request: web.Request) -> web.Response:
