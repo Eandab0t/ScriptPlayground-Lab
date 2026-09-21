@@ -168,6 +168,21 @@
   .lib-btn.link-btn { color: var(--link); border-color: #1e3a5c; }
   .lib-btn.link-btn:hover { background: rgba(0,168,252,.08); }
 
+  /* ---------- workspace + block editor ---------- */
+  #workspace-bar { display: flex; gap: 6px; align-items: center; padding: 7px 14px; border-bottom: 1px solid var(--border); }
+  #workspace-bar label { color: var(--txt-dim); font-size: 11px; font-weight: 700; text-transform: uppercase; }
+  #workspace-select { flex: 1; min-width: 0; background: var(--bg0); color: var(--txt); border: 1px solid #232428; border-radius: 6px; padding: 5px; }
+  #block-panel { display: none; position: absolute; inset: 84px 14px 14px; z-index: 4; background: var(--bg1); border: 1px solid var(--border); border-radius: 8px; padding: 12px; overflow: auto; box-shadow: 0 8px 30px rgba(0,0,0,.45); }
+  #block-panel.open { display: block; }
+  #editor-pane { position: relative; }
+  .block { border-left: 5px solid var(--blurple); background: var(--bg3); border-radius: 6px; padding: 8px; margin: 8px 0; }
+  .block.embed-block { border-left-color: var(--orange); }
+  .block.button-block { border-left-color: var(--green); }
+  .block label { display: block; color: var(--txt-dim); font-size: 11px; font-weight: 700; margin-bottom: 3px; }
+  .block input { width: 100%; background: var(--bg0); color: var(--txt); border: 1px solid var(--border); border-radius: 4px; padding: 6px; margin-bottom: 6px; }
+  .block-title { color: var(--txt-head); font-weight: 700; margin-bottom: 6px; }
+  #block-preview { background: var(--bg0); border: 1px solid var(--border); padding: 8px; border-radius: 6px; margin: 8px 0; }
+
   /* ---------- editor pane ---------- */
   #editor-pane { background: var(--bg1); border-left: 1px solid var(--border); display: flex; flex-direction: column; min-width: 0; }
   #editor-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px;
@@ -255,6 +270,12 @@
   </main>
 
   <aside id="editor-pane">
+    <div id="workspace-bar">
+      <label for="workspace-select">Bot folder</label>
+      <select id="workspace-select"><option value="">connect a folder…</option></select>
+      <button id="btn-connect" class="lib-btn" title="Load a bot folder from bots/">📂 Connect</button>
+      <button id="btn-blocks" class="lib-btn" title="Edit a message visually with blocks">🧱 Blocks</button>
+    </div>
     <div id="script-lib">
       <label for="script-select">Scripts</label>
       <select id="script-select"><option>loading…</option></select>
@@ -262,6 +283,21 @@
       <button id="btn-delete" class="lib-btn" title="Delete the loaded script from the library">🗑</button>
       <button id="btn-suite" class="lib-btn" title="Run every saved script in isolated mock sessions">🧪 Test</button>
       <button id="btn-design" class="lib-btn link-btn" title="Import a saved Components V2 design into the editor">✦ Design</button>
+    </div>
+    <div id="block-panel" aria-label="Visual block editor">
+      <div class="block-title">🧱 Live message blocks</div>
+      <div class="block">Send message <input id="block-content" placeholder="Message text"></div>
+      <div class="block embed-block">Embed
+        <label for="block-title">Title</label><input id="block-title" placeholder="Embed title">
+        <label for="block-description">Description</label><input id="block-description" placeholder="Embed description">
+        <label for="block-color">Color</label><input id="block-color" value="#5865F2" placeholder="#5865F2">
+      </div>
+      <div class="block button-block">Button
+        <label for="block-label">Label</label><input id="block-label" value="Click me">
+        <label for="block-id">Custom ID</label><input id="block-id" value="click_me">
+      </div>
+      <div id="block-preview">Preview will update as you type.</div>
+      <button id="btn-apply-blocks" class="lib-btn">Apply to code</button>
     </div>
     <div id="editor-head">
       <span>bot.py</span>
@@ -312,6 +348,7 @@ async function boot() {
   connectWS();
   render(data.state);
   loadLibrary();
+  loadWorkspaces();
 }
 function startPolling() {
   if (!pollTimer) pollTimer = setInterval(refresh, 2000);
@@ -986,6 +1023,65 @@ document.addEventListener("keydown", (e) => {
 });
 
 /* editor */
+let activeWorkspace = null;
+
+async function loadWorkspaces() {
+  const res = await fetch("/api/workspaces");
+  const items = (await res.json()).workspaces;
+  const select = $("#workspace-select");
+  select.innerHTML = '<option value="">connect a folder…</option>';
+  for (const item of items) select.appendChild(new Option(`${item.name} (${item.files.length} files)`, item.name));
+}
+
+$("#btn-connect").onclick = async () => {
+  const name = $("#workspace-select").value;
+  if (!name) { pgAlert("Choose a bot folder first."); return; }
+  const res = await fetch(`/api/workspaces/${encodeURIComponent(name)}/files/bot.py`);
+  if (!res.ok) { pgAlert("That folder has no bot.py yet."); return; }
+  const data = await res.json();
+  activeWorkspace = name;
+  loadedScript = null;
+  $("#code").value = data.code;
+  $("#run-stats").textContent = `— connected ${name}/bot.py`;
+};
+
+$("#btn-save").dataset.workspaceSave = "true";
+$("#btn-save").addEventListener("click", async (event) => {
+  if (!activeWorkspace || event.__workspaceHandled) return;
+  event.__workspaceHandled = true;
+  event.stopImmediatePropagation();
+  const res = await fetch(`/api/workspaces/${encodeURIComponent(activeWorkspace)}/files/bot.py`, {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code: $("#code").value }),
+  });
+  const data = await res.json();
+  $("#run-stats").textContent = data.ok ? `— saved ${activeWorkspace}/bot.py` : `— ${data.error}`;
+});
+
+function blockCode() {
+  const text = JSON.stringify($("#block-content").value);
+  const title = JSON.stringify($("#block-title").value);
+  const description = JSON.stringify($("#block-description").value);
+  const label = JSON.stringify($("#block-label").value);
+  const customId = JSON.stringify($("#block-id").value);
+  const rawColor = $("#block-color").value.replace("#", "");
+  const color = /^[0-9a-f]{6}$/i.test(rawColor) ? `0x${rawColor}` : "0x5865F2";
+  return `import discord\n\nasync def main():\n    embed = discord.Embed(title=${title}, description=${description}, color=${color})\n    view = discord.ui.View()\n    view.add_item(discord.ui.Button(label=${label}, custom_id=${customId}))\n    await send(content=${text}, embed=embed, view=view)\n`;
+}
+function updateBlocks() {
+  const preview = $("#block-preview");
+  preview.textContent = `${$("#block-title").value || "Untitled embed"} — ${$("#block-description").value || "No description"}`;
+}
+for (const field of document.querySelectorAll("#block-panel input")) field.addEventListener("input", updateBlocks);
+$("#btn-blocks").onclick = () => { $("#block-panel").classList.toggle("open"); updateBlocks(); };
+$("#btn-apply-blocks").onclick = () => {
+  $("#code").value = blockCode();
+  activeWorkspace = null;
+  loadedScript = null;
+  $("#block-panel").classList.remove("open");
+  $("#run-stats").textContent = "— blocks applied to editor";
+};
+
 $("#btn-run").onclick = async () => {
   const code = $("#code").value;
   localStorage.setItem("pg-code", code);
@@ -1078,7 +1174,8 @@ $("#btn-suite").onclick = async () => {
   for (const report of data.reports) {
     const line = document.createElement("div");
     line.className = "console-line" + (report.ok ? "" : " error");
-    line.textContent = `${report.ok ? "✅" : "❌"} ${report.name} — ${report.ms.toFixed(0)} ms, ${report.messages} messages`;
+    const error = report.error ? " — " + report.error.trim().split("\\n").pop() : "";
+    line.textContent = `${report.ok ? "✅" : "❌"} ${report.name} — ${report.ms.toFixed(0)} ms, ${report.messages} messages${error}`;
     consoleBody.appendChild(line);
   }
   $("#run-stats").textContent = `— ${data.reports.filter((report) => report.ok).length}/${data.reports.length} scripts passed`;
@@ -1098,15 +1195,12 @@ $("#btn-design").onclick = async () => {
   const res = await fetch("/api/designs");
   const { designs } = await res.json();
   if (!designs.length) {
-    alert("No saved designs yet. Open the Embeder (✦ button in the chat header), build a design, " +
-          "then use its 'Test in playground' button — or save the project from the builder's toolbar.");
+    pgAlert("No saved designs yet — create one in Embeder first.");
     return;
   }
-  const pick = prompt("Load design (by name):\n" + designs.map((d) => "· " + d.name).join("\n"),
-                      designs[designs.length - 1].name);
-  if (pick === null) return;
-  const get = await fetch(`/api/designs/${encodeURIComponent(pick.trim())}`);
-  if (!get.ok) { pgAlert("No such design: " + pick); return; }
+  const pick = designs[designs.length - 1].name;
+  const get = await fetch(`/api/designs/${encodeURIComponent(pick)}`);
+  if (!get.ok) { pgAlert("Could not load the latest design."); return; }
   const design = await get.json();
   const bridge = await fetch("/api/bridge/design-to-code", {
     method: "POST", headers: { "Content-Type": "application/json" },
@@ -1117,7 +1211,7 @@ $("#btn-design").onclick = async () => {
   $("#code").value = data.code;
   localStorage.setItem("pg-code", data.code);
   loadedScript = null;
-  $("#run-stats").textContent = "— design imported: " + pick.trim();
+  $("#run-stats").textContent = "— design imported: " + pick;
 };
 
 /* Receiving side of the builder's "Test in playground" button: the builder
