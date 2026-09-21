@@ -1,0 +1,94 @@
+{
+  "version": 1,
+  "metadata": {
+    "name": "Club Welcome",
+    "createdAt": "2026-09-21T00:04:45.497Z",
+    "updatedAt": "2026-09-21T00:04:45.497Z"
+  },
+  "bot": {
+    "username": "ClubBot",
+    "avatarUrl": ""
+  },
+  "tree": [
+    {
+      "type": 17,
+      "accent_color": 5793266,
+      "spoiler": false,
+      "components": [
+        {
+          "type": 10,
+          "content": "## Welcome to the club! \ud83c\udf89\nYou made it, **@You**."
+        },
+        {
+          "type": 9,
+          "components": [
+            {
+              "type": 10,
+              "content": "Pick your roles below \u2014 the buttons do the rest."
+            }
+          ],
+          "accessory": {
+            "type": 11,
+            "media": {
+              "url": "https://picsum.photos/seed/club/200"
+            }
+          }
+        },
+        {
+          "type": 1,
+          "components": [
+            {
+              "type": 2,
+              "style": 3,
+              "label": "\u2705 Accept rules",
+              "custom_id": "accept_rules"
+            },
+            {
+              "type": 2,
+              "style": 2,
+              "label": "Introduce me",
+              "custom_id": "intro"
+            }
+          ]
+        },
+        {
+          "type": 3,
+          "custom_id": "color_pick",
+          "placeholder": "Pick your color",
+          "options": [
+            {
+              "label": "Blurple",
+              "value": "blurple",
+              "emoji": {
+                "name": "\ud83d\udd35"
+              },
+              "default": true
+            },
+            {
+              "label": "Green",
+              "value": "green",
+              "emoji": {
+                "name": "\ud83d\udfe2"
+              }
+            }
+          ]
+        },
+        {
+          "type": 12,
+          "items": [
+            {
+              "media": {
+                "url": "https://picsum.photos/seed/gate/400/100"
+              }
+            }
+          ]
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 1
+        }
+      ]
+    }
+  ]
+}

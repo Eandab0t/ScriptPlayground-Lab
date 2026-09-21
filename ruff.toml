@@ -1,0 +1,6 @@
+# Ruff: default rule set, one style knob (100 columns, matching existing code).
+line-length = 100
+
+[lint.per-file-ignores]
+# `send`, `client`, `print` are injected into the script namespace at runtime.
+"scripts/*.py" = ["F821"]

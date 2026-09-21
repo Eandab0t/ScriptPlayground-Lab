@@ -1,0 +1,50 @@
+<script>
+/* ScriptPlayground bridge — injected after the upstream build; do not edit dist by hand.
+   Re-vendor: copy DiscordEmbeder's dist/index.html over embeder/index.html, then
+   append this fragment before </body> (see scripts/vendor_embeder.py). */
+(function () {
+  "use strict";
+  var AUTOSAVE_KEY = "discord-embeder:autosave:v1";
+  function design() {
+    try { return JSON.parse(localStorage.getItem(AUTOSAVE_KEY) || "null"); } catch (e) { return null; }
+  }
+  function sendToPlayground() {
+    var d = design();
+    if (!d || !Array.isArray(d.tree) || d.tree.length === 0) {
+      alert("Build something first — the canvas is empty.");
+      return;
+    }
+    var name = ((d.metadata && d.metadata.name) ? d.metadata.name : "design").trim() || "design";
+    fetch("/api/bridge/design-to-code", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ design: d, save: name }),
+    }).then(function (r) { return r.json(); }).then(function (data) {
+      if (!data.ok) { alert(data.error || "Bridge failed"); return; }
+      // Deliver via the playground's own autosave key: same-origin tabs hear the
+      // storage event, so the editor updates even if the popup never loads.
+      localStorage.setItem("pg-code", data.code);
+      var win = window.open("/", "scriptplayground");
+      if (!win) {
+        alert("Design saved as '" + name + "' and placed in the playground editor — switch to that tab.");
+      }
+    }).catch(function () {
+      alert("Bridge unreachable — open this builder through the playground server (http://127.0.0.1:8741/embeder).");
+    });
+  }
+  function mount() {
+    if (document.getElementById("pg-bridge-btn")) return;
+    var btn = document.createElement("button");
+    btn.id = "pg-bridge-btn";
+    btn.textContent = "▶ Test in playground";
+    btn.title = "Generate discord.py from this design (saved to the playground library) and run it in the mock chat";
+    btn.style.cssText = "position:fixed;bottom:14px;right:14px;z-index:9999;background:#23a559;color:#fff;" +
+      "border:none;border-radius:4px;padding:10px 16px;font:600 13px/1 'gg sans','Noto Sans','Helvetica Neue',Helvetica,Arial,sans-serif;" +
+      "cursor:pointer;box-shadow:0 6px 18px rgba(0,0,0,.4);";
+    btn.onclick = sendToPlayground;
+    document.body.appendChild(btn);
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", mount);
+  else mount();
+})();
+</script>
