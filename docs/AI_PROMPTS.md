@@ -40,6 +40,18 @@ Review only the attached diff for over-engineering. Find code that can be delete
 Then give estimated deletions and a verdict. Do not propose unrelated features or a rewrite.
 ```
 
+## Permission inspector review
+
+```text
+Review ScriptPlayground's State inspector permission summary. Trace the active-user and bot permission values from MockChannel.permission_check() through state(session) into the browser. Confirm reasons update after switching users or changing overwrites, denied results match runtime enforcement, and the UI does not implement a second permission resolver. Report only concrete discrepancies; do not expand into a permissions editor or complete Discord parity.
+```
+
+## Event and action inspector review
+
+```text
+Review ScriptPlayground's State, Events, and Actions inspector tabs. Trace Session.events from runtime operations through state(session) JSON into the browser. Confirm event/action entries remain structured, details are JSON-safe, selecting an entry shows the right details, filters refresh after Run and interactions, and no second event bus or state owner was introduced. Report only concrete UX or correctness failures; do not expand into scenarios, voice, persistence, or a frontend rewrite.
+```
+
 ## Bridge and vendored-build audit
 
 ```text

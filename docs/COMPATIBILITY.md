@@ -17,6 +17,7 @@ ScriptPlayground uses `discord.py` types where practical, but the transport is a
 | Permission failures | `discord.Forbidden` for denied sends, channel deletes, message deletes, interaction responses, and follow-ups; runtime events include the deciding resolution step. |
 | Components V2 bridge | Validated designs generate runnable `discord.py` source; bridge fixtures cover nested accessories, galleries, separators, spoiler containers, and nested controls. |
 | Embeder provenance | `GET /api/embeder/info` reports the committed marker for the vendored local build; it does not contact DiscordEmbeder at runtime. |
+| Runtime inspection | The browser State, Events, and Actions tabs read the current session state; State also shows active-user and bot permission results with resolver reasons, event/action rows can be expanded to inspect JSON-safe details, including failed attempts, and no new runtime state owner is added. |
 | Channels | In-memory text channels with normalized names and duplicate suffixes. |
 | Files | Small image files become inline data URIs; other files remain metadata chips. |
 

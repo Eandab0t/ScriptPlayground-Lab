@@ -20,6 +20,7 @@ from playground import (
     dispatch_message,
     dispatch_submit,
     run_script,
+    state,
 )
 
 DEMO = r"""
@@ -241,6 +242,55 @@ async def test_print_and_send_helpers():
     assert last_msg(s)["content"] == "via helper"
 
 
+async def test_events_and_actions_are_structured():
+    s = Session("t-inspect")
+    await run_script(s, "async def main():\n    await send('inspect me')")
+    actions = [event for event in s.events if event["kind"] == "action"]
+    assert actions and actions[-1]["details"]["operation"] == "channel.send"
+    assert actions[-1]["details"]["message_id"] == s.order[-1]
+    s.log("🧪", "test event", details={"source": "smoke"})
+    assert s.events[-1]["kind"] == "event"
+    assert s.events[-1]["details"] == {"source": "smoke"}
+    s.close()
+
+
+async def test_state_exposes_permission_inspector_data():
+    s = Session("t-permission-inspector")
+    s.set_user(111111111111111111)
+    s.channel.overwrites[s.guild.id] = discord.PermissionOverwrite(send_messages=False)
+    snapshot = state(s)
+    assert snapshot["permissions"]["user"]["send_messages"] == {
+        "allowed": False, "reason": "@everyone overwrite"
+    }
+    assert snapshot["permissions"]["bot"]["send_messages"]["allowed"] is True
+    s.close()
+
+
+async def test_inspector_records_failed_attempts_and_channel_actions():
+    s = Session("t-inspect-failures")
+    await run_script(s, "async def main():\n    pass")
+    await dispatch_command(s, "missing", {})
+    missing = s.events[-1]
+    assert missing["kind"] == "action"
+    assert missing["details"] == {"operation": "interaction.command", "command": "missing",
+                                    "arguments": {}, "status": "missing_command"}
+
+    s.set_user(111111111111111111)
+    s.active_user.permission_override = discord.Permissions(view_channel=True)
+    await dispatch_message(s, "blocked")
+    denied = s.events[-1]
+    assert denied["kind"] == "event" and denied["details"]["status"] == "denied"
+    assert denied["details"]["operation"] == "message.send"
+
+    channel = s.make_channel("temporary")
+    await channel.delete()
+    deleted = s.events[-1]
+    assert deleted["kind"] == "action"
+    assert deleted["details"]["operation"] == "channel.delete"
+    assert deleted["details"]["status"] == "ok"
+    s.close()
+
+
 async def test_error_in_main_is_captured():
     s = Session("t4")
     res = await run_script(s, "async def main():\n    raise ValueError('boom')")
@@ -258,7 +308,9 @@ async def main():
     before = len(s.events)
     await dispatch_click(s, s.order[-1], "lonely", [])
     assert len(s.events) > before
-    assert any("no `on_click`" in e["text"] for e in s.events[-2:])
+    failure = next(e for e in reversed(s.events) if "no `on_click`" in e["text"])
+    assert failure["kind"] == "event"
+    assert failure["details"]["status"] == "missing_handler"
 
 
 async def test_unanswered_interaction_warns():
@@ -272,7 +324,9 @@ async def on_click(interaction, custom_id, values):
     pass  # oops: never answers the interaction
 """)
     await dispatch_click(s, s.order[-1], "silent", [])
-    assert any("never answered" in e["text"] for e in s.events[-2:])
+    failure = next(e for e in reversed(s.events) if "never answered" in e["text"])
+    assert failure["kind"] == "event"
+    assert failure["details"]["status"] == "unanswered"
 
 
 # --- slash commands -----------------------------------------------------------
@@ -342,7 +396,9 @@ async def test_unknown_command_and_reset_on_rerun():
     await run_script(s, CMD_SCRIPT)
     before = len(s.events)
     await dispatch_command(s, "nope", {})
-    assert any("not defined" in e["text"] for e in s.events[before:])
+    failure = next(e for e in s.events[before:] if "not defined" in e["text"])
+    assert failure["kind"] == "action"
+    assert failure["details"]["status"] == "missing_command"
     await run_script(s, "async def main():\n    pass")  # no commands in this script
     assert s.commands == {} and s.cmd_objects == {}
 
@@ -478,6 +534,10 @@ async def main():
     assert "temp" not in [c.name for c in s.channels.values()]
     assert "caught NotFound" in [s.messages[m]["content"] for m in s.order][-1]
     assert all(s.messages[m]["content"] != "gone soon" for m in s.order)  # messages went with it
+    blocked = next(event for event in reversed(s.events)
+                   if event.get("details", {}).get("status") == "missing_channel")
+    assert blocked["kind"] == "action"
+    assert blocked["details"]["operation"] == "channel.send"
 
 
 def test_channel_reset_on_run():
