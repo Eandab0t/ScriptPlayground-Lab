@@ -14,7 +14,9 @@ ScriptPlayground uses `discord.py` types where practical, but the transport is a
 | Guild permissions | Role-derived permissions with owner/admin handling. |
 | Channel permissions | `@everyone`, combined role, then member overwrite precedence. |
 | Interaction permissions | `permissions` for the active user and `app_permissions` for the mock bot. |
-| Permission failures | `discord.Forbidden` for denied sends, channel deletes, message deletes, interaction responses, and follow-ups. |
+| Permission failures | `discord.Forbidden` for denied sends, channel deletes, message deletes, interaction responses, and follow-ups; runtime events include the deciding resolution step. |
+| Components V2 bridge | Validated designs generate runnable `discord.py` source; bridge fixtures cover nested accessories, galleries, separators, spoiler containers, and nested controls. |
+| Embeder provenance | `GET /api/embeder/info` reports the committed marker for the vendored local build; it does not contact DiscordEmbeder at runtime. |
 | Channels | In-memory text channels with normalized names and duplicate suffixes. |
 | Files | Small image files become inline data URIs; other files remain metadata chips. |
 
@@ -29,6 +31,7 @@ Resolution order:
 3. `@everyone` channel overwrite.
 4. Combined role overwrites.
 5. Member-specific overwrite.
+6. The resolved permission result is checked by the operation; denial diagnostics identify the applicable overwrite/final-resolution step.
 
 This covers the operations already represented in the playground. It does not claim to reproduce every Discord permission bit or every API-side validation rule.
 

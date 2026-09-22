@@ -58,8 +58,10 @@ Inspect the resulting messages and console events
 - Role-derived guild permissions and channel overwrites using `@everyone`, role, and member precedence.
 - Administrator bypass and separate user/bot interaction permissions.
 - Permission enforcement for the existing send/delete operations, interaction responses, and follow-ups.
-- Components V2 design bridge and visual message builder.
+- Components V2 design bridge and visual message builder, with fixed bridge round-trip fixtures covering nested components and gallery/separator boundaries.
 - Folder-backed `bots/<name>/bot.py` workspaces.
+- Vendored Embeder provenance exposed through `GET /api/embeder/info`; the current marker records DiscordEmbeder commit `0fc06253ce5c86ac77a91b4f4dabfcec49b4daf8`.
+- Readable permission-denial diagnostics that identify the existing resolution step that rejected an operation.
 - Local script library, saved design projects, and mock runtime stress coverage.
 - Canonical project-state validation before design loading, saving, code generation, and runtime use.
 
