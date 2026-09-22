@@ -1,0 +1,44 @@
+# Discord compatibility notes
+
+ScriptPlayground uses `discord.py` types where practical, but the transport is a local mock. This is a development aid, not a claim of complete Discord emulation.
+
+## Supported surface
+
+| Area | Current behavior |
+|---|---|
+| Messages | Capture content, embeds, files, classic components, Components V2, edits, deletes, replies, and log basic reaction/pin actions. |
+| Components | Buttons, string selects, user/role/channel/mentionable selects, nested V2 interactive items. |
+| Modals | Open and submit text inputs through the browser. |
+| Commands | Discover `app_commands.command`, render argument forms, coerce common types and choices. |
+| Users | Fixed You/Alice/Bob/Carol fixtures; session-selected active user. |
+| Guild permissions | Role-derived permissions with owner/admin handling. |
+| Channel permissions | `@everyone`, combined role, then member overwrite precedence. |
+| Interaction permissions | `permissions` for the active user and `app_permissions` for the mock bot. |
+| Permission failures | `discord.Forbidden` for denied sends, channel deletes, message deletes, interaction responses, and follow-ups. |
+| Channels | In-memory text channels with normalized names and duplicate suffixes. |
+| Files | Small image files become inline data URIs; other files remain metadata chips. |
+
+## Permission contract
+
+The current default fixture intentionally allows ordinary users to send messages and keeps the bot operational. Tests may assign role permissions, channel overwrites, or a temporary member permission override to exercise failure paths.
+
+Resolution order:
+
+1. Guild-level permissions from `@everyone` and assigned roles.
+2. Administrator bypass.
+3. `@everyone` channel overwrite.
+4. Combined role overwrites.
+5. Member-specific overwrite.
+
+This covers the operations already represented in the playground. It does not claim to reproduce every Discord permission bit or every API-side validation rule.
+
+## Known gaps
+
+- No real gateway events or REST requests.
+- No permission-management UI.
+- No multi-guild state.
+- No voice or stage model.
+- No threads, DMs, webhooks, forums, scheduled events, rate limits, or intent simulation.
+- Some mock methods are intentionally shallow and may accept arguments that real Discord would reject.
+
+When adding a new compatibility feature, define the behavior first with a small test that follows the real user/runtime path. Avoid expanding the mock surface just to make an API listing look complete.
