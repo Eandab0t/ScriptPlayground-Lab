@@ -21,7 +21,7 @@ scripts/vendor_embeder.py
   Copies the authoritative Embeder dist and writes embeder/VENDORED_FROM.txt.
 
 static/index.html
-  Single-file browser UI, editor, preview, selectors, and API calls
+  Single-file browser UI, editor, preview, selectors, state/event/action inspectors, and API calls
 
 tests/test_smoke.py
   Offline behavioral contract for the runtime, bridge, server, and stress cases
@@ -44,7 +44,7 @@ Session timeline and events
    ↓
 state(session) JSON
    ↓ websocket nudge or browser refresh
-static/index.html renders the result
+static/index.html renders the result; State, Events, and Actions inspectors summarize the same state JSON, including active-user and bot permission results.
 ```
 
 ## Interaction identity
@@ -86,6 +86,8 @@ MockChannel operation or interaction metadata
 ## State boundaries
 
 - Session state is in memory and scoped to one browser/runtime session.
+- `Session.events` remains the single event/action stream. Entries carry a `kind` and optional JSON-safe `details`; attempted, denied, blocked, missing, and unanswered operations are recorded there, and the browser filters and expands that stream without creating another state owner. Expanded event/action details stay open across ordinary state refreshes.
+- `state(session)` derives the State inspector's active-user and bot permission summaries from `MockChannel.permission_check()`; the UI does not calculate permissions independently.
 - Saved designs are JSON files under `scripts/designs/`; bridge fixtures live under `tests/fixtures/bridge_roundtrip/`.
 - Saved scripts are Python files under `scripts/`.
 - Connected bot workspaces are under `bots/`.
