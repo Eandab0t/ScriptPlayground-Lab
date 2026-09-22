@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "metadata": {"name": "Ten images"},
+  "tree": [{"type": 12, "items": [
+    {"media": {"url": "https://example.com/1.png"}},
+    {"media": {"url": "https://example.com/2.png"}},
+    {"media": {"url": "https://example.com/3.png"}},
+    {"media": {"url": "https://example.com/4.png"}},
+    {"media": {"url": "https://example.com/5.png"}},
+    {"media": {"url": "https://example.com/6.png"}},
+    {"media": {"url": "https://example.com/7.png"}},
+    {"media": {"url": "https://example.com/8.png"}},
+    {"media": {"url": "https://example.com/9.png"}},
+    {"media": {"url": "https://example.com/10.png"}}
+  ]}]
+}

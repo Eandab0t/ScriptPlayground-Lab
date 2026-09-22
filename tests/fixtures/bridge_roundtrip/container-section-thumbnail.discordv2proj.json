@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "metadata": {"name": "Container section thumbnail"},
+  "tree": [
+    {
+      "type": 17,
+      "accent_color": 5793266,
+      "components": [
+        {"type": 10, "content": "Welcome"},
+        {
+          "type": 9,
+          "components": [{"type": 10, "content": "Section text"}],
+          "accessory": {"type": 11, "media": {"url": "https://example.com/thumb.png", "description": "Thumb"}}
+        }
+      ]
+    }
+  ]
+}

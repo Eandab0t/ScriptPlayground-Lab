@@ -221,6 +221,13 @@ async def embeder_page(request: web.Request) -> web.FileResponse:
     return web.FileResponse(EMBEDER_DIR / "index.html")
 
 
+async def embeder_info(_request: web.Request) -> web.Response:
+    marker = EMBEDER_DIR / "VENDORED_FROM.txt"
+    if not marker.exists():
+        return web.json_response({"ok": False, "error": "vendor provenance is unavailable"}, status=404)
+    return web.json_response({"ok": True, "provenance": marker.read_text(encoding="utf-8")})
+
+
 async def bridge_design_to_code(request: web.Request) -> web.Response:
     body = await request.json()
     design = body.get("design")
@@ -362,6 +369,7 @@ def build_app() -> web.Application:
     app.on_startup.append(on_startup)
     app.router.add_get("/", index)
     app.router.add_get("/embeder", embeder_page)
+    app.router.add_get("/api/embeder/info", embeder_info)
     app.router.add_get("/api/workspaces", list_workspaces)
     app.router.add_get("/api/workspaces/{workspace}/files/{filename}", get_workspace_file)
     app.router.add_put("/api/workspaces/{workspace}/files/{filename}", save_workspace_file)

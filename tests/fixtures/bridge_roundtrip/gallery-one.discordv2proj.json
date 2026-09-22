@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "metadata": {"name": "One image"},
+  "tree": [{"type": 12, "items": [{"media": {"url": "https://example.com/one.png", "description": "One"}}]}]
+}
