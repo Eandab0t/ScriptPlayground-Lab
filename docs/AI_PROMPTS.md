@@ -17,7 +17,7 @@ Review the attached ScriptPlayground code as a maintainer. Trace one flow from b
 ## Permission-model review
 
 ```text
-Audit ScriptPlayground's mock Discord permission behavior against the documented contract. Exercise @everyone, combined role, member overwrite, administrator bypass, active-user permissions, bot app_permissions, channel sends/deletes, interaction responses, and follow-ups. Look especially for checks that bypass the shared enforcement path or stale permission snapshots. Report concrete failures with a minimal regression test. Do not expand into voice, intents, multi-guild state, or a complete Discord clone.
+Audit ScriptPlayground's mock Discord permission behavior against the documented contract. Exercise @everyone, combined role, member overwrite, administrator bypass, active-user permissions, bot app_permissions, channel sends/deletes, interaction responses, and follow-ups. Confirm denied operations expose the deciding resolution step through the existing event/API path. Look especially for checks that bypass the shared enforcement path or stale permission snapshots. Report concrete failures with a minimal regression test. Do not expand into voice, intents, multi-guild state, or a complete Discord clone.
 ```
 
 ## Adversarial test plan
@@ -38,6 +38,12 @@ Implement the smallest complete change requested for ScriptPlayground. First rea
 Review only the attached diff for over-engineering. Find code that can be deleted or simplified: duplicate validation, one-use wrappers, dead branches, invented standard-library behavior, unnecessary dependencies, and tests coupled to implementation instead of user behavior. Use this format:
 [delete|simplify|question] file:line — finding
 Then give estimated deletions and a verdict. Do not propose unrelated features or a rewrite.
+```
+
+## Bridge and vendored-build audit
+
+```text
+Audit ScriptPlayground's Components V2 bridge and vendored Embeder build. For every fixture under tests/fixtures/bridge_roundtrip/, verify JSON → project validation → bridge.py → generated LayoutView → mock runtime, including serialized nesting and nested dispatch. Compare embeder/VENDORED_FROM.txt with the actual authoritative source commit and GET /api/embeder/info, and verify the committed embeder/index.html is the build described by that marker. Report only concrete drift or missing coverage; do not refresh artifacts or redesign the bridge during the audit.
 ```
 
 ## Release-candidate audit

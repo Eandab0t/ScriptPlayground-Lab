@@ -15,6 +15,10 @@ project_state.py
 
 bridge.py
   Validated project state → runnable discord.py source
+  Bridge fixtures exercise generated LayoutView code against the mock runtime.
+
+scripts/vendor_embeder.py
+  Copies the authoritative Embeder dist and writes embeder/VENDORED_FROM.txt.
 
 static/index.html
   Single-file browser UI, editor, preview, selectors, and API calls
@@ -72,12 +76,17 @@ resolved channel permissions
 MockChannel operation or interaction metadata
 ```
 
-`MockChannel.send()` is the shared enforcement seam for bot and explicit-member sends. Interaction response and follow-up sends route through it rather than maintaining separate permission checks.
+`MockChannel.send()` is the shared enforcement seam for bot and explicit-member sends. Interaction response and follow-up sends route through it rather than maintaining separate permission checks. Denied operations carry the resolver step that decided the failure, and the existing console/API path exposes that diagnostic.
+
+## Bridge and vendored UI boundaries
+
+- `bridge.py` consumes validated project state and generates runnable `discord.py` source; `tests/fixtures/bridge_roundtrip/` proves nesting, accessories, gallery limits, separators, spoiler state, and nested dispatch.
+- `embeder/index.html` is a committed local build from the external DiscordEmbeder source. `embeder/VENDORED_FROM.txt` records its source commit, and `GET /api/embeder/info` reports the same marker without contacting the network.
 
 ## State boundaries
 
 - Session state is in memory and scoped to one browser/runtime session.
-- Saved designs are JSON files under `scripts/designs/`.
+- Saved designs are JSON files under `scripts/designs/`; bridge fixtures live under `tests/fixtures/bridge_roundtrip/`.
 - Saved scripts are Python files under `scripts/`.
 - Connected bot workspaces are under `bots/`.
 - Test logs and compiler output belong under `.test-artifacts/` and must not be committed.

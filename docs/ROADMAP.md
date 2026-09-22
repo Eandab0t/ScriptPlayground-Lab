@@ -4,29 +4,29 @@ This is a prioritization guide, not a promise to build every idea.
 
 ## Highest-value next steps
 
-### 1. Make the current simulator easier to inspect
+The following baseline work is complete: bridge round-trip fixtures, vendored Embeder provenance, and read-only permission-denial diagnostics. Keep these behaviors covered when changing the runtime.
 
-- Show resolved user and bot permissions in the existing runtime view.
-- Show why an operation was denied.
-- Keep the feature read-only first; do not build a permissions editor yet.
-
-### 2. Add a small scenario format
+### 1. Add a small scenario format
 
 - Save a sequence such as “Alice sends message → clicks button → receives response.”
 - Replay it against one session.
 - Reuse existing dispatch functions instead of inventing a broad event bus.
 
-### 3. Improve workspace editing deliberately
+### 2. Improve workspace editing deliberately
 
 - Decide whether the product needs multiple files before adding them.
 - If yes, define a safe workspace manifest and explicit file allowlist.
 - Keep execution local and prevent path traversal.
 
-### 4. Reduce concentrated ownership when a change demands it
+### 3. Reduce concentrated ownership when a change demands it
 
 - Extract only a proven seam from `playground.py` or `static/index.html`.
 - Preserve the current HTTP/runtime contract.
 - Do not split files for aesthetics alone.
+
+### 4. Decide on session persistence
+
+Session state is currently memory-only. Before implementing persistence, establish whether restart recovery is worth the storage, migration, and cleanup cost; if it is, share a serializable shape with scenario replay rather than building two formats.
 
 ## Later possibilities
 
