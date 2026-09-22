@@ -205,8 +205,7 @@ class MockMessage:
     async def delete(self, delay: float | None = None) -> None:
         if delay:
             await asyncio.sleep(delay)
-        if not self.channel.permissions_for(self.guild.me).manage_messages:
-            raise discord.Forbidden(_FORBIDDEN, "missing manage_messages permission")
+        self.channel.require_permission(self.guild.me, "manage_messages")
         self._session.delete_message(self.id)
 
     async def reply(self, content=None, **kwargs) -> MockMessage:
@@ -234,34 +233,56 @@ class MockChannel:
     def __str__(self) -> str:
         return f"#{self.name}"
 
-    def permissions_for(self, member: MockMember) -> discord.Permissions:
+    def _resolve_permissions(self, member: MockMember, permission: str | None = None) -> tuple[discord.Permissions, str]:
         permissions = member.guild_permissions
         if permissions.administrator:
-            return discord.Permissions.all()
-        allow, deny = self.overwrites.get(self.guild.id, discord.PermissionOverwrite()).pair()
-        permissions.handle_overwrite(allow.value, deny.value)
+            return discord.Permissions.all(), "administrator bypass"
+        bit = discord.Permissions(**{permission: True}).value if permission else 0
+        reason = "resolved permissions"
+
+        def apply(overwrite: discord.PermissionOverwrite, label: str) -> None:
+            nonlocal reason
+            allow, deny = overwrite.pair()
+            permissions.handle_overwrite(allow.value, deny.value)
+            if bit and deny.value & bit and not allow.value & bit:
+                reason = label
+
+        apply(self.overwrites.get(self.guild.id, discord.PermissionOverwrite()), "@everyone overwrite")
         role_allow = role_deny = 0
         for role in member.roles:
+            if role.id == self.guild.id:
+                continue
             allow, deny = self.overwrites.get(role.id, discord.PermissionOverwrite()).pair()
             role_allow |= allow.value
             role_deny |= deny.value
         permissions.handle_overwrite(role_allow, role_deny)
-        allow, deny = self.overwrites.get(member.id, discord.PermissionOverwrite()).pair()
-        permissions.handle_overwrite(allow.value, deny.value)
-        return permissions
+        if bit and role_deny & bit and not role_allow & bit:
+            reason = "role overwrite"
+        apply(self.overwrites.get(member.id, discord.PermissionOverwrite()), "member overwrite")
+        return permissions, reason
+
+    def permissions_for(self, member: MockMember) -> discord.Permissions:
+        return self._resolve_permissions(member)[0]
+
+    def permission_check(self, member: MockMember, permission: str) -> tuple[bool, str]:
+        resolved, reason = self._resolve_permissions(member, permission)
+        return bool(getattr(resolved, permission)), reason
+
+    def require_permission(self, member: MockMember, permission: str) -> None:
+        allowed, reason = self.permission_check(member, permission)
+        if not allowed:
+            raise discord.Forbidden(_FORBIDDEN, f"missing {permission} permission ({reason})")
 
     async def send(self, content=None, **kwargs) -> MockMessage:
         if self._session.channels.get(str(self.id)) is not self:
             raise discord.NotFound(_NOT_FOUND, "channel was deleted")
         author = kwargs.get("author") or self.guild.me
-        if not self.permissions_for(author).send_messages:
-            raise discord.Forbidden(_FORBIDDEN, "missing send_messages permission")
+        self.require_permission(author, "send_messages")
         msg = self._session.add_message(channel_id=self.id, content=content, **kwargs)
         return MockMessage(self._session, msg["id"], msg.get("author_obj"))
 
     async def delete(self) -> None:
-        if not self.permissions_for(self.guild.me).manage_channels:
-            raise discord.Forbidden(_FORBIDDEN, "missing manage_channels permission")
+        self.require_permission(self.guild.me, "manage_channels")
         self._session.delete_channel(self.id)
 
     async def fetch_message(self, message_id) -> MockMessage:
@@ -1180,8 +1201,9 @@ async def _do_message(session: Session, content: str, channel_id=None) -> None:
     if not env:
         raise RuntimeError("Nothing is running yet — press Run first.")
     channel = session.channels.get(str(channel_id), session.channel)
-    if not channel.permissions_for(session.active_user).send_messages:
-        session.log("🚫", "message blocked: missing send_messages permission", "warn")
+    allowed, reason = channel.permission_check(session.active_user, "send_messages")
+    if not allowed:
+        session.log("🚫", f"message blocked: missing send_messages permission ({reason})", "warn")
         return
     msg = session.add_message(channel_id=channel_id, content=content,
                               author=session.active_user)

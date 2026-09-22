@@ -1,0 +1,4 @@
+source: E:/Ean server assests/Ean Applications/DiscordEmbeder
+commit: 2094dc4480f05d910edeb022f645258953ba3580
+vended_at: 2026-09-22T02:07:27Z
+verification: current dist and vendored build both contain forwarded-message snapshot and customId normalization code

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "metadata": {"name": "Section button"},
+  "tree": [
+    {
+      "type": 9,
+      "components": [{"type": 10, "content": "Choose an action"}],
+      "accessory": {"type": 2, "style": 3, "label": "Join", "custom_id": "section_join"}
+    }
+  ]
+}
