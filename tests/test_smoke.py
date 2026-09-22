@@ -113,6 +113,125 @@ async def on_submit(interaction, values, modal_id):
     assert not s2.modals, "modal should be consumed after submit"
 
 
+async def test_active_user_and_interaction_metadata():
+    s = Session("t-users")
+    await run_script(s, """
+import discord
+from discord import app_commands
+modal = discord.ui.Modal(title="Form")
+modal.add_item(discord.ui.TextInput(label="Name"))
+
+@app_commands.command(name="who")
+async def who(interaction):
+    await interaction.response.send_message(f"command:{interaction.user.name}:{interaction.type.name}")
+
+async def main():
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label="Open", custom_id="open"))
+    await send(view=view)
+
+async def on_click(interaction, custom_id, values):
+    modal.title = f"component:{interaction.type.name}"
+    await interaction.response.send_modal(modal)
+
+async def on_message(message):
+    await message.channel.send(f"author:{message.author.name}")
+
+async def on_submit(interaction, values, modal_id):
+    await interaction.response.send_message(f"modal:{interaction.user.name}:{interaction.type.name}")
+""")
+    assert s.active_user.name == "You"
+    assert s.build_interaction().user.name == "You"
+    s.set_user(111111111111111111)
+    assert s.active_user.name == "Alice"
+    mid = s.order[-1]
+    await dispatch_click(s, mid, "open", [])
+    assert s.modals[0]["title"] == "component:component"
+    await dispatch_submit(s, s.modals[0]["id"], {"name": "ok"})
+    await dispatch_command(s, "who", {})
+    await dispatch_message(s, "hello")
+    contents = [s.messages[mid]["content"] for mid in s.order]
+    assert "modal:Alice:modal_submit" in contents
+    assert "command:Alice:application_command" in contents
+    assert s.messages[s.order[-2]]["author"]["name"] == "Alice"
+
+
+async def test_permissions_and_interaction_permissions():
+    s = Session("t-permissions")
+    alice = s.guild.get_member(111111111111111111)
+    role = s.guild.roles[-1]
+    role.permissions.update(manage_messages=True)
+    alice.roles = [s.guild.roles[0], role]
+    assert alice.guild_permissions.manage_messages
+
+    channel = s.channel
+    channel.overwrites[s.guild.id] = discord.PermissionOverwrite(send_messages=False)
+    channel.overwrites[role.id] = discord.PermissionOverwrite(send_messages=True)
+    assert channel.permissions_for(alice).send_messages
+    channel.overwrites[alice.id] = discord.PermissionOverwrite(send_messages=False)
+    assert not channel.permissions_for(alice).send_messages
+    try:
+        await channel.send("blocked", author=alice)
+    except discord.Forbidden:
+        pass
+    else:
+        raise AssertionError("member send should require send_messages")
+
+    s.set_user(alice.id)
+    interaction = s.build_interaction()
+    assert interaction.permissions == channel.permissions_for(alice)
+    assert interaction.app_permissions == channel.permissions_for(s.guild.me)
+
+    owner = s.guild.get_member(s.guild.owner_id)
+    assert channel.permissions_for(owner).administrator
+    s.guild.me.roles = [s.guild.roles[0]]
+    s.guild.me.permission_override = discord.Permissions(view_channel=True)
+    assert not channel.permissions_for(s.guild.me).send_messages
+    try:
+        await channel.send("blocked")
+    except discord.Forbidden:
+        pass
+    else:
+        raise AssertionError("bot send should require send_messages")
+    blocked = s.build_interaction()
+    for sender in (
+        lambda: blocked.response.send_message("blocked response"),
+        lambda: blocked.followup.send("blocked followup"),
+    ):
+        try:
+            await sender()
+        except discord.Forbidden:
+            pass
+        else:
+            raise AssertionError("interaction send should require send_messages")
+
+    s.guild.me.permission_override = None
+    allowed = s.build_interaction()
+    await allowed.response.send_message("allowed response")
+    await allowed.followup.send("allowed followup")
+    assert [s.messages[mid]["content"] for mid in s.order[-2:]] == [
+        "allowed response", "allowed followup"
+    ]
+
+
+async def test_active_user_http_selection():
+    import json
+
+    import main as server
+
+    s = Session("t-user-http")
+    server.SESSIONS[s.sid] = s
+    try:
+        response = await server.set_user(_FakeReq(match={"sid": s.sid}, body={"user_id": 222222222222222222}))
+        assert json.loads(response.body)["user"] == {"id": "222222222222222222", "name": "Bob"}
+        response = await server.set_user(_FakeReq(match={"sid": s.sid}, body={"user_id": 987}))
+        assert response.status == 400
+        assert server.state(s)["user"] == {"id": "222222222222222222", "name": "Bob"}
+    finally:
+        server.SESSIONS.pop(s.sid, None)
+        s.close()
+
+
 async def test_print_and_send_helpers():
     s = Session("t3")
     await run_script(s, "print('to console')\nasync def main():\n    await send('via helper')")

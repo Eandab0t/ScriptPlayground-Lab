@@ -41,6 +41,9 @@
             display: flex; align-items: center; justify-content: center; font-weight: 700; color: #fff; font-size: 14px; }
   .me-name { font-size: 13px; font-weight: 600; color: var(--txt-head); }
   .me-tag { font-size: 11px; color: var(--txt-dim); }
+  #act-as { width: 112px; margin-left: auto; background: var(--bg0); color: var(--txt); border: 1px solid var(--border);
+             border-radius: 4px; padding: 4px 6px; font: inherit; font-size: 11px; }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
 
   /* ---------- chat ---------- */
   #chat-pane { display: flex; flex-direction: column; background: var(--bg2); min-width: 0; }
@@ -247,6 +250,7 @@
     <div class="sidebar-foot">
       <div class="avatar" id="me-avatar" style="background:#5865f2">Y</div>
       <div><div class="me-name" id="me-name">You</div><div class="me-tag" id="me-sub">connected locally</div></div>
+      <label><span class="sr-only">Act as user</span><select id="act-as" title="Act as user"></select></label>
     </div>
   </nav>
 
@@ -379,6 +383,15 @@ function render(st) {
   $("#guild-name").textContent = st.guild.name;
   $("#me-name").textContent = st.user.name;
   $("#me-sub").textContent = st.running ? "runtime live" : "not running — press Run";
+  const activeUser = (st.users || []).find((user) => user.id == st.user.id) || st.user;
+  const activeIndex = (st.users || []).findIndex((user) => user.id == st.user.id);
+  const avatar = $("#me-avatar");
+  avatar.textContent = (activeUser.name || "?")[0].toUpperCase();
+  avatar.style.background = AVATAR_COLORS[(activeIndex < 0 ? 0 : activeIndex) % AVATAR_COLORS.length];
+  const actAs = $("#act-as");
+  actAs.innerHTML = "";
+  for (const user of st.users || []) actAs.appendChild(new Option(user.name, user.id));
+  actAs.value = String(st.user.id);
   renderChannels(st);
 
   // Stay on the channel you're viewing; if it vanished (fresh Run), fall back to the first.
@@ -794,6 +807,23 @@ async function post(path, body) {
   if (res.ok) { render(await res.json()); }
 }
 const click = (mid, cid, values) => post("click", { message_id: mid, custom_id: cid, values });
+let userChange = 0;
+$("#act-as").onchange = async () => {
+  const select = $("#act-as");
+  const previous = String(lastState?.user.id ?? select.value);
+  const attempt = ++userChange;
+  const res = await fetch(`/api/session/${SID}/user`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: select.value }),
+  });
+  const data = await res.json();
+  if (attempt !== userChange) return;
+  if (res.ok) render(data);
+  else {
+    select.value = previous;
+    pgAlert(data.error || "Could not switch user");
+  }
+};
 
 /* modal dialog */
 let activeModal = null;

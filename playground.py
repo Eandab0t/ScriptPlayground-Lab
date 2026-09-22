@@ -66,6 +66,7 @@ class MockRole:
         self.id = role_id
         self.name = name
         self.position = ROLE_NAMES.index(name) + 1 if name in ROLE_NAMES else 0
+        self.permissions = discord.Permissions.none()
         self.colour = self.color = discord.Color.blurple()
         self.hoist = name != "Members"
 
@@ -85,10 +86,11 @@ class MockMember:
         self.global_name = name
         self.bot = bot
         self.guild = guild
-        self.roles = list(guild.roles)
+        self.roles = [guild.roles[0]]
         self.joined_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
         self.status = discord.Status.online
         self.avatar = None
+        self.permission_override: discord.Permissions | None = None
 
     @property
     def mention(self) -> str:
@@ -98,7 +100,15 @@ class MockMember:
     def guild_permissions(self) -> discord.Permissions:
         if self.guild.owner_id == self.id:
             return discord.Permissions.all()
-        return discord.Permissions.general()
+        if self.permission_override is not None:
+            return discord.Permissions(self.permission_override.value)
+        if self.bot:
+            return discord.Permissions.all()
+        permissions = discord.Permissions(view_channel=True, send_messages=True,
+                                          embed_links=True, manage_channels=True)
+        for role in self.roles:
+            permissions |= role.permissions
+        return permissions
 
     def __str__(self) -> str:
         return self.name
@@ -159,6 +169,14 @@ class _FakeResponse:
 _NOT_FOUND = _FakeResponse()
 
 
+class _ForbiddenResponse(_FakeResponse):
+    status = 403
+    reason = "Forbidden"
+
+
+_FORBIDDEN = _ForbiddenResponse()
+
+
 class MockMessage:
     """Handle returned from sends; edits/deletes go through the session."""
 
@@ -187,6 +205,8 @@ class MockMessage:
     async def delete(self, delay: float | None = None) -> None:
         if delay:
             await asyncio.sleep(delay)
+        if not self.channel.permissions_for(self.guild.me).manage_messages:
+            raise discord.Forbidden(_FORBIDDEN, "missing manage_messages permission")
         self._session.delete_message(self.id)
 
     async def reply(self, content=None, **kwargs) -> MockMessage:
@@ -209,17 +229,39 @@ class MockChannel:
         self.name = name
         self.guild = session.guild
         self.mention = f"<#{channel_id}>"
+        self.overwrites: dict[int, discord.PermissionOverwrite] = {}
 
     def __str__(self) -> str:
         return f"#{self.name}"
 
+    def permissions_for(self, member: MockMember) -> discord.Permissions:
+        permissions = member.guild_permissions
+        if permissions.administrator:
+            return discord.Permissions.all()
+        allow, deny = self.overwrites.get(self.guild.id, discord.PermissionOverwrite()).pair()
+        permissions.handle_overwrite(allow.value, deny.value)
+        role_allow = role_deny = 0
+        for role in member.roles:
+            allow, deny = self.overwrites.get(role.id, discord.PermissionOverwrite()).pair()
+            role_allow |= allow.value
+            role_deny |= deny.value
+        permissions.handle_overwrite(role_allow, role_deny)
+        allow, deny = self.overwrites.get(member.id, discord.PermissionOverwrite()).pair()
+        permissions.handle_overwrite(allow.value, deny.value)
+        return permissions
+
     async def send(self, content=None, **kwargs) -> MockMessage:
         if self._session.channels.get(str(self.id)) is not self:
             raise discord.NotFound(_NOT_FOUND, "channel was deleted")
+        author = kwargs.get("author") or self.guild.me
+        if not self.permissions_for(author).send_messages:
+            raise discord.Forbidden(_FORBIDDEN, "missing send_messages permission")
         msg = self._session.add_message(channel_id=self.id, content=content, **kwargs)
         return MockMessage(self._session, msg["id"], msg.get("author_obj"))
 
     async def delete(self) -> None:
+        if not self.permissions_for(self.guild.me).manage_channels:
+            raise discord.Forbidden(_FORBIDDEN, "missing manage_channels permission")
         self._session.delete_channel(self.id)
 
     async def fetch_message(self, message_id) -> MockMessage:
@@ -294,11 +336,12 @@ class MockResponse:
     async def send_message(self, content=None, **kwargs) -> MockMessage:
         if self._done:
             raise RuntimeError("This interaction has already been responded to.")
-        self._done = True
         session = self._interaction._session
-        msg = session.add_message(content=content, **kwargs)
-        self._interaction._last = msg["id"]
-        return MockMessage(session, msg["id"])
+        kwargs["author"] = session.guild.me
+        msg = await self._interaction.channel.send(content, **kwargs)
+        self._done = True
+        self._interaction._last = msg.id
+        return msg
 
     async def defer(self, thinking: bool = False, ephemeral: bool = False, **kwargs) -> None:
         self._done = True
@@ -327,9 +370,10 @@ class MockFollowup:
         session = self._interaction._session
         if "ephemeral" not in kwargs and self._interaction._ephemeral_followups:
             kwargs["ephemeral"] = True
-        msg = session.add_message(content=content, **kwargs)
-        self._interaction._last = msg["id"]
-        return MockMessage(session, msg["id"])
+        kwargs["author"] = session.guild.me
+        msg = await self._interaction.channel.send(content, **kwargs)
+        self._interaction._last = msg.id
+        return msg
 
     async def edit_message(self, content=None, **kwargs) -> MockMessage:
         session = self._interaction._session
@@ -341,10 +385,12 @@ class MockInteraction:
     """Stands in for discord.Interaction: responses are captured, not sent."""
 
     def __init__(self, session: Session, source_message_id: str | None = None,
-                 custom_id: str | None = None, values: list | None = None):
+                 custom_id: str | None = None, values: list | None = None,
+                 interaction_type: discord.InteractionType = discord.InteractionType.application_command):
         self._session = session
+        self._interaction_type = interaction_type
         guild = session.guild
-        self.user = guild.get_member(USER_ID)
+        self.user = session.active_user
         self.author = self.user
         self.guild = guild
         self.guild_id = guild.id
@@ -356,6 +402,8 @@ class MockInteraction:
         src = session.messages.get(source_message_id or "") or {}
         self.channel = session.channels.get(src.get("channel") or "", session.channel)
         self.channel_id = self.channel.id
+        self.permissions = self.channel.permissions_for(self.user)
+        self.app_permissions = self.channel.permissions_for(guild.me)
         self.command = _CommandRef("playground")
         self.data = {"custom_id": custom_id, "values": values or []} if custom_id else {}
         self.namespace = _Namespace()
@@ -369,7 +417,7 @@ class MockInteraction:
 
     @property
     def type(self) -> discord.InteractionType:
-        return discord.InteractionType.application_command
+        return self._interaction_type
 
     def is_done(self) -> bool:
         return self.response.is_done
@@ -687,7 +735,10 @@ async def _do_command(session: Session, name: str, args: dict) -> None:
         return
     session.pending_command = name
     try:
-        interaction = session.build_interaction(source_message_id=None)
+        interaction = session.build_interaction(
+            source_message_id=None,
+            interaction_type=discord.InteractionType.application_command,
+        )
         interaction.channel = session.channel
         interaction.channel_id = session.channel.id
         interaction.command = _CommandRef(name)
@@ -926,9 +977,21 @@ class Session:
 
     # -- runtime -----------------------------------------------------------
 
+    @property
+    def active_user(self) -> MockMember:
+        return self.guild.get_member(self.user_id) or self.guild.get_member(USER_ID)
+
+    def set_user(self, user_id: int) -> None:
+        if self.guild.get_member(user_id) is None or user_id == BOT_ID:
+            raise ValueError("unknown simulated user")
+        self.user_id = user_id
+        self.user_name = self.active_user.name
+        self._touch()
+
     def build_interaction(self, source_message_id: str | None = None,
-                          custom_id: str | None = None, values: list | None = None) -> MockInteraction:
-        return MockInteraction(self, source_message_id, custom_id, values)
+                          custom_id: str | None = None, values: list | None = None,
+                          interaction_type: discord.InteractionType = discord.InteractionType.application_command) -> MockInteraction:
+        return MockInteraction(self, source_message_id, custom_id, values, interaction_type)
 
     def restart(self) -> None:
         """Boot a fresh runtime (fresh thread + loop); the timeline is cleared."""
@@ -1069,7 +1132,9 @@ async def _do_click(session: Session, message_id: str, custom_id: str, values: l
     if not callable(handler):
         session.log("⚠️", f"clicked {custom_id!r} but no `on_click` handler is defined", "warn")
         return
-    interaction = session.build_interaction(message_id, custom_id, values)
+    interaction = session.build_interaction(
+        message_id, custom_id, values, discord.InteractionType.component
+    )
     result = _call(handler, interaction, custom_id, values)
     if inspect.isawaitable(result):
         await result
@@ -1093,7 +1158,10 @@ async def _do_submit(session: Session, modal_id: str, values: dict) -> None:
     modal = next((m for m in session.modals if m["id"] == modal_id), None)
     if modal is not None:
         session.modals.remove(modal)
-    interaction = session.build_interaction(modal["source"] if modal else None)
+    interaction = session.build_interaction(
+        modal["source"] if modal else None,
+        interaction_type=discord.InteractionType.modal_submit,
+    )
     result = _call(handler, interaction, values, modal_id)
     if inspect.isawaitable(result):
         await result
@@ -1111,8 +1179,12 @@ async def _do_message(session: Session, content: str, channel_id=None) -> None:
     env = session.env
     if not env:
         raise RuntimeError("Nothing is running yet — press Run first.")
+    channel = session.channels.get(str(channel_id), session.channel)
+    if not channel.permissions_for(session.active_user).send_messages:
+        session.log("🚫", "message blocked: missing send_messages permission", "warn")
+        return
     msg = session.add_message(channel_id=channel_id, content=content,
-                              author=session.guild.get_member(USER_ID))
+                              author=session.active_user)
     handle = MockMessage(session, msg["id"], msg.get("author_obj"))
     handler = env.get("on_message")
     if not callable(handler):
@@ -1207,7 +1279,9 @@ def state(session: Session) -> dict:
     return {
         "ok": True,
         "sid": session.sid,
-        "user": {"id": session.user_id, "name": session.user_name},
+        "user": {"id": str(session.user_id), "name": session.user_name},
+        "users": [{"id": str(member.id), "name": member.name}
+                  for member in session.guild.members if not member.bot],
         "guild": {"id": session.guild.id, "name": session.guild.name},
         "channel": {"id": str(session.channel.id), "name": session.channel.name},
         "revision": session.revision,
