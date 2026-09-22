@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "metadata": {"name": "Separators"},
+  "tree": [
+    {"type": 14, "divider": true, "spacing": 1},
+    {"type": 14, "divider": true, "spacing": 2}
+  ]
+}

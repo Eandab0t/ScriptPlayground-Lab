@@ -170,6 +170,8 @@ async def test_permissions_and_interaction_permissions():
     assert channel.permissions_for(alice).send_messages
     channel.overwrites[alice.id] = discord.PermissionOverwrite(send_messages=False)
     assert not channel.permissions_for(alice).send_messages
+    allowed, reason = channel.permission_check(alice, "send_messages")
+    assert not allowed and reason == "member overwrite"
     try:
         await channel.send("blocked", author=alice)
     except discord.Forbidden:
@@ -189,8 +191,8 @@ async def test_permissions_and_interaction_permissions():
     assert not channel.permissions_for(s.guild.me).send_messages
     try:
         await channel.send("blocked")
-    except discord.Forbidden:
-        pass
+    except discord.Forbidden as error:
+        assert "@everyone overwrite" in str(error)
     else:
         raise AssertionError("bot send should require send_messages")
     blocked = s.build_interaction()
@@ -687,6 +689,78 @@ async def test_project_state_validation_and_roundtrip():
             assert message in str(error)
         else:
             raise AssertionError("invalid project was accepted")
+
+
+async def test_bridge_fixture_roundtrips():
+    import json
+    from pathlib import Path
+
+    import bridge
+    from project_state import validate_project
+
+    fixture_dir = Path(__file__).parent / "fixtures" / "bridge_roundtrip"
+    expected = {
+        "container-section-thumbnail.discordv2proj.json": "container",
+        "section-button.discordv2proj.json": "section",
+        "gallery-one.discordv2proj.json": "gallery",
+        "gallery-ten.discordv2proj.json": "gallery",
+        "separators.discordv2proj.json": "separator",
+        "nested-spoiler-controls.discordv2proj.json": "container",
+    }
+    for filename, kind in expected.items():
+        project = json.loads((fixture_dir / filename).read_text(encoding="utf-8"))
+        code = bridge.design_to_code(project)
+        validate_project(project)
+        session = Session(filename)
+        try:
+            result = await run_script(session, code)
+            assert result["ok"], filename
+            roots = last_msg(session)["v2"]
+            assert roots[0]["v2"] == kind, filename
+            if filename == "container-section-thumbnail.discordv2proj.json":
+                assert roots[0]["children"][1]["accessory"]["v2"] == "thumbnail"
+            elif filename == "section-button.discordv2proj.json":
+                assert roots[0]["accessory"]["kind"] == "button"
+            elif filename == "gallery-one.discordv2proj.json":
+                assert len(roots[0]["items"]) == 1
+            elif filename == "gallery-ten.discordv2proj.json":
+                assert len(roots[0]["items"]) == 10
+            elif filename == "separators.discordv2proj.json":
+                assert [node["spacing"] for node in roots] == [1, 2]
+            else:
+                assert roots[0]["spoiler"] is True
+                assert roots[0]["children"][0]["children"][0]["v2"] == "actionrow"
+        finally:
+            session.close()
+
+    nested = Session("nested-controls")
+    try:
+        project = json.loads((fixture_dir / "nested-spoiler-controls.discordv2proj.json").read_text(encoding="utf-8"))
+        script = bridge.design_to_code(project) + """
+async def on_click(interaction, custom_id, values):
+    await interaction.response.send_message(custom_id)
+"""
+        await run_script(nested, script)
+        message = last_msg(nested)
+        await dispatch_click(nested, message["id"], "deep_button", [])
+        await dispatch_click(nested, message["id"], "deep_select", ["one"])
+        assert [nested.messages[mid]["content"] for mid in nested.order[-2:]] == ["deep_button", "deep_select"]
+    finally:
+        nested.close()
+
+
+async def test_embeder_provenance_endpoint():
+    import json
+    import re
+
+    import main as server
+
+    marker_text = (server.EMBEDER_DIR / "VENDORED_FROM.txt").read_text(encoding="utf-8")
+    response = await server.embeder_info(None)
+    data = json.loads(response.body)
+    marker = re.search(r"^commit: ([0-9a-f]{40})$", marker_text, re.MULTILINE)
+    assert data["ok"] is True and marker
+    assert data["provenance"] == marker_text
 
 
 async def test_bridge_route_validates_before_generation():
