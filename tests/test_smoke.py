@@ -751,13 +751,16 @@ async def on_click(interaction, custom_id, values):
 
 async def test_embeder_provenance_endpoint():
     import json
+    import re
 
     import main as server
 
+    marker_text = (server.EMBEDER_DIR / "VENDORED_FROM.txt").read_text(encoding="utf-8")
     response = await server.embeder_info(None)
     data = json.loads(response.body)
-    assert data["ok"] is True
-    assert "commit: 2094dc4480f05d910edeb022f645258953ba3580" in data["provenance"]
+    marker = re.search(r"^commit: ([0-9a-f]{40})$", marker_text, re.MULTILINE)
+    assert data["ok"] is True and marker
+    assert data["provenance"] == marker_text
 
 
 async def test_bridge_route_validates_before_generation():
