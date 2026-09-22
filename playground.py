@@ -205,17 +205,25 @@ class MockMessage:
     async def delete(self, delay: float | None = None) -> None:
         if delay:
             await asyncio.sleep(delay)
-        self.channel.require_permission(self.guild.me, "manage_messages")
+        allowed, reason = self.channel.permission_check(self.guild.me, "manage_messages")
+        if not allowed:
+            self._session.log("🚫", f"message.delete blocked: missing manage_messages permission ({reason})", "warn",
+                              kind="action", details={"operation": "message.delete", "message_id": self.id,
+                                                       "status": "denied", "permission": "manage_messages",
+                                                       "reason": reason})
+            raise discord.Forbidden(_FORBIDDEN, f"missing manage_messages permission ({reason})")
         self._session.delete_message(self.id)
 
     async def reply(self, content=None, **kwargs) -> MockMessage:
         return await self.channel.send(content, **kwargs)
 
     async def add_reaction(self, emoji) -> None:
-        self._session.log("➕", f"reacted {emoji} to message #{self.id}")
+        self._session.log("➕", f"reacted {emoji} to message #{self.id}", kind="action",
+                          details={"operation": "message.add_reaction", "message_id": self.id, "emoji": str(emoji)})
 
     async def pin(self, **kwargs) -> None:
-        self._session.log("📌", f"message #{self.id} pinned")
+        self._session.log("📌", f"message #{self.id} pinned", kind="action",
+                          details={"operation": "message.pin", "message_id": self.id})
 
     def __str__(self) -> str:
         return self.content or "(embed)"
@@ -275,18 +283,39 @@ class MockChannel:
 
     async def send(self, content=None, **kwargs) -> MockMessage:
         if self._session.channels.get(str(self.id)) is not self:
+            self._session.log("⚠️", f"channel.send blocked: #{self.name} was deleted", "warn",
+                              kind="action", details={"operation": "channel.send", "channel": self.name,
+                                                       "status": "missing_channel"})
             raise discord.NotFound(_NOT_FOUND, "channel was deleted")
         author = kwargs.get("author") or self.guild.me
-        self.require_permission(author, "send_messages")
+        allowed, reason = self.permission_check(author, "send_messages")
+        if not allowed:
+            self._session.log("🚫", f"channel.send blocked: missing send_messages permission ({reason})", "warn",
+                              kind="action", details={"operation": "channel.send", "channel": self.name,
+                                                       "status": "denied", "permission": "send_messages",
+                                                       "reason": reason, "actor": author.name})
+            raise discord.Forbidden(_FORBIDDEN, f"missing send_messages permission ({reason})")
         msg = self._session.add_message(channel_id=self.id, content=content, **kwargs)
+        self._session.log("↗️", f"channel.send → message #{msg['index']}", kind="action",
+                          details={"operation": "channel.send", "channel": self.name,
+                                   "message_id": msg["id"], "content": content or ""})
         return MockMessage(self._session, msg["id"], msg.get("author_obj"))
 
     async def delete(self) -> None:
-        self.require_permission(self.guild.me, "manage_channels")
+        allowed, reason = self.permission_check(self.guild.me, "manage_channels")
+        if not allowed:
+            self._session.log("🚫", f"channel.delete blocked: missing manage_channels permission ({reason})", "warn",
+                              kind="action", details={"operation": "channel.delete", "channel": self.name,
+                                                       "status": "denied", "permission": "manage_channels",
+                                                       "reason": reason})
+            raise discord.Forbidden(_FORBIDDEN, f"missing manage_channels permission ({reason})")
         self._session.delete_channel(self.id)
 
     async def fetch_message(self, message_id) -> MockMessage:
         if str(message_id) not in self._session.messages:
+            self._session.log("⚠️", f"message.fetch blocked: #{message_id} was not found", "warn",
+                              kind="action", details={"operation": "message.fetch", "message_id": str(message_id),
+                                                       "status": "missing_message"})
             raise discord.NotFound(_NOT_FOUND, "message not found")
         return MockMessage(self._session, str(message_id))
 
@@ -740,9 +769,11 @@ async def _do_command(session: Session, name: str, args: dict) -> None:
     env = session.env
     if not env:
         raise RuntimeError("Nothing is running yet — press Run first.")
+    command_details = {"operation": "interaction.command", "command": name, "arguments": args}
     cmd = session.cmd_objects.get(name)
     if cmd is None:
-        session.log("⚠️", f"/{name} is not defined by the current script", "warn")
+        session.log("⚠️", f"/{name} is not defined by the current script", "warn",
+                    kind="action", details={**command_details, "status": "missing_command"})
         return
     spec = session.commands.get(name) or {"params": []}
     params = {p["name"]: p for p in spec["params"]}
@@ -752,10 +783,14 @@ async def _do_command(session: Session, name: str, args: dict) -> None:
             kwargs[pname] = _coerce_arg(session, params[pname], raw)
     missing = [p["name"] for p in spec["params"] if p["required"] and p["name"] not in kwargs]
     if missing:
-        session.log("⚠️", f"/{name} is missing required argument(s): {', '.join(missing)}", "warn")
+        session.log("⚠️", f"/{name} is missing required argument(s): {', '.join(missing)}", "warn",
+                    kind="action", details={**command_details, "status": "missing_arguments",
+                                             "missing": missing})
         return
     session.pending_command = name
     try:
+        session.log("⚡", f"command invoked: /{name}", kind="action",
+                    details={**command_details, "status": "dispatched"})
         interaction = session.build_interaction(
             source_message_id=None,
             interaction_type=discord.InteractionType.application_command,
@@ -768,7 +803,8 @@ async def _do_command(session: Session, name: str, args: dict) -> None:
             await result
         if not interaction.is_done():
             session.log("⚠️", "that interaction was never answered — real Discord shows "
-                        "'This interaction failed'", "warn")
+                        "'This interaction failed'", "warn", kind="event",
+                        details={**command_details, "status": "unanswered"})
     finally:
         session.pending_command = None
 
@@ -860,10 +896,13 @@ class Session:
     def _touch(self) -> None:
         self.revision += 1
 
-    def log(self, icon: str, text: str, cls: str | None = None) -> None:
-        event = {"icon": icon, "text": text}
+    def log(self, icon: str, text: str, cls: str | None = None, *,
+            kind: str = "event", details: dict | None = None) -> None:
+        event = {"icon": icon, "text": text, "kind": kind}
         if cls:
             event["cls"] = cls
+        if details is not None:
+            event["details"] = details
         self.events.append(event)
         self._touch()
         if len(self.events) > _MAX_EVENTS:
@@ -906,7 +945,8 @@ class Session:
     def update_message(self, message_id: str | None, content=None, **kwargs) -> None:
         msg = self.messages.get(message_id or "")
         if msg is None or msg["deleted"]:
-            self.log("⚠️", "edit_message targeted a missing message; ignored", "warn")
+            self.log("⚠️", "edit_message targeted a missing message; ignored", "warn", kind="action",
+                     details={"operation": "message.edit", "message_id": message_id, "status": "missing_message"})
             return
         if content is not None and not isinstance(content, str):
             content = str(content)
@@ -919,16 +959,22 @@ class Session:
             msg["components"], msg["v2"] = classic, v2
         msg["revision"] += 1
         self._touch()
+        self.log("✏️", f"message #{msg['index']} edited", kind="action",
+                 details={"operation": "message.edit", "message_id": msg["id"],
+                          "content": msg["content"]})
 
     def delete_message(self, message_id: str | None) -> None:
         msg = self.messages.get(message_id or "")
         if msg is None or msg["deleted"]:
+            self.log("⚠️", "delete_message targeted a missing message; ignored", "warn", kind="action",
+                     details={"operation": "message.delete", "message_id": message_id, "status": "missing_message"})
             return
         msg["deleted"] = True
         if message_id in self.order:
             self.order.remove(message_id)
         self._touch()
-        self.log("🗑️", f"message #{msg['index']} deleted")
+        self.log("🗑️", f"message #{msg['index']} deleted", kind="action",
+                 details={"operation": "message.delete", "message_id": message_id})
 
     def open_modal(self, modal: discord.ui.Modal, source_message_id: str | None) -> None:
         title = modal.title if isinstance(modal.title, str) else "Modal"
@@ -942,7 +988,9 @@ class Session:
         )
         self.next_modal_id += 1
         self._touch()
-        self.log("📋", f"modal opened: {title!r}")
+        self.log("📋", f"modal opened: {title!r}", kind="action",
+                 details={"operation": "interaction.response.send_modal", "title": title,
+                          "source_message_id": source_message_id})
 
     def clear_timeline(self) -> None:
         self.messages.clear()
@@ -978,9 +1026,12 @@ class Session:
         key = str(channel_id)
         ch = self.channels.get(key)
         if ch is None:
+            self.log("⚠️", f"channel.delete targeted missing channel #{key}", "warn", kind="action",
+                     details={"operation": "channel.delete", "channel_id": key, "status": "missing_channel"})
             return
         if len(self.channels) <= 1:
-            self.log("⚠️", "can't delete the last remaining channel", "warn")
+            self.log("⚠️", "can't delete the last remaining channel", "warn", kind="action",
+                     details={"operation": "channel.delete", "channel": ch.name, "status": "blocked_last_channel"})
             return
         del self.channels[key]
         for mid in [m for m, msg in self.messages.items() if msg.get("channel") == key]:
@@ -988,7 +1039,8 @@ class Session:
             msg["deleted"] = True
             if mid in self.order:
                 self.order.remove(mid)
-        self.log("🗑️", f"channel #{ch.name} deleted")
+        self.log("🗑️", f"channel #{ch.name} deleted", kind="action",
+                 details={"operation": "channel.delete", "channel": ch.name, "status": "ok"})
 
     def reset_channels(self) -> None:
         """Back to just #playground — a fresh Run bootstraps its own world."""
@@ -1150,8 +1202,13 @@ async def _do_click(session: Session, message_id: str, custom_id: str, values: l
     if not env:
         raise RuntimeError("Nothing is running yet — press Run first.")
     handler = env.get("on_click")
+    click_details = {"interaction": "component", "custom_id": custom_id,
+                     "message_id": message_id, "values": values}
+    session.log("🖱️", f"component used: {custom_id!r}", kind="event",
+                details={**click_details, "status": "attempted"})
     if not callable(handler):
-        session.log("⚠️", f"clicked {custom_id!r} but no `on_click` handler is defined", "warn")
+        session.log("⚠️", f"clicked {custom_id!r} but no `on_click` handler is defined", "warn",
+                    kind="event", details={**click_details, "status": "missing_handler"})
         return
     interaction = session.build_interaction(
         message_id, custom_id, values, discord.InteractionType.component
@@ -1165,6 +1222,8 @@ async def _do_click(session: Session, message_id: str, custom_id: str, values: l
             "that interaction was never answered — real Discord shows "
             "'This interaction failed'",
             "warn",
+            kind="event",
+            details={**click_details, "status": "unanswered"},
         )
 
 
@@ -1173,8 +1232,12 @@ async def _do_submit(session: Session, modal_id: str, values: dict) -> None:
     if not env:
         raise RuntimeError("Nothing is running yet — press Run first.")
     handler = env.get("on_submit")
+    submit_details = {"interaction": "modal_submit", "modal_id": modal_id, "values": values}
+    session.log("📝", f"modal submitted: {modal_id!r}", kind="event",
+                details={**submit_details, "status": "attempted"})
     if not callable(handler):
-        session.log("⚠️", f"modal {modal_id} submitted but no `on_submit` handler is defined", "warn")
+        session.log("⚠️", f"modal {modal_id} submitted but no `on_submit` handler is defined", "warn",
+                    kind="event", details={**submit_details, "status": "missing_handler"})
         return
     modal = next((m for m in session.modals if m["id"] == modal_id), None)
     if modal is not None:
@@ -1192,6 +1255,8 @@ async def _do_submit(session: Session, modal_id: str, values: dict) -> None:
             "that interaction was never answered — real Discord shows "
             "'This interaction failed'",
             "warn",
+            kind="event",
+            details={**submit_details, "status": "unanswered"},
         )
 
 
@@ -1203,14 +1268,20 @@ async def _do_message(session: Session, content: str, channel_id=None) -> None:
     channel = session.channels.get(str(channel_id), session.channel)
     allowed, reason = channel.permission_check(session.active_user, "send_messages")
     if not allowed:
-        session.log("🚫", f"message blocked: missing send_messages permission ({reason})", "warn")
+        session.log("🚫", f"message blocked: missing send_messages permission ({reason})", "warn",
+                    kind="event", details={"interaction": "message_create", "operation": "message.send",
+                                           "channel": channel.name, "actor": session.active_user.name,
+                                           "permission": "send_messages", "reason": reason, "status": "denied"})
         return
     msg = session.add_message(channel_id=channel_id, content=content,
                               author=session.active_user)
     handle = MockMessage(session, msg["id"], msg.get("author_obj"))
     handler = env.get("on_message")
     if not callable(handler):
-        session.log("⚠️", "message received but no `on_message` handler is defined", "warn")
+        session.log("⚠️", "message received but no `on_message` handler is defined", "warn",
+                    kind="event", details={"interaction": "message_create", "operation": "message.send",
+                                           "channel": channel.name, "actor": session.active_user.name,
+                                           "status": "missing_handler"})
         return
     result = _call(handler, handle)
     if inspect.isawaitable(result):
@@ -1298,6 +1369,15 @@ def state(session: Session) -> dict:
     for mid in session.order:
         msg = {k: v for k, v in session.messages[mid].items() if k != "author_obj"}
         msgs.append(msg)
+    permission_names = ("view_channel", "send_messages", "manage_messages", "manage_channels")
+    permissions = {
+        label: {
+            name: {"allowed": allowed, "reason": reason}
+            for name in permission_names
+            for allowed, reason in [session.channel.permission_check(member, name)]
+        }
+        for label, member in (("user", session.active_user), ("bot", session.guild.me))
+    }
     return {
         "ok": True,
         "sid": session.sid,
@@ -1310,6 +1390,7 @@ def state(session: Session) -> dict:
         # ids as strings: 18-digit snowflakes lose precision as JS numbers
         "channels": [{"id": str(c.id), "name": c.name} for c in session.channels.values()],
         "bot": {"id": session.guild.me.id, "name": session.guild.me.name},
+        "permissions": permissions,
         "members": _members_json(session),
         "messages": msgs,
         "modals": session.modals,

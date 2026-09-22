@@ -62,6 +62,8 @@ Inspect the resulting messages and console events
 - Folder-backed `bots/<name>/bot.py` workspaces.
 - Vendored Embeder provenance exposed through `GET /api/embeder/info`; the current marker records DiscordEmbeder commit `0fc06253ce5c86ac77a91b4f4dabfcec49b4daf8`.
 - Readable permission-denial diagnostics that identify the existing resolution step that rejected an operation.
+- A runtime **State inspector** in the console pane showing the active user, bot, channel, counts, users, channels, current permission results, and recent event snapshot.
+- **Events** and **Actions** inspector tabs showing structured runtime entries; selecting an entry reveals its details and simulated API operation arguments, including missing, denied, blocked, and unanswered attempts. Expanded details remain visible while the session refreshes.
 - Local script library, saved design projects, and mock runtime stress coverage.
 - Canonical project-state validation before design loading, saving, code generation, and runtime use.
 
