@@ -266,6 +266,16 @@ async def get_state(request: web.Request) -> web.Response:
     return web.json_response(state(_get_session(request)))
 
 
+async def set_user(request: web.Request) -> web.Response:
+    session = _get_session(request)
+    body = await request.json()
+    try:
+        session.set_user(int(body.get("user_id")))
+    except (TypeError, ValueError):
+        return web.json_response({"ok": False, "error": "unknown simulated user"}, status=400)
+    return web.json_response(state(session))
+
+
 async def run_code(request: web.Request) -> web.Response:
     session = _get_session(request)
     body = await request.json()
@@ -365,6 +375,7 @@ def build_app() -> web.Application:
     app.router.add_post("/api/bridge/design-to-code", bridge_design_to_code)
     app.router.add_post("/api/session", create_session)
     app.router.add_get("/api/session/{sid}/state", get_state)
+    app.router.add_post("/api/session/{sid}/user", set_user)
     app.router.add_post("/api/session/{sid}/run", run_code)
     app.router.add_post("/api/session/{sid}/click", click)
     app.router.add_post("/api/session/{sid}/submit", submit_modal)
