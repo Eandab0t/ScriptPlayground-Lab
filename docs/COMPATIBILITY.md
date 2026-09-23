@@ -18,6 +18,7 @@ ScriptPlayground uses `discord.py` types where practical, but the transport is a
 | Components V2 bridge | Validated designs generate runnable `discord.py` source; bridge fixtures cover nested accessories, galleries, separators, spoiler containers, and nested controls. |
 | Embeder provenance | `GET /api/embeder/info` reports the committed marker for the vendored local build; it does not contact DiscordEmbeder at runtime. |
 | Runtime inspection | The browser State, Events, and Actions tabs read the current session state; State also shows active-user and bot permission results with resolver reasons, event/action rows can be expanded to inspect JSON-safe details, including failed attempts, and no new runtime state owner is added. |
+| Optional Discord identity | Server-side OAuth2 authorization-code flow with `identify` only, state validation, memory-scoped identity session, logout, generic provider errors, and callback-query access-log redaction on the production `web.run_app()` entry point; callers embedding `build_app()` must configure the same logger explicitly, and the flow does not import guilds or alter the simulator. |
 | Channels | In-memory text channels with normalized names and duplicate suffixes. |
 | Files | Small image files become inline data URIs; other files remain metadata chips. |
 
@@ -38,11 +39,12 @@ This covers the operations already represented in the playground. It does not cl
 
 ## Known gaps
 
-- No real gateway events or REST requests.
+- No real gateway events or simulator REST requests. OAuth's identity request is the deliberate exception: it calls Discord only during an explicitly configured sign-in callback, never from simulator operations.
 - No permission-management UI.
 - No multi-guild state.
 - No voice or stage model.
 - No threads, DMs, webhooks, forums, scheduled events, rate limits, or intent simulation.
+- OAuth sessions are memory-only, do not survive restart, and do not provide guild discovery, account settings, real Discord data access, or real Discord actions. Callback-query redaction is guaranteed by the production `web.run_app()` wiring, not by arbitrary embedding callers that choose aiohttp's default access logger.
 - Some mock methods are intentionally shallow and may accept arguments that real Discord would reject.
 
 When adding a new compatibility feature, define the behavior first with a small test that follows the real user/runtime path. Avoid expanding the mock surface just to make an API listing look complete.

@@ -58,6 +58,12 @@ Review ScriptPlayground's State, Events, and Actions inspector tabs. Trace Sessi
 Audit ScriptPlayground's Components V2 bridge and vendored Embeder build. For every fixture under tests/fixtures/bridge_roundtrip/, verify JSON → project validation → bridge.py → generated LayoutView → mock runtime, including serialized nesting and nested dispatch. Compare embeder/VENDORED_FROM.txt with the actual authoritative source commit and GET /api/embeder/info, and verify the committed embeder/index.html is the build described by that marker. Report only concrete drift or missing coverage; do not refresh artifacts or redesign the bridge during the audit.
 ```
 
+## OAuth review
+
+```text
+Review ScriptPlayground's optional Discord OAuth2 identity flow. Verify configuration is server-side, the default scope is exactly identify, state is cryptographically random, single-use, expiry-bounded, and validated before code exchange, secrets/tokens never reach browser state or logs, callback failures are graceful, logout removes the memory-scoped session, and missing configuration preserves offline mode. Confirm OAuth identity remains separate from simulated users and does not add guild discovery or simulator network behavior. Verify callback-query redaction through the production `web.run_app()` access logger, and distinguish that guarantee from embedding callers that bypass the configured logger. Use mocked HTTP responses and report only concrete security or correctness gaps; do not turn this into a production auth platform or security-sandbox claim.
+```
+
 ## Release-candidate audit
 
 ```text

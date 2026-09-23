@@ -4,7 +4,7 @@
 
 ```text
 main.py
-  HTTP routes, session lookup, static files, workspace/library/design APIs
+  HTTP routes, optional Discord OAuth identity flow, in-memory auth/session lookup, static files, workspace/library/design APIs
 
 playground.py
   Mock Discord objects, session state, permission resolution,
@@ -21,11 +21,19 @@ scripts/vendor_embeder.py
   Copies the authoritative Embeder dist and writes embeder/VENDORED_FROM.txt.
 
 static/index.html
-  Single-file browser UI, editor, preview, selectors, state/event/action inspectors, and API calls
+  Single-file browser UI, dark-first desktop Discord-like shell, optional sign-in entry point, editor, preview, selectors, local display settings, state/event/action inspectors, and API calls
+
+The browser theme is owned by the `:root` semantic tokens in `static/index.html`; density and message display preferences are UI-only localStorage settings and do not enter session state or runtime behavior.
 
 tests/test_smoke.py
   Offline behavioral contract for the runtime, bridge, server, and stress cases
 ```
+
+## Optional identity flow
+
+When `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET`, and `DISCORD_REDIRECT_URI` are all configured, `/auth/discord/login` creates a cryptographically random, server-memory OAuth state, mirrors it in an HttpOnly short-lived state cookie, and redirects to Discord with the `identify` scope only. The callback consumes and validates both state copies, exchanges the code server-side, fetches `/users/@me` server-side, and stores only the returned identity behind an HttpOnly session cookie. `/auth/logout` removes that in-memory session. Missing configuration returns a clear disabled response and the browser keeps its offline entry point.
+
+OAuth identity is separate from `Session.active_user`: it does not populate simulated members, read guilds, call the gateway, or send REST operations on the user's behalf. Tokens and client secrets never enter browser state or session JSON. Callback provider failures are returned as generic errors. The production `web.run_app()` entry point uses `_AccessLogger` to omit the callback query string so authorization codes and state values are not logged; callers embedding `build_app()` must configure that access logger explicitly. State/session data is intentionally memory-only for this local tool; the event-loop execution model is not a security sandbox.
 
 ## Runtime flow
 
@@ -86,6 +94,7 @@ MockChannel operation or interaction metadata
 ## State boundaries
 
 - Session state is in memory and scoped to one browser/runtime session.
+- OAuth state and authenticated identity sessions are owned by `main.py`; they are separate from simulated Discord session state and are not persisted.
 - `Session.events` remains the single event/action stream. Entries carry a `kind` and optional JSON-safe `details`; attempted, denied, blocked, missing, and unanswered operations are recorded there, and the browser filters and expands that stream without creating another state owner. Expanded event/action details stay open across ordinary state refreshes.
 - `state(session)` derives the State inspector's active-user and bot permission summaries from `MockChannel.permission_check()`; the UI does not calculate permissions independently.
 - Saved designs are JSON files under `scripts/designs/`; bridge fixtures live under `tests/fixtures/bridge_roundtrip/`.
