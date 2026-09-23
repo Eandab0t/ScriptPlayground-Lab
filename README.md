@@ -1,6 +1,6 @@
 # ScriptPlayground
 
-A **local Discord bot playground** — no token, no server, no network. The UI
+A **local Discord bot playground** — by default, no token, no server, and no Discord network calls. The optional configured OAuth identity flow is the only path that contacts Discord. The UI
 uses Discord's dark palette and `gg sans`/Discord's standard fallback font stack.
 Write
 plain `discord.py` code in the web editor, press **Run**, and see exactly what
@@ -25,6 +25,18 @@ python main.py            # opens http://127.0.0.1:8741 in your browser
 ```
 
 Options: `--port 8741`, `--host 127.0.0.1`, `--no-browser`.
+
+### Optional Discord identity sign-in
+
+Offline simulation remains the default. To enable the optional **Sign in with Discord** link, configure these server-side environment variables before launch and register the exact callback URI in the Discord developer portal:
+
+```text
+DISCORD_CLIENT_ID=your-application-client-id
+DISCORD_CLIENT_SECRET=your-application-client-secret
+DISCORD_REDIRECT_URI=http://127.0.0.1:8741/auth/discord/callback
+```
+
+The server uses Discord's authorization-code flow with the `identify` scope only. It validates a short-lived, single-use OAuth state, keeps the code exchange and identity request server-side, and stores only an in-memory identity session behind an HttpOnly cookie; that session disappears when the server restarts. It does not request `guilds`, connect the simulator to Discord, or expose the client secret/access token to the browser. Provider failures return a generic error. The production `python main.py` entry point omits the callback query string from aiohttp access logs so authorization `code` and `state` values are not logged; callers embedding `build_app()` must configure the same `_AccessLogger` explicitly. Without all three variables, the link reports **Offline mode** and no OAuth request is made.
 
 ## DiscordEmbeder (Components V2 builder)
 

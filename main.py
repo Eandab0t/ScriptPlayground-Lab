@@ -11,15 +11,20 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hmac
 import json
 import logging
+import os
 import re
 import secrets
 import threading
+import time
 import webbrowser
 from pathlib import Path
+from urllib.parse import urlencode
 
-from aiohttp import web
+from aiohttp import ClientError, ClientSession, ClientTimeout, web
+from aiohttp.web_log import AccessLogger
 
 import bridge
 from playground import (
@@ -42,6 +47,13 @@ _DESIGNS_SUBDIR = "designs"
 _MAIN_SCRIPT = "demo"
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_ -]{1,50}$")
 
+_OAUTH_AUTHORIZE_URL = "https://discord.com/oauth2/authorize"
+_OAUTH_TOKEN_URL = "https://discord.com/api/oauth2/token"
+_OAUTH_USER_URL = "https://discord.com/api/users/@me"
+_AUTH_COOKIE = "scriptplayground_auth"
+_OAUTH_STATE_COOKIE = "scriptplayground_oauth_state"
+_OAUTH_STATE_TTL = 600
+
 
 def _script_path(name: str) -> Path:
     """Resolve a library name to a .py file, rejecting path escapes."""
@@ -51,6 +63,59 @@ def _script_path(name: str) -> Path:
 
 SESSIONS: dict[str, Session] = {}
 WS_CLIENTS: dict[str, set[web.WebSocketResponse]] = {}
+OAUTH_STATES: dict[str, float] = {}
+AUTH_SESSIONS: dict[str, dict[str, str | None]] = {}
+
+
+def _oauth_config() -> dict[str, str] | None:
+    values = {name: os.getenv(name, "").strip() for name in (
+        "DISCORD_CLIENT_ID", "DISCORD_CLIENT_SECRET", "DISCORD_REDIRECT_URI"
+    )}
+    return values if all(values.values()) else None
+
+
+def _auth_user(request: web.Request) -> dict[str, str | None] | None:
+    return AUTH_SESSIONS.get(request.cookies.get(_AUTH_COOKIE))
+
+
+async def _oauth_request(method: str, url: str, **kwargs) -> tuple[int, dict]:
+    async with ClientSession(timeout=ClientTimeout(total=10)) as client, client.request(method, url, **kwargs) as response:
+        try:
+            payload = await response.json(content_type=None)
+        except (TypeError, ValueError):
+            payload = {}
+        return response.status, payload if isinstance(payload, dict) else {}
+
+
+def _oauth_state() -> str:
+    now = time.monotonic()
+    for value, created in list(OAUTH_STATES.items()):
+        if now - created > _OAUTH_STATE_TTL:
+            OAUTH_STATES.pop(value, None)
+    value = secrets.token_urlsafe(32)
+    OAUTH_STATES[value] = now
+    return value
+
+
+def _auth_error(message: str, status: int) -> web.Response:
+    return web.json_response({"ok": False, "error": message}, status=status)
+
+
+class _AccessLogger(AccessLogger):
+    """Keep OAuth callback credentials out of request-target access logs."""
+
+    def __init__(self, logger, log_format=AccessLogger.LOG_FORMAT):
+        super().__init__(logger, log_format)
+        self._methods = [
+            (key, self._format_r if key == "first_request_line" else method)
+            for key, method in self._methods
+        ]
+
+    @staticmethod
+    def _format_r(request, response, request_time):
+        if request is not None and request.path == "/auth/discord/callback":
+            return f"{request.method} {request.path} HTTP/{request.version.major}.{request.version.minor}"
+        return AccessLogger._format_r(request, response, request_time)
 
 
 def _get_session(request: web.Request) -> Session:
@@ -93,6 +158,103 @@ async def create_session(_request: web.Request) -> web.Response:
     main_script = SCRIPTS_DIR / f"{_MAIN_SCRIPT}.py"
     example = main_script.read_text(encoding="utf-8") if main_script.exists() else ""
     return web.json_response({"sid": sid, "example": example, "state": state(SESSIONS[sid])})
+
+
+async def auth_status(request: web.Request) -> web.Response:
+    user = _auth_user(request)
+    return web.json_response({
+        "configured": _oauth_config() is not None,
+        "authenticated": user is not None,
+        "user": user,
+    })
+
+
+async def discord_login(request: web.Request) -> web.Response:
+    config = _oauth_config()
+    if config is None:
+        return _auth_error("Discord sign-in is not configured; continue in offline mode.", 503)
+    state_value = _oauth_state()
+    query = urlencode({
+        "client_id": config["DISCORD_CLIENT_ID"],
+        "redirect_uri": config["DISCORD_REDIRECT_URI"],
+        "response_type": "code",
+        "scope": "identify",
+        "state": state_value,
+    })
+    response = web.HTTPFound(f"{_OAUTH_AUTHORIZE_URL}?{query}")
+    response.set_cookie(
+        _OAUTH_STATE_COOKIE, state_value, path="/", httponly=True,
+        samesite="Lax", secure=request.secure, max_age=_OAUTH_STATE_TTL,
+    )
+    return response
+
+
+async def discord_callback(request: web.Request) -> web.Response:
+    config = _oauth_config()
+    if config is None:
+        return _auth_error("Discord sign-in is not configured; continue in offline mode.", 503)
+    state_value = request.query.get("state", "")
+    created = OAUTH_STATES.pop(state_value, None)
+    cookie_state = request.cookies.get(_OAUTH_STATE_COOKIE, "")
+    if (
+        created is None
+        or time.monotonic() - created > _OAUTH_STATE_TTL
+        or not hmac.compare_digest(state_value.encode("utf-8"), cookie_state.encode("utf-8"))
+    ):
+        return _auth_error("Discord sign-in could not be verified. Please try again.", 400)
+    if request.query.get("error"):
+        return _auth_error("Discord authorization was not completed.", 400)
+    code = request.query.get("code", "")
+    if not code:
+        return _auth_error("Discord did not return an authorization code.", 400)
+    try:
+        token_status, token = await _oauth_request(
+            "POST",
+            _OAUTH_TOKEN_URL,
+            data={
+                "client_id": config["DISCORD_CLIENT_ID"],
+                "client_secret": config["DISCORD_CLIENT_SECRET"],
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": config["DISCORD_REDIRECT_URI"],
+            },
+            headers={"Accept": "application/json"},
+        )
+        access_token = token.get("access_token")
+        if token_status != 200 or not isinstance(access_token, str) or not access_token:
+            return _auth_error("Discord sign-in could not exchange the authorization code.", 502)
+        user_status, user = await _oauth_request(
+            "GET", _OAUTH_USER_URL,
+            headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+        )
+    except (ClientError, OSError, asyncio.TimeoutError):
+        return _auth_error("Discord sign-in is temporarily unavailable.", 502)
+    if user_status != 200 or not user.get("id") or not user.get("username"):
+        return _auth_error("Discord sign-in could not retrieve your identity.", 502)
+    identity = {
+        "id": str(user["id"]),
+        "username": str(user["username"]),
+        "global_name": user.get("global_name"),
+        "avatar": user.get("avatar"),
+    }
+    auth_id = secrets.token_urlsafe(32)
+    AUTH_SESSIONS[auth_id] = identity
+    response = web.HTTPFound("/")
+    response.set_cookie(
+        _AUTH_COOKIE, auth_id, path="/", httponly=True, samesite="Lax",
+        secure=request.secure,
+    )
+    response.del_cookie(_OAUTH_STATE_COOKIE, path="/")
+    return response
+
+
+async def logout(request: web.Request) -> web.Response:
+    auth_id = request.cookies.get(_AUTH_COOKIE)
+    if auth_id:
+        AUTH_SESSIONS.pop(auth_id, None)
+    response = web.HTTPFound("/")
+    response.del_cookie(_AUTH_COOKIE, path="/")
+    return response
 
 
 _HIDDEN_SCRIPTS = {"vendor_embeder"}  # internal tooling, not runnable demos
@@ -368,6 +530,10 @@ def build_app() -> web.Application:
     app = web.Application()
     app.on_startup.append(on_startup)
     app.router.add_get("/", index)
+    app.router.add_get("/api/auth/status", auth_status)
+    app.router.add_get("/auth/discord/login", discord_login)
+    app.router.add_get("/auth/discord/callback", discord_callback)
+    app.router.add_get("/auth/logout", logout)
     app.router.add_get("/embeder", embeder_page)
     app.router.add_get("/api/embeder/info", embeder_info)
     app.router.add_get("/api/workspaces", list_workspaces)
@@ -408,7 +574,8 @@ def main() -> None:
     if not args.no_browser:
         threading.Timer(0.6, webbrowser.open, args=(url,)).start()
     log.info("ScriptPlayground listening on %s", url)
-    web.run_app(build_app(), host=args.host, port=args.port, print=None)
+    web.run_app(build_app(), host=args.host, port=args.port, print=None,
+                access_log_class=_AccessLogger)
 
 
 if __name__ == "__main__":
