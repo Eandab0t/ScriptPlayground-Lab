@@ -4,11 +4,13 @@ Run from the project root:
 
     python -m tests.test_smoke
 
-Uses throwaway Session objects; no server, no network, no files touched.
+Most checks use throwaway Session objects without network access; the OAuth checks use mocked provider calls, and the access-log regression starts a throwaway local aiohttp server. No external Discord credentials or network calls are used.
 """
 
 import asyncio
+import os
 import sys
+from pathlib import Path
 
 import discord
 
@@ -240,6 +242,16 @@ async def test_print_and_send_helpers():
     await run_script(s, "print('to console')\nasync def main():\n    await send('via helper')")
     assert any("to console" in e["text"] for e in s.events)
     assert last_msg(s)["content"] == "via helper"
+
+
+async def test_discord_desktop_shell_contract():
+    html = (Path(__file__).parents[1] / "static" / "index.html").read_text(encoding="utf-8")
+    for token in ("--background-primary", "--background-secondary", "--background-tertiary", "--brand-primary", "--text-normal"):
+        assert token in html
+    for element in ("server-rail", "Local simulation", "sim-context", "Act as user", "density-select", "message-display", "account-link", "/auth/discord/login"):
+        assert element in html
+    assert "localStorage.getItem(\"pg-density\")" in html
+    assert "@media (max-width: 980px)" in html
 
 
 async def test_events_and_actions_are_structured():
@@ -595,12 +607,244 @@ async def test_restart_boots_fresh_runtime():
 class _FakeReq:
     """Just enough of an aiohttp request for the library handlers."""
 
-    def __init__(self, match=None, body=None):
+    def __init__(self, match=None, body=None, query=None, cookies=None, secure=False):
         self.match_info = match or {}
         self._body = body or {}
+        self.query = query or {}
+        self.cookies = cookies or {}
+        self.secure = secure
 
     async def json(self):
         return self._body
+
+
+async def test_discord_oauth_unconfigured_mode():
+    import json
+
+    import main as server
+
+    names = ("DISCORD_CLIENT_ID", "DISCORD_CLIENT_SECRET", "DISCORD_REDIRECT_URI")
+    saved = {name: os.environ.pop(name, None) for name in names}
+    try:
+        status = json.loads((await server.auth_status(_FakeReq())).body)
+        assert status == {"configured": False, "authenticated": False, "user": None}
+        response = await server.discord_login(_FakeReq())
+        assert response.status == 503
+    finally:
+        for name, value in saved.items():
+            if value is not None:
+                os.environ[name] = value
+
+
+async def test_discord_oauth_state_and_callback_errors():
+    import main as server
+
+    saved = {name: os.environ.get(name) for name in (
+        "DISCORD_CLIENT_ID", "DISCORD_CLIENT_SECRET", "DISCORD_REDIRECT_URI"
+    )}
+    os.environ.update({
+        "DISCORD_CLIENT_ID": "client-id",
+        "DISCORD_CLIENT_SECRET": "client-secret",
+        "DISCORD_REDIRECT_URI": "http://127.0.0.1:8741/auth/discord/callback",
+    })
+    try:
+        redirect = await server.discord_login(_FakeReq())
+        location = redirect.location
+        cookie_state = redirect.cookies[server._OAUTH_STATE_COOKIE].value
+        assert redirect.status == 302
+        assert "scope=identify" in location and "guilds" not in location
+        assert "client-secret" not in location
+        assert cookie_state in server.OAUTH_STATES
+        mismatch = await server.discord_callback(_FakeReq(query={"state": "wrong"}))
+        assert mismatch.status == 400
+        state_value = server._oauth_state()
+        cancelled = await server.discord_callback(_FakeReq(
+            query={"state": state_value, "error": "access_denied"},
+            cookies={server._OAUTH_STATE_COOKIE: state_value},
+        ))
+        assert cancelled.status == 400
+        assert "client-secret" not in str(cancelled)
+    finally:
+        server.OAUTH_STATES.clear()
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+async def test_discord_oauth_success_and_logout():
+    import json
+
+    import main as server
+
+    saved = {name: os.environ.get(name) for name in (
+        "DISCORD_CLIENT_ID", "DISCORD_CLIENT_SECRET", "DISCORD_REDIRECT_URI"
+    )}
+    original_request = server._oauth_request
+    os.environ.update({
+        "DISCORD_CLIENT_ID": "client-id",
+        "DISCORD_CLIENT_SECRET": "client-secret",
+        "DISCORD_REDIRECT_URI": "http://127.0.0.1:8741/auth/discord/callback",
+    })
+
+    async def fake_request(method, url, **kwargs):
+        if method == "POST":
+            assert kwargs["data"]["client_secret"] == "client-secret"
+            return 200, {"access_token": "access-token"}
+        assert kwargs["headers"]["Authorization"] == "Bearer access-token"
+        return 200, {"id": "42", "username": "reviewer", "global_name": "Reviewer", "avatar": "hash"}
+
+    server._oauth_request = fake_request
+    try:
+        state_value = server._oauth_state()
+        response = await server.discord_callback(_FakeReq(
+            query={"state": state_value, "code": "code"},
+            cookies={server._OAUTH_STATE_COOKIE: state_value},
+        ))
+        assert response.status == 302 and response.location == "/"
+        cookie = response.cookies[server._AUTH_COOKIE]
+        auth_id = cookie.value
+        identity = server.AUTH_SESSIONS[auth_id]
+        assert identity["id"] == "42" and identity["username"] == "reviewer"
+        status = json.loads((await server.auth_status(_FakeReq(cookies={server._AUTH_COOKIE: auth_id}))).body)
+        assert status["authenticated"] is True and status["user"] == identity
+        logged_out = await server.logout(_FakeReq(cookies={server._AUTH_COOKIE: auth_id}))
+        assert logged_out.status == 302 and auth_id not in server.AUTH_SESSIONS
+    finally:
+        server._oauth_request = original_request
+        server.OAUTH_STATES.clear()
+        server.AUTH_SESSIONS.clear()
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+async def test_oauth_callback_access_log_redacts_query():
+    import io
+    import logging
+
+    from aiohttp import ClientSession, web
+
+    import main as server
+
+    names = ("DISCORD_CLIENT_ID", "DISCORD_CLIENT_SECRET", "DISCORD_REDIRECT_URI")
+    saved = {name: os.environ.get(name) for name in names}
+    os.environ.update({
+        "DISCORD_CLIENT_ID": "client-id",
+        "DISCORD_CLIENT_SECRET": "client-secret",
+        "DISCORD_REDIRECT_URI": "http://127.0.0.1:8741/auth/discord/callback",
+    })
+    stream = io.StringIO()
+    logger = logging.getLogger("test.oauth.access")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    handler = logging.StreamHandler(stream)
+    logger.addHandler(handler)
+    # build_app() is deliberately transport-neutral; redaction belongs to the
+    # production web.run_app() wiring and must be supplied by custom runners.
+    runner = web.AppRunner(
+        server.build_app(), access_log=logger, access_log_class=server._AccessLogger
+    )
+    try:
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        state_value = "supplied-state"
+        code = "supplied-code"
+        async with ClientSession() as client:
+            callback = await client.get(
+                f"http://127.0.0.1:{port}/auth/discord/callback"
+                f"?state={state_value}&code={code}"
+            )
+            assert callback.status == 400
+            await callback.read()
+            status = await client.get(
+                f"http://127.0.0.1:{port}/api/auth/status?probe=kept"
+            )
+            assert status.status == 200
+            await status.read()
+        logs = stream.getvalue()
+        assert "GET /auth/discord/callback HTTP/1.1" in logs
+        assert "code=" not in logs and "state=" not in logs
+        assert code not in logs and state_value not in logs
+        assert "GET /api/auth/status?probe=kept HTTP/1.1" in logs
+    finally:
+        await runner.cleanup()
+        logger.removeHandler(handler)
+        handler.close()
+        server.OAUTH_STATES.clear()
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+async def test_discord_oauth_provider_failures_are_generic():
+    import json
+
+    from aiohttp import ClientError
+
+    import main as server
+
+    names = ("DISCORD_CLIENT_ID", "DISCORD_CLIENT_SECRET", "DISCORD_REDIRECT_URI")
+    saved = {name: os.environ.get(name) for name in names}
+    original_request = server._oauth_request
+    os.environ.update({
+        "DISCORD_CLIENT_ID": "client-id",
+        "DISCORD_CLIENT_SECRET": "client-secret",
+        "DISCORD_REDIRECT_URI": "http://127.0.0.1:8741/auth/discord/callback",
+    })
+    cases = (
+        ("token-status", "Discord sign-in could not exchange the authorization code."),
+        ("identity-status", "Discord sign-in could not retrieve your identity."),
+        ("token-timeout", "Discord sign-in is temporarily unavailable."),
+        ("identity-timeout", "Discord sign-in is temporarily unavailable."),
+        ("token-network", "Discord sign-in is temporarily unavailable."),
+        ("identity-network", "Discord sign-in is temporarily unavailable."),
+    )
+    try:
+        for failure, expected in cases:
+            async def fake_request(method, url, *, failure=failure, **kwargs):
+                if method == "POST":
+                    if failure == "token-status":
+                        return 400, {"error": "provider detail"}
+                    if failure == "token-timeout":
+                        raise asyncio.TimeoutError
+                    if failure == "token-network":
+                        raise ClientError("provider detail")
+                    return 200, {"access_token": "access-token"}
+                if failure == "identity-status":
+                    return 503, {"error": "provider detail"}
+                if failure == "identity-timeout":
+                    raise asyncio.TimeoutError
+                if failure == "identity-network":
+                    raise ClientError("provider detail")
+                raise AssertionError(f"unexpected OAuth request for {failure}")
+
+            server._oauth_request = fake_request
+            state_value = server._oauth_state()
+            response = await server.discord_callback(_FakeReq(
+                query={"state": state_value, "code": "supplied-code"},
+                cookies={server._OAUTH_STATE_COOKIE: state_value},
+            ))
+            payload = json.loads(response.body)
+            assert response.status == 502
+            assert payload == {"ok": False, "error": expected}
+            assert not server.AUTH_SESSIONS
+    finally:
+        server._oauth_request = original_request
+        server.OAUTH_STATES.clear()
+        server.AUTH_SESSIONS.clear()
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 async def test_script_library_roundtrip():

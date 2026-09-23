@@ -6,11 +6,17 @@
 <title>ScriptPlayground</title>
 <style>
   :root {
-    --bg0: #1e1f22; --bg1: #2b2d31; --bg2: #313338; --bg3: #383a40;
-    --txt: #dbdee1; --txt-dim: #949ba4; --txt-head: #f2f3f5;
-    --blurple: #5865f2; --green: #23a559; --red: #da373c; --orange: #f0b232;
-    --link: #00a8fc; --border: #3f4147;
-    --font-ui: "gg sans", "Noto Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    --background-primary: #313338; --background-secondary: #2b2d31; --background-secondary-alt: #383a40; --background-tertiary: #1e1f22;
+    --background-floating: #111214; --background-input: #232428; --background-modifier-hover: #3a3c43; --background-modifier-selected: #404249;
+    --text-normal: #dbdee1; --text-muted: #949ba4; --text-heading: #f2f3f5; --text-code: #e3e5e8; --text-link: #00a8fc;
+    --interactive-normal: #b5bac1; --interactive-hover: #dbdee1; --interactive-active: #fff;
+    --brand-primary: #5865f2; --brand-primary-hover: #4752c4; --status-success: #23a559; --status-success-hover: #1a6334;
+    --status-danger: #da373c; --status-danger-hover: #a12d31; --status-warning: #f0b232;
+    --border-subtle: #3f4147; --font-ui: "gg sans", "Noto Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    --bg0: var(--background-tertiary); --bg1: var(--background-secondary); --bg2: var(--background-primary); --bg3: var(--background-secondary-alt);
+    --txt: var(--text-normal); --txt-dim: var(--text-muted); --txt-head: var(--text-heading);
+    --blurple: var(--brand-primary); --green: var(--status-success); --red: var(--status-danger); --orange: var(--status-warning);
+    --link: var(--text-link); --border: var(--border-subtle);
   }
   * { box-sizing: border-box; margin: 0; }
   html, body { height: 100%; }
@@ -21,14 +27,19 @@
     overflow: hidden;
   }
   button, input, select, textarea { font-family: var(--font-ui); }
-  #app { display: grid; grid-template-columns: 300px 1fr 460px; height: 100vh; }
-  @media (max-width: 1400px) { #app { grid-template-columns: 1fr 460px; } #sidebar { display: none; } }
-  @media (max-width: 980px)  { #app { grid-template-columns: 1fr; } #editor-pane { display: none; } }
+  #app { display: grid; grid-template-columns: 72px 280px 1fr 460px; height: 100vh; }
+
+  /* ---------- server rail ---------- */
+  #server-rail { background: var(--background-tertiary); display: flex; flex-direction: column; align-items: center; gap: 8px; padding-top: 12px; border-right: 1px solid var(--border); }
+  .server-icon { width: 44px; height: 44px; border-radius: 22px; background: var(--background-primary); color: var(--text-normal); display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; letter-spacing: .02em; transition: border-radius .15s, background .15s; }
+  .server-icon.active { border-radius: 14px; background: var(--brand-primary); color: #fff; }
+  .server-separator { width: 32px; height: 1px; background: var(--border); margin: 2px 0; }
 
   /* ---------- channel sidebar ---------- */
   #sidebar { background: var(--bg1); display: flex; flex-direction: column; border-right: 1px solid var(--border); }
-  .guild-head { padding: 12px 16px; font-weight: 700; color: var(--txt-head); font-size: 15px;
+  .guild-head { padding: 10px 16px; font-weight: 700; color: var(--txt-head); font-size: 15px;
                 border-bottom: 1px solid var(--border); box-shadow: 0 1px 0 rgba(0,0,0,.2); }
+  .local-label { color: var(--text-muted); font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
   .channel-row { padding: 8px 16px; color: var(--txt-dim); cursor: pointer; display: flex; gap: 6px; align-items: center; }
   .channel-row.active { background: var(--bg3); color: var(--txt-head); border-radius: 4px; margin: 0 8px; padding: 8px 8px; }
   .channel-row:hover { color: var(--txt-head); }
@@ -36,9 +47,10 @@
                           border-radius: 8px; padding: 0 6px; min-width: 10px; text-align: center; }
   .channel-cat { padding: 14px 16px 4px; font-size: 11px; font-weight: 700; letter-spacing: .05em;
                  color: var(--txt-dim); text-transform: uppercase; }
-  .sidebar-foot { margin-top: auto; padding: 10px; background: #232428; display: flex; align-items: center; gap: 10px; }
-  .avatar { width: 34px; height: 34px; border-radius: 50%; flex: none;
+  .sidebar-foot { margin-top: auto; padding: 10px; background: var(--background-tertiary); display: flex; align-items: center; gap: 10px; border-top: 1px solid var(--border); }
+  .avatar { width: 34px; height: 34px; border-radius: 50%; flex: none; background: var(--brand-primary);
             display: flex; align-items: center; justify-content: center; font-weight: 700; color: #fff; font-size: 14px; }
+  .me-context { color: var(--text-muted); font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
   .me-name { font-size: 13px; font-weight: 600; color: var(--txt-head); }
   .me-tag { font-size: 11px; color: var(--txt-dim); }
   #act-as { width: 112px; margin-left: auto; background: var(--bg0); color: var(--txt); border: 1px solid var(--border);
@@ -51,6 +63,7 @@
                color: var(--txt-head); font-weight: 700; box-shadow: 0 1px 0 rgba(0,0,0,.2); }
   #chat-head .desc { color: var(--txt-dim); font-weight: 400; font-size: 13px; border-left: 1px solid var(--border); padding-left: 10px;
                      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sim-badge { margin-left: auto; color: var(--text-muted); font-size: 10px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; white-space: nowrap; }
   #timeline { flex: 1; overflow-y: auto; padding: 16px 0 8px; }
   .day-divider { display: flex; align-items: center; gap: 8px; margin: 8px 16px; color: var(--txt-dim); font-size: 11px; font-weight: 600; }
   .day-divider::before, .day-divider::after { content: ""; flex: 1; height: 1px; background: var(--border); }
@@ -91,7 +104,7 @@
   .embed-thumb { width: 68px; height: 68px; object-fit: cover; flex: none; }
   .embed-right { display: flex; flex-direction: column; min-width: 0; flex: 1; }
   .embed-body { display: flex; gap: 12px; min-width: 0; }
-  .embed-code { background: #2b2d31; border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px;
+  .embed-code { background: var(--background-secondary); border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px;
                 font: 12.5px/1.4 Consolas, monospace; white-space: pre-wrap; word-break: break-word; display: block; margin: 2px 0; }
   .embed-author { font-size: 12.5px; font-weight: 700; color: var(--txt-head); margin-bottom: 4px; }
 
@@ -100,16 +113,16 @@
   .btn { border: none; border-radius: 4px; padding: 6px 14px; font-size: 13.5px; font-weight: 600; cursor: pointer;
          color: #fff; font-family: inherit; }
   .btn:disabled { opacity: .45; cursor: not-allowed; }
-  .btn-1 { background: var(--blurple); } .btn-1:hover:not(:disabled) { background: #4752c4; }
+  .btn-1 { background: var(--blurple); } .btn-1:hover:not(:disabled) { background: var(--brand-primary-hover); }
   .btn-2 { background: #4e5058; } .btn-2:hover:not(:disabled) { background: #6d6f78; }
-  .btn-3 { background: var(--green); } .btn-3:hover:not(:disabled) { background: #1a6334; }
-  .btn-4 { background: var(--red); } .btn-4:hover:not(:disabled) { background: #a12d31; }
+  .btn-3 { background: var(--green); } .btn-3:hover:not(:disabled) { background: var(--status-success-hover); }
+  .btn-4 { background: var(--red); } .btn-4:hover:not(:disabled) { background: var(--status-danger-hover); }
   .btn-5 { background: #80848e; color: #000; } .btn-5:hover:not(:disabled) { background: #6d6f78; }
   .btn.btn-link { background: transparent; color: var(--link); text-decoration: underline; }
   .select-wrap { position: relative; }
   .sel { appearance: none; background: var(--bg1); color: var(--txt); border: 1px solid var(--border); border-radius: 4px;
          padding: 7px 30px 7px 10px; font-size: 13.5px; font-family: inherit; cursor: pointer; max-width: 300px; }
-  .sel:hover:not(:disabled) { border-color: #1c1d20; }
+  .sel:hover:not(:disabled) { border-color: var(--interactive-normal); }
   .sel.multi { max-width: 340px; }
   .select-wrap::after { content: "▾"; position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
                         color: var(--txt-dim); pointer-events: none; font-size: 12px; }
@@ -136,13 +149,13 @@
   .cmd-chip.msg-chip { background: var(--bg1); border: 1px solid var(--border); color: var(--txt-dim); font-size: 11.5px; padding: 1px 6px; }
   #cmd-form .pf { display: flex; flex-direction: column; gap: 2px; min-width: 110px; flex: 1; }
   #cmd-form .pf label { font-size: 10.5px; color: var(--txt-dim); font-weight: 700; letter-spacing: .03em; }
-  #cmd-form .pf input, #cmd-form .pf select { background: var(--bg0); border: 1px solid #232428; border-radius: 4px;
+  #cmd-form .pf input, #cmd-form .pf select { background: var(--bg0); border: 1px solid var(--background-input); border-radius: 4px;
       color: var(--txt); padding: 6px 8px; font: inherit; font-size: 13px; outline: none; min-width: 0; }
   #cmd-form .pf input:focus, #cmd-form .pf select:focus { border-color: var(--blurple); }
   #cmd-form .pf .req { color: var(--red); }
   #cmd-send { background: var(--blurple); color: #fff; border: none; border-radius: 4px; padding: 8px 16px;
               font: inherit; font-size: 13px; font-weight: 700; cursor: pointer; }
-  #cmd-send:hover { background: #4752c4; }
+  #cmd-send:hover { background: var(--brand-primary-hover); }
   #cmd-cancel { background: transparent; border: none; color: var(--txt-dim); cursor: pointer; font-size: 15px; padding: 4px; }
   #cmd-cancel:hover { color: var(--txt); }
 
@@ -174,7 +187,7 @@
   /* ---------- workspace + block editor ---------- */
   #workspace-bar { display: flex; gap: 6px; align-items: center; padding: 7px 14px; border-bottom: 1px solid var(--border); }
   #workspace-bar label { color: var(--txt-dim); font-size: 11px; font-weight: 700; text-transform: uppercase; }
-  #workspace-select { flex: 1; min-width: 0; background: var(--bg0); color: var(--txt); border: 1px solid #232428; border-radius: 6px; padding: 5px; }
+  #workspace-select { flex: 1; min-width: 0; background: var(--bg0); color: var(--txt); border: 1px solid var(--background-input); border-radius: 6px; padding: 5px; }
   #block-panel { display: none; position: absolute; inset: 84px 14px 14px; z-index: 4; background: var(--bg1); border: 1px solid var(--border); border-radius: 8px; padding: 12px; overflow: auto; box-shadow: 0 8px 30px rgba(0,0,0,.45); }
   #block-panel.open { display: block; }
   #editor-pane { position: relative; }
@@ -190,9 +203,19 @@
   #editor-pane { background: var(--bg1); border-left: 1px solid var(--border); display: flex; flex-direction: column; min-width: 0; }
   #editor-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px;
                  border-bottom: 1px solid var(--border); color: var(--txt-head); font-weight: 700; }
+  .view-settings { display: flex; align-items: center; gap: 5px; margin-left: 12px; }
+  .view-settings label { color: var(--text-muted); font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+  .view-settings select { background: var(--background-tertiary); border: 1px solid var(--border); border-radius: 4px; color: var(--text-normal); font: inherit; font-size: 11px; padding: 4px 5px; }
+  .view-settings select:focus, #act-as:focus { border-color: var(--brand-primary); outline: 2px solid rgba(88,101,242,.25); outline-offset: 1px; }
+  body[data-density="compact"] #timeline .msg { padding-top: 2px; padding-bottom: 2px; }
+  body[data-density="compact"] #timeline { padding-top: 8px; }
+  body[data-message-display="compact"] #timeline .msg { gap: 8px; padding-top: 2px; padding-bottom: 2px; }
+  body[data-message-display="compact"] #timeline .msg .avatar { width: 28px; height: 28px; font-size: 12px; }
+  body[data-message-display="compact"] #timeline .msg-author { font-size: 13px; }
+  body[data-message-display="compact"] #timeline .msg-time { font-size: 10px; }
   #btn-run { background: var(--green); border: none; color: #fff; font-weight: 700; border-radius: 6px;
              padding: 8px 22px; font-size: 14px; cursor: pointer; font-family: inherit; }
-  #btn-run:hover { background: #1a6334; }
+  #btn-run:hover { background: var(--status-success-hover); }
   #btn-run:disabled { opacity: .5; cursor: default; }
   #btn-restart { background: transparent; border: 1px solid var(--border); color: var(--txt-dim); border-radius: 6px;
                  padding: 7px 12px; cursor: pointer; margin-left: 8px; font-family: inherit; font-size: 13px; }
@@ -200,7 +223,7 @@
   #script-lib { display: flex; align-items: center; gap: 8px; padding: 8px 14px; border-bottom: 1px solid var(--border); }
   #script-lib label { font-size: 11px; font-weight: 700; letter-spacing: .04em; color: var(--txt-dim);
                       text-transform: uppercase; flex: none; }
-  #script-select { flex: 1; min-width: 0; background: var(--bg0); border: 1px solid #232428; border-radius: 6px;
+  #script-select { flex: 1; min-width: 0; background: var(--bg0); border: 1px solid var(--background-input); border-radius: 6px;
                    color: var(--txt); padding: 6px 8px; font: inherit; font-size: 13px; outline: none; cursor: pointer; }
   #script-select:focus { border-color: var(--blurple); }
   .lib-btn { background: transparent; border: 1px solid var(--border); border-radius: 6px; color: var(--txt-dim);
@@ -208,7 +231,7 @@
   .lib-btn:hover { color: var(--txt-head); border-color: var(--txt-dim); }
   #btn-save { background: var(--bg3); border-color: transparent; color: var(--txt); font-weight: 600; }
   #btn-save:hover { background: #43464c; border-color: transparent; }
-  #code { flex: 1; width: 100%; background: var(--bg0); color: #e3e5e8; border: none; outline: none; resize: none;
+  #code { flex: 1; width: 100%; background: var(--bg0); color: var(--text-code); border: none; outline: none; resize: none;
           font: 13px/1.55 "Cascadia Code", Consolas, monospace; padding: 14px; tab-size: 4; white-space: pre; }
   #console { border-top: 1px solid var(--border); height: 30%; display: flex; flex-direction: column; }
   #console-head { padding: 8px 14px; font-size: 11px; font-weight: 700; letter-spacing: .04em; color: var(--txt-dim);
@@ -259,7 +282,7 @@
   .modal-field { margin-bottom: 14px; }
   .modal-field label { display: block; font-size: 12.5px; font-weight: 700; color: var(--txt-head); margin-bottom: 6px; }
   .modal-field .req { color: var(--red); }
-  .modal-field input { width: 100%; background: var(--bg0); border: 1px solid #232428; border-radius: 4px; color: var(--txt);
+  .modal-field input { width: 100%; background: var(--bg0); border: 1px solid var(--background-input); border-radius: 4px; color: var(--txt);
                        padding: 9px 10px; font: inherit; outline: none; }
   .modal-field input:focus { border-color: var(--blurple); }
   .modal-hint { font-size: 11.5px; color: var(--txt-dim); margin-top: 4px; }
@@ -268,17 +291,35 @@
   #modal-cancel { background: transparent; border: none; color: var(--txt); cursor: pointer; font: inherit; font-weight: 600; }
   #modal-ok { background: var(--blurple); color: #fff; border: none; border-radius: 4px; padding: 9px 24px;
               font: inherit; font-weight: 700; cursor: pointer; }
-  #modal-ok:hover { background: #4752c4; }
+  #modal-ok:hover { background: var(--brand-primary-hover); }
+
+  /* Keep the desktop shell primary while collapsing secondary surfaces on small screens. */
+  @media (max-width: 1200px) {
+    #app { grid-template-columns: 280px 1fr 420px; }
+    #server-rail { display: none; }
+  }
+  @media (max-width: 980px) {
+    #app { grid-template-columns: 1fr; }
+    #sidebar, #editor-pane { display: none; }
+    #chat-head .desc, #sim-context { display: none; }
+    #chat-head { padding: 10px 12px; }
+    #composer { padding: 0 12px 12px; }
+  }
 </style>
 </head>
 <body>
 <div id="app">
+  <nav id="server-rail" aria-label="Servers">
+    <div class="server-icon active" title="ScriptPlayground local server" aria-label="ScriptPlayground local server">SP</div>
+    <div class="server-separator"></div>
+    <div class="server-icon" title="Offline local simulation" aria-label="Offline local simulation">⌘</div>
+  </nav>
   <nav id="sidebar">
-    <div class="guild-head" id="guild-name">Playground Server</div>
+    <div class="guild-head"><div class="local-label">Local simulation</div><div id="guild-name">Playground Server</div></div>
     <div id="channel-list"></div>
     <div class="sidebar-foot">
-      <div class="avatar" id="me-avatar" style="background:#5865f2">Y</div>
-      <div><div class="me-name" id="me-name">You</div><div class="me-tag" id="me-sub">connected locally</div></div>
+      <div class="avatar" id="me-avatar">Y</div>
+      <div><div class="me-context">Acting as</div><div class="me-name" id="me-name">You</div><div class="me-tag" id="me-sub">connected locally</div></div>
       <label><span class="sr-only">Act as user</span><select id="act-as" title="Act as user"></select></label>
     </div>
   </nav>
@@ -287,7 +328,9 @@
   <header id="chat-head">
     <span id="chat-head-name"># playground</span>
     <span class="desc" id="head-desc">Everything your script sends shows up here — live.</span>
+    <span class="sim-badge" id="sim-context">LOCAL · ACTING AS YOU</span>
     <a class="head-link" href="/embeder" target="_blank" title="Open the Components V2 builder">✦ Embeder</a>
+    <a class="head-link" id="account-link" href="/auth/discord/login" title="Optional Discord identity sign-in">Sign in</a>
   </header>
     <div id="timeline"></div>
     <div id="composer">
@@ -334,14 +377,26 @@
     </div>
     <div id="editor-head">
       <span>bot.py</span>
-      <span>
+      <span style="display:flex;align-items:center">
+        <div class="view-settings" aria-label="Display settings">
+          <label for="density-select">View</label>
+          <select id="density-select" title="Adjust tool spacing">
+            <option value="comfortable">Comfortable</option>
+            <option value="compact">Compact</option>
+          </select>
+          <label class="sr-only" for="message-display">Message display</label>
+          <select id="message-display" title="Adjust message display">
+            <option value="cozy">Cozy</option>
+            <option value="compact">Compact</option>
+          </select>
+        </div>
         <button id="btn-run">▶ Run</button>
         <button id="btn-restart" title="Restart the script runtime">↻</button>
       </span>
     </div>
     <textarea id="code" spellcheck="false" wrap="off"></textarea>
     <div id="console">
-      <div id="console-head">Console <span id="run-stats" class="run-stats"></span>
+      <div id="console-head">Developer tools <span id="run-stats" class="run-stats"></span>
         <button class="inspect-tab active" data-inspector="console" type="button">Console</button>
         <button class="inspect-tab" data-inspector="state" type="button">State</button>
         <button class="inspect-tab" data-inspector="events" type="button">Events</button>
@@ -375,7 +430,28 @@ const dismissedModals = new Set();
 const AVATAR_COLORS = ["#5865f2","#3ba55d","#faa81a","#ed4245","#eb459e","#9b59b6"];
 let lastState = null, cmdMode = null; // cmdMode: the command being composed
 let libScripts = [];                  // the script library listing
-const pickedValues = {}; // "mid|custom_id" -> [values], so selects keep state across re-renders
+const pickedValues = {};               // "mid|custom_id" -> [values], so selects keep state across re-renders
+const viewSettings = {
+    density: localStorage.getItem("pg-density") || "comfortable",
+    messages: localStorage.getItem("pg-message-display") || "cozy",
+  };
+  function applyViewSettings() {
+    document.body.dataset.density = viewSettings.density;
+    document.body.dataset.messageDisplay = viewSettings.messages;
+    $("#density-select").value = viewSettings.density;
+    $("#message-display").value = viewSettings.messages;
+  }
+  $("#density-select").onchange = (event) => {
+    viewSettings.density = event.target.value;
+    localStorage.setItem("pg-density", viewSettings.density);
+    applyViewSettings();
+  };
+  $("#message-display").onchange = (event) => {
+    viewSettings.messages = event.target.value;
+    localStorage.setItem("pg-message-display", viewSettings.messages);
+    applyViewSettings();
+  };
+  applyViewSettings();
 
 /* ---------------- boot ---------------- */
 async function boot() {
@@ -386,9 +462,34 @@ async function boot() {
   else $("#code").value = localStorage.getItem("pg-code") || "";
   connectWS();
   render(data.state);
+  loadAuthStatus();
   loadLibrary();
   loadWorkspaces();
 }
+async function loadAuthStatus() {
+  const link = $("#account-link");
+  try {
+    const response = await fetch("/api/auth/status");
+    const data = await response.json();
+    if (!data.configured) {
+      link.textContent = "Offline mode";
+      link.href = "#";
+      link.title = "Discord sign-in is optional and not configured";
+      link.onclick = (event) => event.preventDefault();
+    } else if (data.authenticated) {
+      link.textContent = `Signed in as ${data.user.username}`;
+      link.href = "/auth/logout";
+      link.title = "Sign out of Discord identity session";
+    } else {
+      link.textContent = "Sign in with Discord";
+    }
+  } catch (_) {
+    link.textContent = "Offline mode";
+    link.href = "#";
+    link.onclick = (event) => event.preventDefault();
+  }
+}
+
 function startPolling() {
   if (!pollTimer) pollTimer = setInterval(refresh, 2000);
 }
@@ -418,6 +519,7 @@ function render(st) {
   $("#guild-name").textContent = st.guild.name;
   $("#me-name").textContent = st.user.name;
   $("#me-sub").textContent = st.running ? "runtime live" : "not running — press Run";
+  $("#sim-context").textContent = `LOCAL · ACTING AS ${st.user.name.toUpperCase()}`;
   const activeUser = (st.users || []).find((user) => user.id == st.user.id) || st.user;
   const activeIndex = (st.users || []).findIndex((user) => user.id == st.user.id);
   const avatar = $("#me-avatar");
