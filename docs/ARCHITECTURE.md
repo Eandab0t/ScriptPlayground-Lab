@@ -4,11 +4,11 @@
 
 ```text
 main.py
-  HTTP routes, optional Discord OAuth identity flow, in-memory auth/session lookup, static files, workspace/library/design APIs
+  HTTP routes, optional Discord OAuth identity flow, in-memory auth/session lookup, static files, workspace/library/design/scenario APIs
 
 playground.py
   Mock Discord objects, session state, permission resolution,
-  script execution, interaction dispatch, serialization
+  script execution, interaction dispatch, serialization, and bounded JSON scenario validation/replay via existing dispatch paths
 
 project_state.py
   Canonical Components V2 project validation
@@ -21,9 +21,9 @@ scripts/vendor_embeder.py
   Copies the authoritative Embeder dist and writes embeder/VENDORED_FROM.txt.
 
 static/index.html
-  Single-file browser UI, dark-first desktop Discord-like shell, optional sign-in entry point, editor, preview, selectors, local display settings, state/event/action inspectors, and API calls
+  Single-file browser UI, dark-first desktop Discord-like shell, optional sign-in entry point, editor, preview, selectors, local display settings, state/event/action inspectors, member rail, and API calls
 
-The browser theme is owned by the `:root` semantic tokens in `static/index.html`; density and message display preferences are UI-only localStorage settings and do not enter session state or runtime behavior.
+The browser theme is owned by the `:root` semantic tokens in `static/index.html`; motion durations/easing and reduced-motion behavior are also centralized there. Density and message display preferences are UI-only localStorage settings and do not enter session state or runtime behavior. The timeline keeps a `Map` of message-id rows and updates only changed rows after the revision guard; the member rail derives from the same serialized state.
 
 tests/test_smoke.py
   Offline behavioral contract for the runtime, bridge, server, and stress cases
@@ -52,7 +52,7 @@ Session timeline and events
    ↓
 state(session) JSON
    ↓ websocket nudge or browser refresh
-static/index.html renders the result; State, Events, and Actions inspectors summarize the same state JSON, including active-user and bot permission results.
+static/index.html renders the result; the incremental timeline, member rail, State/Events/Actions inspectors, and motion states all summarize the same state JSON, including active-user and bot permission results. No browser event bus or second runtime state owner was added.
 ```
 
 ## Interaction identity
@@ -97,7 +97,7 @@ MockChannel operation or interaction metadata
 - OAuth state and authenticated identity sessions are owned by `main.py`; they are separate from simulated Discord session state and are not persisted.
 - `Session.events` remains the single event/action stream. Entries carry a `kind` and optional JSON-safe `details`; attempted, denied, blocked, missing, and unanswered operations are recorded there, and the browser filters and expands that stream without creating another state owner. Expanded event/action details stay open across ordinary state refreshes.
 - `state(session)` derives the State inspector's active-user and bot permission summaries from `MockChannel.permission_check()`; the UI does not calculate permissions independently.
-- Saved designs are JSON files under `scripts/designs/`; bridge fixtures live under `tests/fixtures/bridge_roundtrip/`.
+- Saved designs are JSON files under `scripts/designs/`; saved version-1 scenarios are JSON files under `scripts/scenarios/` and replay through the current session's message/click/submit/command dispatch functions. They add no second event store or runtime. Bridge fixtures live under `tests/fixtures/bridge_roundtrip/`.
 - Saved scripts are Python files under `scripts/`.
 - Connected bot workspaces are under `bots/`.
 - Test logs and compiler output belong under `.test-artifacts/` and must not be committed.

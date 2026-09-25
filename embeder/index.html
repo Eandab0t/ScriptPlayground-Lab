@@ -139,8 +139,7 @@ Open a ticket and pick a category — a moderator will join your channel within 
 
   <script>
 /* ScriptPlayground bridge — injected after the upstream build; do not edit dist by hand.
-   Re-vendor: copy DiscordEmbeder's dist/index.html over embeder/index.html, then
-   append this fragment before </body> (see scripts/vendor_embeder.py). */
+   Re-vendor with `python scripts/vendor_embeder.py <path-to-DiscordEmbeder-checkout>`. */
 (function () {
   "use strict";
   var AUTOSAVE_KEY = "discord-embeder:autosave:v1";
@@ -168,7 +167,7 @@ Open a ticket and pick a category — a moderator will join your channel within 
         alert("Design saved as '" + name + "' and placed in the playground editor — switch to that tab.");
       }
     }).catch(function () {
-      alert("Bridge unreachable — open this builder through the playground server (http://127.0.0.1:8741/embeder).");
+      alert("Bridge unreachable — open this builder through the playground server (" + window.location.origin + "/embeder).");
     });
   }
   function mount() {

@@ -9,7 +9,9 @@ Most checks use throwaway Session objects without network access; the OAuth chec
 
 import asyncio
 import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import discord
@@ -246,11 +248,20 @@ async def test_print_and_send_helpers():
 
 async def test_discord_desktop_shell_contract():
     html = (Path(__file__).parents[1] / "static" / "index.html").read_text(encoding="utf-8")
+    assert 'addEventListener("beforeunload", flushLocalState)' in html
+    assert 'addEventListener("visibilitychange"' in html and 'document.visibilityState === "hidden"' in html
+    assert 'function flushLocalState()' in html and 'localStorage.setItem("pg-code", $("#code").value)' in html
+    assert 'const design = localStorage.getItem("discord-embeder:autosave:v1")' in html
+    assert 'localStorage.setItem("discord-embeder:autosave:v1", design)' in html
     for token in ("--background-primary", "--background-secondary", "--background-tertiary", "--brand-primary", "--text-normal"):
         assert token in html
-    for element in ("server-rail", "Local simulation", "sim-context", "Act as user", "density-select", "message-display", "account-link", "/auth/discord/login"):
+    for element in ("server-rail", "Local simulation", "sim-context", "Act as user", "density-select", "message-display", "account-link", "/auth/discord/login", "member-list", "head-topic", "jump-present"):
         assert element in html
+    for token in ("--motion-fast: 100ms", "--motion-normal: 150ms", "--motion-slow: 250ms", "--ease-standard", "--ease-decelerate"):
+        assert token in html
     assert "localStorage.getItem(\"pg-density\")" in html
+    assert "messageRows = new Map()" in html and "messageFingerprint" in html
+    assert "prefers-reduced-motion: reduce" in html
     assert "@media (max-width: 980px)" in html
 
 
@@ -855,8 +866,10 @@ async def test_script_library_roundtrip():
     import main as server
 
     with tempfile.TemporaryDirectory() as td:
-        orig = server.SCRIPTS_DIR
+        orig = (server.DATA_DIR, server.SCRIPTS_DIR, server.WORKSPACES_DIR)
+        server.DATA_DIR = pathlib.Path(td)
         server.SCRIPTS_DIR = pathlib.Path(td)
+        server.WORKSPACES_DIR = pathlib.Path(td) / "bots"
         try:
             r = await server.save_script(_FakeReq(body={"name": "my bot", "code": '"""Doc here."""\nx = 1\n'}))
             data = json.loads(r.body)
@@ -878,7 +891,7 @@ async def test_script_library_roundtrip():
             await server.delete_script(_FakeReq(match={"name": "my bot"}))
             assert list(server.SCRIPTS_DIR.glob("*.py")) == []
         finally:
-            server.SCRIPTS_DIR = orig
+            server.DATA_DIR, server.SCRIPTS_DIR, server.WORKSPACES_DIR = orig
 
 
 DESIGN = {
@@ -1053,6 +1066,52 @@ async def on_click(interaction, custom_id, values):
         nested.close()
 
 
+def _check_embeder_vendoring_requires_an_explicit_source():
+    project = Path(__file__).resolve().parent.parent
+    result = subprocess.run(
+        [sys.executable, "-X", "utf8", "scripts/vendor_embeder.py", "--help"],
+        cwd=project, capture_output=True, text=True, check=True,
+    )
+    assert "path to the DiscordEmbeder checkout" in result.stdout
+    missing = subprocess.run(
+        [sys.executable, "-X", "utf8", "scripts/vendor_embeder.py"],
+        cwd=project, capture_output=True, text=True, check=False,
+    )
+    assert missing.returncode == 2 and "source" in missing.stderr
+
+
+def _check_embeder_vendoring_injects_bridge_from_source():
+    from scripts import vendor_embeder
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        source = root / "upstream"
+        (source / "dist").mkdir(parents=True)
+        (source / "dist" / "index.html").write_text("<html><body>upstream</body></html>", encoding="utf-8")
+        project = root / "playground"
+        (project / "embeder").mkdir(parents=True)
+        (project / "embeder" / "bridge-inject.fragment.html").write_text("<!-- bridge -->", encoding="utf-8")
+        original_root = vendor_embeder.ROOT
+        vendor_embeder.ROOT = project
+        try:
+            vendor_embeder.vendor(source)
+            built = (project / "embeder" / "index.html").read_text(encoding="utf-8")
+            assert built == "<html><body>upstream<!-- bridge --></body></html>"
+            marker = (project / "embeder" / "VENDORED_FROM.txt").read_text(encoding="utf-8")
+            assert marker.startswith(f"source: {source}\ncommit: unknown\n")
+            assert marker.endswith("+00:00\n")
+        finally:
+            vendor_embeder.ROOT = original_root
+
+
+async def test_embeder_vendoring_requires_an_explicit_source():
+    _check_embeder_vendoring_requires_an_explicit_source()
+
+
+async def test_embeder_vendoring_injects_bridge_from_source():
+    _check_embeder_vendoring_injects_bridge_from_source()
+
+
 async def test_embeder_provenance_endpoint():
     import json
     import re
@@ -1060,6 +1119,13 @@ async def test_embeder_provenance_endpoint():
     import main as server
 
     marker_text = (server.EMBEDER_DIR / "VENDORED_FROM.txt").read_text(encoding="utf-8")
+    fragment = (server.EMBEDER_DIR / "bridge-inject.fragment.html").read_text(encoding="utf-8")
+    built = (server.EMBEDER_DIR / "index.html").read_text(encoding="utf-8")
+    dynamic_url = 'window.location.origin + "/embeder'
+    assert dynamic_url in fragment and dynamic_url in built
+    assert "127.0.0.1:8741/embeder" not in built
+    vendor_script = (Path(__file__).resolve().parent.parent / "scripts" / "vendor_embeder.py").read_text(encoding="utf-8")
+    assert "DEFAULT_SOURCE" not in vendor_script and "E:/" not in vendor_script
     response = await server.embeder_info(None)
     data = json.loads(response.body)
     marker = re.search(r"^commit: ([0-9a-f]{40})$", marker_text, re.MULTILINE)
@@ -1196,6 +1262,163 @@ async def on_click(interaction, custom_id, values):
         assert last_msg(s)["content"] == "got max-select: ['24']"
     finally:
         s.close()
+
+
+async def test_desktop_auto_shutdown_after_last_websocket_disconnects():
+    from aiohttp.test_utils import TestClient, TestServer
+
+    import main as server
+
+    old_grace, old_interval = server._DESKTOP_CLOSE_GRACE, server._DESKTOP_POLL_INTERVAL
+    server._DESKTOP_CLOSE_GRACE = 0.03
+    server._DESKTOP_POLL_INTERVAL = 0.002
+    app = server.build_app(auto_shutdown=True)
+    shutdown_callback = asyncio.Event()
+
+    async def on_shutdown(_app):
+        shutdown_callback.set()
+
+    app.on_shutdown.append(on_shutdown)
+    assert server.build_app()[server._AUTO_SHUTDOWN] is False
+    session = Session("desktop-test")
+    server.SESSIONS[session.sid] = session
+    client = TestClient(TestServer(app))
+    try:
+        await client.start_server()
+        ws = await client.ws_connect("/api/session/desktop-test/ws")
+        assert app[server._DESKTOP_CLIENT_CONNECTED]
+        await ws.close()
+        await asyncio.wait_for(app[server._DESKTOP_SHUTDOWN_REQUESTED].wait(), timeout=1)
+        assert not server.WS_CLIENTS.get("desktop-test")
+    finally:
+        await client.close()
+        assert shutdown_callback.is_set()
+        assert session.sid not in server.SESSIONS
+        assert not server.WS_CLIENTS
+        server._DESKTOP_CLOSE_GRACE, server._DESKTOP_POLL_INTERVAL = old_grace, old_interval
+
+
+async def test_data_directory_defaults_to_project_root_in_dev_mode():
+    import main as server
+
+    frozen_present = hasattr(server.sys, "frozen")
+    original_frozen = getattr(server.sys, "frozen", None)
+    original_env = os.environ.pop("SCRIPTPLAYGROUND_DATA_DIR", None)
+    original_data = (server.DATA_DIR, server.SCRIPTS_DIR, server.WORKSPACES_DIR)
+    try:
+        if hasattr(server.sys, "frozen"):
+            del server.sys.frozen
+        assert server.data_directory() == Path(__file__).resolve().parents[1]
+        os.environ["SCRIPTPLAYGROUND_DATA_DIR"] = str(Path(".test-artifacts") / "data-test")
+        assert server.data_directory() == (Path(".test-artifacts") / "data-test").resolve()
+    finally:
+        server.DATA_DIR, server.SCRIPTS_DIR, server.WORKSPACES_DIR = original_data
+        if frozen_present:
+            server.sys.frozen = original_frozen
+        elif hasattr(server.sys, "frozen"):
+            del server.sys.frozen
+        if original_env is None:
+            os.environ.pop("SCRIPTPLAYGROUND_DATA_DIR", None)
+        else:
+            os.environ["SCRIPTPLAYGROUND_DATA_DIR"] = original_env
+
+
+async def test_frozen_data_directory_uses_windows_local_app_data():
+    import main as server
+
+    original_env = os.environ.pop("SCRIPTPLAYGROUND_DATA_DIR", None)
+    frozen_present = hasattr(server.sys, "frozen")
+    original_frozen = getattr(server.sys, "frozen", None)
+    original_platform = server.sys.platform
+    old_local = os.environ.get("LOCALAPPDATA")
+    try:
+        server.sys.frozen = True
+        server.sys.platform = "win32"
+        with tempfile.TemporaryDirectory() as directory:
+            os.environ["LOCALAPPDATA"] = directory
+            path = server.data_directory()
+            assert path == Path(directory) / "ScriptPlayground"
+            assert path.is_dir()
+    finally:
+        server.sys.platform = original_platform
+        if frozen_present:
+            server.sys.frozen = original_frozen
+        else:
+            del server.sys.frozen
+        if old_local is None:
+            os.environ.pop("LOCALAPPDATA", None)
+        else:
+            os.environ["LOCALAPPDATA"] = old_local
+        if original_env is not None:
+            os.environ["SCRIPTPLAYGROUND_DATA_DIR"] = original_env
+
+
+async def test_data_dir_bootstrap_preserves_user_files():
+    import main as server
+
+    original = (server.DATA_DIR, server.SCRIPTS_DIR, server.WORKSPACES_DIR)
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            server.configure_data_directory(data)
+            server.bootstrap_default_scripts()
+            assert {p.name for p in server.SCRIPTS_DIR.glob("*.py")} >= {"demo.py", "poll_bot.py"}
+            assert (data / "scenarios" / "Greeting.scenario.json").is_file()
+            assert (data / "designs" / "Club Welcome.discordv2proj.json").is_file()
+            user_script = server.SCRIPTS_DIR / "demo.py"
+            user_script.write_text("# keep my version", encoding="utf-8")
+            server.bootstrap_default_scripts()
+            assert user_script.read_text(encoding="utf-8") == "# keep my version"
+    finally:
+        server.DATA_DIR, server.SCRIPTS_DIR, server.WORKSPACES_DIR = original
+
+
+async def test_browser_process_close_uses_five_second_grace():
+    import launcher
+
+    original_grace, original_interval = launcher._BROWSER_EXIT_GRACE, launcher._BROWSER_POLL_INTERVAL
+    launcher._BROWSER_EXIT_GRACE = 0.01
+    launcher._BROWSER_POLL_INTERVAL = 0.001
+
+    class FakeProcess:
+        exited = False
+
+        def poll(self):
+            return 0 if self.exited else None
+
+    process = FakeProcess()
+    stop = asyncio.Event()
+    task = asyncio.create_task(launcher._wait_for_browser_exit(process, stop))
+    try:
+        await asyncio.sleep(0.005)
+        process.exited = True
+        await asyncio.wait_for(task, timeout=0.2)
+        assert stop.is_set()
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        launcher._BROWSER_EXIT_GRACE, launcher._BROWSER_POLL_INTERVAL = original_grace, original_interval
+
+
+async def test_desktop_auto_shutdown_ignores_startup_without_clients():
+    from aiohttp.test_utils import TestClient, TestServer
+
+    import main as server
+
+    old_grace, old_interval = server._DESKTOP_CLOSE_GRACE, server._DESKTOP_POLL_INTERVAL
+    server._DESKTOP_CLOSE_GRACE = 0.03
+    server._DESKTOP_POLL_INTERVAL = 0.002
+    app = server.build_app(auto_shutdown=True)
+    client = TestClient(TestServer(app))
+    try:
+        await client.start_server()
+        await asyncio.sleep(server._DESKTOP_CLOSE_GRACE + 0.08)
+        assert not app[server._DESKTOP_CLIENT_CONNECTED]
+        assert not app[server._DESKTOP_SHUTDOWN_REQUESTED].is_set()
+    finally:
+        await client.close()
+        server._DESKTOP_CLOSE_GRACE, server._DESKTOP_POLL_INTERVAL = old_grace, old_interval
 
 
 async def test_cpu_bound_startup_is_interrupted():
