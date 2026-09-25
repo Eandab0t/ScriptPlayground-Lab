@@ -101,7 +101,38 @@ _ORIGINAL_REQUEST = HTTPClient.request
 _ORIGINAL_STATIC_LOGIN = HTTPClient.static_login
 _ORIGINAL_CLIENT_INIT = discord.Client.__init__
 _ORIGINAL_ADAPTER_REQUEST = webhook_async.AsyncWebhookAdapter.request
+_ORIGINAL_ASYNCIO_RUN = asyncio.run  # real asyncio.run, captured once at import
 _PATCHED = False
+
+
+def _install_asyncio_run_patch() -> None:
+    """Redirect asyncio.run() onto the running simulator loop during a boot.
+
+    Identity-guarded: install refuses to double-patch, and restore only puts
+    back the real asyncio.run if the global still holds the shim — so an
+    out-of-order shutdown from a stale runtime can never clobber another
+    runtime's active patch (or the real one) with a stale reference.
+    """
+    if asyncio.run is _ORIGINAL_ASYNCIO_RUN:
+        asyncio.run = _runtime_asyncio_run_shim
+
+
+def _restore_asyncio_run_patch() -> None:
+    if asyncio.run is _runtime_asyncio_run_shim:
+        asyncio.run = _ORIGINAL_ASYNCIO_RUN
+
+
+def _runtime_asyncio_run_shim(awaitable, *args, **kwargs):  # type: ignore[no-untyped-def]
+    """asyncio.run() inside a project can't spawn a second loop while the
+    simulator's loop is running; schedule on it instead and return promptly.
+    The project's main() keeps running as a managed background task."""
+    runtime = _ACTIVE_BOOT.get()
+    if runtime is None:  # direct call outside any boot: behave normally-ish
+        return _ORIGINAL_ASYNCIO_RUN(awaitable, *args, **kwargs)
+    runtime._main_task = asyncio.ensure_future(_wrap_main(awaitable, runtime))
+    runtime.session.log("🪄", "asyncio.run() redirected to the simulator loop", kind="action",
+                        details={"operation": "asyncio.run", "status": "adapted"})
+    return None
 
 
 def _http_session(http: HTTPClient):
@@ -945,7 +976,6 @@ class ProjectRuntime:
         self._main_task: asyncio.Task | None = None
         self._connected = asyncio.Event()
         self._pending_modal: tuple[str, str | None] | None = None  # (custom_id, source message)
-        self._original_asyncio_run = asyncio.run
         self.entry: str | None = None
 
     # ------------------------------------------------ boot
@@ -969,8 +999,8 @@ class ProjectRuntime:
             _purge_sandbox_modules()
             # Projects legitimately call asyncio.run() in their entry (a fresh
             # loop is fine standalone, but this server loop is already running).
-            # Redirect it onto the running loop for the runtime's lifetime.
-            asyncio.run = self._asyncio_run_shim
+            # Redirect it for the duration of the boot under the global lock.
+            _install_asyncio_run_patch()
             try:
                 module = self._import_entry(entry)
                 bot = self._scan_for_bot() or (self.clients[-1] if self.clients else None)
@@ -987,7 +1017,7 @@ class ProjectRuntime:
                                  kind="event", details={"operation": "project.transport",
                                                         "status": "installed"})
             finally:
-                asyncio.run = self._original_asyncio_run
+                _restore_asyncio_run_patch()
 
     def _import_entry(self, entry: Path):
         saved_cwd = os.getcwd()
@@ -1003,11 +1033,8 @@ class ProjectRuntime:
             os.chdir(saved_cwd)
 
     def _asyncio_run_shim(self, awaitable, *args, **kwargs):  # type: ignore[no-untyped-def]
-        """asyncio.run() inside a project can't spawn a second loop here; the
-        coroutine is scheduled on the simulator's loop instead."""
-        self._main_task = asyncio.ensure_future(_wrap_main(awaitable, self))
-        self.session.log("🪄", "asyncio.run() redirected to the simulator loop", kind="action",
-                         details={"operation": "asyncio.run", "status": "adapted"})
+        """Deprecated: the shim moved to module level. Fail loudly if referenced."""
+        raise RuntimeError("_asyncio_run_shim moved to module-level _runtime_asyncio_run_shim")
 
     def _scan_for_bot(self) -> discord.Client | None:
         for module in list(sys.modules.values()):
@@ -1357,7 +1384,7 @@ class ProjectRuntime:
 
     async def shutdown(self) -> None:
         self._connected.set()  # release any bot parked in connect()
-        asyncio.run = self._original_asyncio_run
+        _restore_asyncio_run_patch()
         with contextlib.suppress(ValueError):
             sys.path.remove(str(self.sandbox))
         for bot in list(self.clients):

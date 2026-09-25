@@ -130,6 +130,55 @@ def test_wire_id_roundtrip():
     assert bot_runtime._session_message_id("123456789012345678") is None
 
 
+def test_asyncio_run_patch_scoped_to_boot_and_restored_everywhere():
+    """The asyncio.run redirect is installed only during a boot and restored on
+    every exit path: clean boot, boot failure, and shutdown — with an
+    identity guard so a stale runtime's shutdown cannot clobber the real one."""
+    real = bot_runtime._ORIGINAL_ASYNCIO_RUN
+    assert bot_runtime.asyncio.run is real  # untouched at import
+
+    # Install/restore pair is idempotent and identity-guarded.
+    bot_runtime._install_asyncio_run_patch()
+    try:
+        assert bot_runtime.asyncio.run is bot_runtime._runtime_asyncio_run_shim
+        bot_runtime._install_asyncio_run_patch()  # double install: no-op
+        assert bot_runtime.asyncio.run is bot_runtime._runtime_asyncio_run_shim
+    finally:
+        bot_runtime._restore_asyncio_run_patch()
+    assert bot_runtime.asyncio.run is real
+
+    # A restore when the shim is NOT active must not clobber a foreign value
+    # (simulates out-of-order shutdown from a stale runtime).
+    def foreign():  # pragma: no cover - never called
+        raise AssertionError
+
+    bot_runtime.asyncio.run = foreign
+    try:
+        bot_runtime._restore_asyncio_run_patch()
+        assert bot_runtime.asyncio.run is foreign, "stale restore clobbered a foreign patch"
+    finally:
+        bot_runtime.asyncio.run = real
+    assert bot_runtime.asyncio.run is real
+
+
+@pytest.mark.timeout(120)
+def test_asyncio_run_restored_after_boot_failure():
+    """A project that raises during boot leaves the real asyncio.run in place."""
+    async def run():
+        session = _session()
+        project = Path(bot_runtime._SANDBOX_ROOT) / "pytest-boot-fail"
+        project.mkdir(parents=True, exist_ok=True)
+        (project / "main.py").write_text("raise RuntimeError('boom during import')\n", encoding="utf-8")
+        try:
+            with pytest.raises(RuntimeError, match="boom during import"):
+                await asyncio.wait_for(bot_runtime.run_project(session, project), timeout=60)
+            assert bot_runtime.asyncio.run is bot_runtime._ORIGINAL_ASYNCIO_RUN
+        finally:
+            session.close()
+
+    asyncio.run(run())
+
+
 @pytest.mark.timeout(120)
 def test_python_asyncio_run_entry_boots():
     """Entries using asyncio.run(bot.start(...)) work: the call is redirected
