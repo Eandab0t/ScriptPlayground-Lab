@@ -6,11 +6,11 @@ This is a prioritization guide, not a promise to build every idea.
 
 The following baseline work is complete: bridge round-trip fixtures, vendored Embeder provenance, and read-only permission-denial diagnostics. Keep these behaviors covered when changing the runtime.
 
-### 1. Add a small scenario format
+### 1. Add a small scenario format (complete)
 
-- Save a sequence such as “Alice sends message → clicks button → receives response.”
-- Replay it against one session.
-- Reuse existing dispatch functions instead of inventing a broad event bus.
+- Version-1 JSON scenarios save under `scripts/scenarios/` and replay message, component-click, modal-submit, and slash-command steps against one session.
+- Assertions cover messages, embed fields, components, channels, and events; replay stops at the first failure with a bounded runtime snapshot.
+- The runner reuses existing dispatch functions rather than introducing a broad event bus.
 
 ### 2. Improve workspace editing deliberately
 

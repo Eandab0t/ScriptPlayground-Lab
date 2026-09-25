@@ -1,30 +1,58 @@
 # ScriptPlayground
 
-A **local Discord bot playground** — by default, no token, no server, and no Discord network calls. The optional configured OAuth identity flow is the only path that contacts Discord. The UI
-uses Discord's dark palette and `gg sans`/Discord's standard fallback font stack.
-Write
-plain `discord.py` code in the web editor, press **Run**, and see exactly what
-your bot would post: embeds, buttons, select menus, and modals, rendered in a
-Discord-styled chat. Then *use* the UI: click the buttons, pick from the
-selects, fill in the modals, type `/` for the **slash-command palette** — your
-code's handlers run against mocked `Interaction` objects.
+A **local Discord bot UI playground** with no Discord connection by default. The simulator makes no Discord API calls; optional OAuth signs in with `identify`, and Embeder's explicit webhook test-send posts to the URL you enter. Scripts run as ordinary Python with your account's permissions—not sandboxed—and can access local files, the network, and available credentials. Run only code you trust. The UI uses Discord's dark palette and `gg sans`/Discord's standard fallback font stack. The chat shell includes an informational member rail, animated message/channel surfaces, and a reduced-motion fallback; editor and developer tools remain ScriptPlayground surfaces.
+
+Write plain `discord.py` code in the web editor, press **Run**, and see exactly what your bot would post: embeds, buttons, select menus, and modals, rendered in a Discord-styled chat. Then use the UI: click the buttons, pick from the selects, fill in the modals, or type `/` for the **slash-command palette** — your code's handlers run against mocked `Interaction` objects.
 
 ```
 ┌─────────────┬──────────────────────┬──────────────────┐
-│  channels   │  # playground        │  bot.py  [▶ Run] │
-│  (live —    │  the viewed          │  your code       │
-│  switch!)   │  channel, live       │  console + timing│
+│  channels   │  # playground        │  members │ bot.py │
+│  (live —    │  the viewed          │  live    │ your code│
+│  switch!)   │  channel, live       │          │ console  │
 └─────────────┴──────────────────────┴──────────────────┘
 ```
 
 ## Quick start
 
+Requires Python 3.9 or newer. From the project root:
+
 ```bash
-pip install -r requirements.txt
+python -m venv .venv
+# Windows PowerShell: .venv\Scripts\Activate.ps1
+# macOS/Linux: source .venv/bin/activate
+python -m pip install -r requirements.txt
 python main.py            # opens http://127.0.0.1:8741 in your browser
 ```
 
-Options: `--port 8741`, `--host 127.0.0.1`, `--no-browser`.
+Options: `--port 8741`, `--host 127.0.0.1`, `--no-browser`. If you change the port or host, use that address for the UI and `/embeder` (for example, `http://127.0.0.1:8742/embeder`).
+
+## Desktop launcher
+
+The optional Windows executable bundle is built with `scripts/build_windows.ps1`; see `docs/DESKTOP_BUILD.md` for packaging and data-location details. To use the Python launcher instead, double-click `ScriptPlayground.bat`. It activates `.venv` when present, then runs `python launcher.py` in the same console. Chrome/Edge app mode is preferred; when unavailable, the default browser is used and the server shuts down 30 seconds after the last UI WebSocket disconnects. For app mode, the spawned browser process is monitored, followed by a 5-second restart grace period.
+
+When using a packaged exe, scripts, workspaces, scenarios, and designs are stored under `%LOCALAPPDATA%\ScriptPlayground` on Windows and survive upgrades. `--data-dir PATH` / `SCRIPTPLAYGROUND_DATA_DIR` can override this location. A first launch seeds built-in scripts, scenarios, and designs without replacing user files.
+
+The release bundle is `dist/ScriptPlayground/`; run `ScriptPlayground.exe` inside it. To create a shortcut, right-click `ScriptPlayground.bat` → **Show more options** → **Create shortcut**. Open shortcut **Properties → Change Icon…**, browse to `assets/icon.ico`, and select it.
+
+For Linux desktops, save this as `~/.local/share/applications/scriptplayground.desktop` (replace `/path/to/ScirptPlayground` with this checkout's absolute path; use `launcher.py` from your activated project venv if applicable):
+
+```ini
+[Desktop Entry]
+Type=Application
+Name=ScriptPlayground
+Comment=Local Discord bot UI playground
+Exec=/path/to/ScirptPlayground/.venv/bin/python /path/to/ScirptPlayground/launcher.py
+Path=/path/to/ScirptPlayground
+Icon=/path/to/ScirptPlayground/assets/icon.svg
+Terminal=true
+Categories=Development;IDE;
+```
+
+## Beta status and support
+
+This checkout is a **pre-release 1.0 Beta candidate**, not a stable 1.0 release. The `v0.9.0-baseline` tag marks the audit starting point, not this current worktree. Requires Python 3.9+ and discord.py 2.6+ for Components V2. Known limits: one simulated guild with fixed fixture users and roles; no Discord gateway, REST bot transport, or voice; Python scripts are not isolated; and the UI is dark-first and desktop-oriented.
+
+Use the support or issue-reporting channel provided by whoever supplied this checkout; this README does not assume a public issue-tracker URL. Include your OS, Python version, launch command, a traceback, and a minimal reproduction. Remove tokens, client secrets, cookies, and webhook URLs from reports.
 
 ### Optional Discord identity sign-in
 
@@ -42,12 +70,10 @@ The server uses Discord's authorization-code flow with the `identify` scope only
 
 The [DiscordEmbeder](https://github.com/Eandab0t/DiscordEmbeder) visual
 Components V2 builder ships alongside the playground: open
-**http://127.0.0.1:8741/embeder** (or the ✦ button in the chat header). Its
-dist is vendored — the E: repo stays authoritative. To refresh after an
-upstream rebuild:
+**http://127.0.0.1:8741/embeder** (or the ✦ button in the chat header; use your configured host and port if changed). Its built files are vendored here; the upstream checkout remains authoritative. To refresh after building that checkout, run from the ScriptPlayground root and pass its path:
 
 ```bash
-python scripts/vendor_embeder.py   # copies dist + injects the bridge button
+python scripts/vendor_embeder.py "path/to/DiscordEmbeder"
 ```
 
 ### The bridge
@@ -56,7 +82,8 @@ python scripts/vendor_embeder.py   # copies dist + injects the bridge button
   design to `/api/bridge/design-to-code`, saves it under
   `scripts/designs/<name>.discordv2proj.json`, generates runnable discord.py
   (`ui.LayoutView` — a faithful port of the builder's own exporter, see
-  `bridge.py`), and pushes it into the playground editor via `postMessage`.
+  `bridge.py`), and hands it to the playground editor through shared browser
+  storage.
 - **✦ Design** (editor library bar) imports any saved design from the library
   the same way. Project files are the builder's own `.discordv2proj.json`.
 - **V2 in the timeline** — messages sent with a `LayoutView` render as real
@@ -68,8 +95,19 @@ python scripts/vendor_embeder.py   # copies dist + injects the bridge button
 
 ## Folder workspaces and visual blocks
 
-Put a bot folder under `bots/<name>/bot.py`, then choose it in **Bot folder → 📂 Connect**.
-The existing editor runs the connected file against the same offline Discord mock; **Save** writes
+Put a bot folder under `bots/<name>/` with a `main.py` or `bot.py` entry file, then choose it in
+**Bot folder → 📂 Connect** (the entry file is detected automatically and loaded into the editor).
+Pressing **Run** on a connected folder boots the **whole bot project offline**: the real `discord.py`
+login flow runs against a fake REST transport, so `setup_hook`, cog loading, `tree.sync`, `on_ready`,
+slash commands, component clicks, modals, and `on_message` handlers all execute exactly like
+production — no network is ever touched. Live tokens are scrubbed from the copied sandbox (`.env`
+and hardcoded values in source files) and replaced with a placeholder.
+
+Node bots work too: a folder whose `package.json` depends on `discord.js` runs through a bundled
+`discord.js` shim (no `npm install` needed — requires `node` on PATH). Slash commands, embeds,
+mention-triggered and ragebait replies all flow into the same simulator timeline.
+
+The editor can still run a single connected file the old way; **Save** writes
 back to that folder. **🧱 Blocks** is a dependency-free starter canvas for message text,
 embed title/description/color, and one button. **Apply to code** generates ordinary discord.py
 that can be edited further, run, and previewed in the chat.
@@ -97,6 +135,23 @@ Three scripts ship with the playground:
 | `ticket_panel` | button handlers that create `#ticket-N` channels and close them again |
 
 The ★ marks `demo`, the default script loaded on a fresh page.
+
+## Saved scenarios
+
+Run a script first, then open **Scenarios** in the toolbar to edit, save, or replay a version-1 JSON scenario against that session. Replay uses the current handlers and adds its messages/interactions to the live session; it does not reset the timeline. The `Greeting` starter scenario is included; saved files live in `scripts/scenarios/`.
+
+```json
+{
+  "version": 1,
+  "name": "Greeting",
+  "steps": [
+    {"action": "message", "content": "!hello", "as": "Alice"},
+    {"assert": "message_exists", "content": "Hello, <@111111111111111111>!"}
+  ]
+}
+```
+
+Actions can send a message, click a component, submit a modal, or invoke a command. Assertions can check messages, content, embed fields, components, channels, and events. Message assertions match a substring of the stored content; mentions are stored as `<@id>` and rendered with fixture names in the chat.
 
 ## The scripting contract
 
@@ -145,14 +200,15 @@ Members' IDs and names are listed in `playground.py` (`USER_ID`, `MEMBER_IDS`,
 - **Runtime state is bounded:** scripts are capped at 1 MB, the timeline retains
   2,000 messages, and the console retains 1,000 events. The browser uses the
   websocket for instant updates and falls back to polling only when it disconnects.
-- The editor autosaves to `localStorage`; **Ctrl+Enter** runs.
+- The editor autosaves to `localStorage`; **Ctrl+Enter** runs. Cozy message display groups nearby messages from the same author; Compact keeps each message header visible.
+- The chat timeline updates existing message rows by message ID instead of rebuilding the whole list; genuinely new messages use short motion only, and `prefers-reduced-motion` disables entrance/interaction animation.
 - Library **Save** writes to `scripts/<name>.py`; `demo.py` is the fresh-page default.
 - Ephemeral messages render in the timeline with an "only visible to you" note.
 - Message **edits** are tracked (`(edited ×n)`); deleted messages vanish.
 - Mentions (`<@id>`, `<@&id>`, `<#id>`) resolve against the fixture members, roles, and live channels.
-- The old bot features (credits economy, script library/showcase, sandboxed
-  execution, `/plot`, SQLite storage) were removed in the pivot — this is now
-  a *UI prototyping tool*, not a runnable bot. The git history still has them.
+- The old bot features (credits economy, script library/showcase, `/plot`,
+  SQLite storage) were removed in the pivot — this is now a *UI prototyping
+  tool*, not a runnable bot. The git history still has them.
 
 ## Architecture
 

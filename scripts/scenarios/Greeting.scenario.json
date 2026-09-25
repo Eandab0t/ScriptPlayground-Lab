@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "name": "Greeting",
+  "steps": [
+    {
+      "action": "message",
+      "content": "!hello",
+      "as": "Alice"
+    },
+    {
+      "assert": "message_exists",
+      "content": "Hello, <@111111111111111111>!"
+    }
+  ]
+}
