@@ -509,6 +509,7 @@
         <button class="inspect-tab" data-inspector="state" type="button">State</button>
         <button class="inspect-tab" data-inspector="events" type="button">Events</button>
         <button class="inspect-tab" data-inspector="actions" type="button">Actions</button>
+        <button class="inspect-tab" data-inspector="environment" type="button">Env</button>
       </div>
       <div id="run-error" role="alert" aria-live="assertive"></div>
       <div id="console-body"></div>
@@ -799,6 +800,61 @@ timeline.addEventListener("scroll", () => {
 
 let inspectorMode = "console";
 let expandedInspectorEntry = null;
+let envReport = null;               // last fetched workspace environment discovery
+let envWorkspace = null;            // workspace the report belongs to
+
+async function fetchEnvironment(workspace) {
+  if (!workspace) return null;
+  if (envReport && envWorkspace === workspace) return envReport;
+  try {
+    const res = await fetch(`/api/workspaces/${encodeURIComponent(workspace)}/environment`);
+    if (!res.ok) return null;
+    envReport = await res.json();
+    envWorkspace = workspace;
+  } catch { return null; }
+  return envReport;
+}
+
+function renderEnvironmentInspector() {
+  inspector.innerHTML = `<div class="inspect-section">Project configuration</div><div id="inspect-env" class="inspect-list">Loading…</div>`;
+  const workspace = activeWorkspace;
+  fetchEnvironment(workspace).then((report) => {
+    const host = $("#inspect-env");
+    if (!host) return;
+    if (!report) {
+      host.textContent = workspace
+        ? "No dotenv files found in this workspace."
+        : "Connect a bot folder to inspect its configuration.";
+      return;
+    }
+    host.innerHTML = "";
+    const heading = document.createElement("div");
+    heading.className = "inspect-label";
+    const fileSummary = (report.files || []).map((f) => f.file).join(", ") || "none";
+    heading.textContent = `Dotenv files: ${fileSummary}` +
+      (report.secret_count ? ` · ${report.secret_count} secret value(s) redacted` : "");
+    host.appendChild(heading);
+    if (report.missing && report.missing.length) {
+      const missing = document.createElement("div");
+      missing.className = "inspect-label";
+      missing.textContent = `Missing (declared in .env.example, not provided): ${report.missing.join(", ")}`;
+      host.appendChild(missing);
+    }
+    for (const entry of report.variables || []) {
+      const row = document.createElement("div");
+      row.className = "permission-row";
+      row.innerHTML = `<span class="permission-name"></span><span class="permission-result"></span><span class="permission-reason"></span>`;
+      row.querySelector(".permission-name").textContent = entry.name;
+      row.querySelector(".permission-result").textContent =
+        entry.redacted ? "provided 🔒" : entry.present ? "provided" : "missing";
+      row.querySelector(".permission-result").style.color =
+        entry.present ? "var(--status-success, #23a559)" : "var(--status-danger, #da373c)";
+      row.querySelector(".permission-reason").textContent =
+        entry.secret ? "secret — value never shown" : entry.present ? "value visible in .env" : "expected but not set";
+      host.appendChild(row);
+    }
+  });
+}
 
 function setInspector(mode, entryId = null) {
   inspectorMode = mode;
@@ -827,6 +883,7 @@ function renderInspector(st) {
   consoleBody.style.display = showInspector ? "none" : "block";
   inspector.style.display = showInspector ? "block" : "none";
   if (!showInspector) return;
+  if (inspectorMode === "environment") { renderEnvironmentInspector(); return; }
   const events = (st.events || []).filter((entry) =>
     inspectorMode === "actions" ? entry.kind === "action" : entry.kind === "event");
   if (inspectorMode === "state") {

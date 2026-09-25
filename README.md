@@ -24,7 +24,7 @@ python -m pip install -r requirements.txt
 python main.py            # opens http://127.0.0.1:8741 in your browser
 ```
 
-Options: `--port 8741`, `--host 127.0.0.1`, `--no-browser`. If you change the port or host, use that address for the UI and `/embeder` (for example, `http://127.0.0.1:8742/embeder`).
+Options: `--port 8741`, `--host 127.0.0.1`, `--no-browser`. If you change the port or host, use that address for the UI and `/embeder` (for example, `http://127.0.0.1:8742/embeder`). The packaged exe accepts `--port` and `--data-dir` but not `--no-browser`; set the environment variable `SCRIPTPLAYGROUND_NO_BROWSER=1` instead.
 
 ## Desktop launcher
 
@@ -105,7 +105,15 @@ and hardcoded values in source files) and replaced with a placeholder.
 
 Node bots work too: a folder whose `package.json` depends on `discord.js` runs through a bundled
 `discord.js` shim (no `npm install` needed — requires `node` on PATH). Slash commands, embeds,
-mention-triggered and ragebait replies all flow into the same simulator timeline.
+mention-triggered and ragebait replies all flow into the same simulator timeline. Entries may call
+`asyncio.run(bot.start(…))` (Python) or use `Events.*` constants and option builders (Node).
+
+The **Env** developer tab shows a project's configuration discovery: dotenv files found
+(`.env`, `.env.example`, `.env.local`, `.env.development`, `.env.production`), which variables each
+declares, which are provided, and which declared variables are missing. Secret-looking variables
+(names containing `TOKEN`, `SECRET`, `PASSWORD`, `API_KEY`, `PRIVATE_KEY`, …) are always redacted —
+only names and presence are shown, never values. Bot tokens are replaced with a placeholder at run
+time regardless of what the project's `.env` contains.
 
 The editor can still run a single connected file the old way; **Save** writes
 back to that folder. **🧱 Blocks** is a dependency-free starter canvas for message text,

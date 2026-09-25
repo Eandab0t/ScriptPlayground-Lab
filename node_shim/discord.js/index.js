@@ -22,10 +22,7 @@ class SlashCommandBuilder {
   constructor() { this.data = { name: "", description: "", type: 1, options: [] }; }
   setName(n) { this.data.name = n; return this; }
   setDescription(d) { this.data.description = d; return this; }
-  toJSON() { return this.data; }
-}
-function _makeOptionAccumulator(type) {
-  return (fn) => {
+  _addOption(type, fn) {
     const acc = { name: "", description: "", required: false, choices: [], type };
     const builder = {
       setName: (n) => { acc.name = n; return builder; },
@@ -38,17 +35,19 @@ function _makeOptionAccumulator(type) {
       setMinValue: () => builder, setMaxValue: () => builder,
     };
     fn(builder);
-    acc.name = acc.name.toLowerCase().replace(/[^a-z0-9_]/g, "-");
+    acc.name = String(acc.name).toLowerCase().replace(/[^a-z0-9_]/g, "-");
     this.data.options.push(acc);
     return this;
-  };
-}
-for (const [method, type] of [
-  ["addStringOption", 3], ["addIntegerOption", 4], ["addBooleanOption", 5],
-  ["addUserOption", 6], ["addChannelOption", 7], ["addRoleOption", 8],
-  ["addMentionableOption", 9],
-]) {
-  SlashCommandBuilder.prototype[method] = _makeOptionAccumulator(type);
+  }
+  addStringOption(fn) { return this._addOption(3, fn); }
+  addIntegerOption(fn) { return this._addOption(4, fn); }
+  addBooleanOption(fn) { return this._addOption(5, fn); }
+  addUserOption(fn) { return this._addOption(6, fn); }
+  addChannelOption(fn) { return this._addOption(7, fn); }
+  addRoleOption(fn) { return this._addOption(8, fn); }
+  addMentionableOption(fn) { return this._addOption(9, fn); }
+  addAttachmentOption(fn) { return this._addOption(11, fn); }
+  toJSON() { return this.data; }
 }
 
 class ButtonBuilder {
@@ -160,8 +159,17 @@ class Client {
 
   emit(name, ...args) {
     if (name === "ready") return; /* dispatched inline with ack, see _dispatch */
-    for (const handler of this.handlers.get(name) || []) {
-      Promise.resolve().then(() => handler(...args)).catch((err) => this.emit("error", err));
+    const handlers = this.handlers.get(name) || [];
+    for (const handler of handlers) {
+      Promise.resolve().then(() => handler(...args)).catch((err) => {
+        if (name === "error" || !this.handlers.get("error")?.length) {
+          /* No user error handler: surface it to the simulator host instead
+           * of letting it vanish into an unhandled rejection. */
+          process.stdout.write(JSON.stringify({ type: "error", message: String((err && err.stack) || err) }) + "\n");
+        } else {
+          this.emit("error", err);
+        }
+      });
     }
   }
 
