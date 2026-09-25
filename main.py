@@ -28,8 +28,9 @@ from urllib.parse import urlencode
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
 from aiohttp.web_log import AccessLogger
 
-import bridge
 import bot_runtime
+import bridge
+import env_discovery
 from playground import (
     Session,
     dispatch_click,
@@ -148,7 +149,7 @@ def bootstrap_default_scripts() -> None:
 
 
 SESSIONS: dict[str, Session] = {}
-RUNTIMES: dict[str, "bot_runtime.ProjectRuntime"] = {}  # sid -> booted project runtime
+RUNTIMES: dict[str, bot_runtime.ProjectRuntime] = {}  # sid -> booted project runtime
 WS_CLIENTS: dict[str, set[web.WebSocketResponse]] = {}
 OAUTH_STATES: dict[str, float] = {}
 AUTH_SESSIONS: dict[str, dict[str, str | None]] = {}
@@ -342,6 +343,17 @@ async def logout(request: web.Request) -> web.Response:
 
 
 _HIDDEN_SCRIPTS = {"vendor_embeder"}
+
+
+async def workspace_environment(request: web.Request) -> web.Response:
+    """Configuration discovery for a workspace's dotenv files (values redacted)."""
+    workspace = request.match_info["workspace"]
+    if not _SAFE_NAME.match(workspace):
+        raise web.HTTPBadRequest(text="invalid workspace")
+    folder = WORKSPACES_DIR / workspace
+    if not folder.is_dir():
+        raise web.HTTPNotFound(text="workspace not found")
+    return web.json_response(env_discovery.discover(folder))
 
 
 async def list_workspaces(_request: web.Request) -> web.Response:
@@ -621,7 +633,7 @@ async def run_project_file(request: web.Request) -> web.Response:
                               "status": RUNTIMES[session.sid].status()})
 
 
-def _runtime(session: Session) -> "bot_runtime.ProjectRuntime | None":
+def _runtime(session: Session) -> bot_runtime.ProjectRuntime | None:
     return RUNTIMES.get(session.sid)
 
 
@@ -806,6 +818,7 @@ def build_app(*, auto_shutdown: bool = False, data_dir: Path | None = None) -> w
     app.router.add_get("/embeder", embeder_page)
     app.router.add_get("/api/embeder/info", embeder_info)
     app.router.add_get("/api/workspaces", list_workspaces)
+    app.router.add_get("/api/workspaces/{workspace}/environment", workspace_environment)
     app.router.add_get("/api/workspaces/{workspace}/files/{filename}", get_workspace_file)
     app.router.add_put("/api/workspaces/{workspace}/files/{filename}", save_workspace_file)
     app.router.add_get("/api/scripts", list_scripts)

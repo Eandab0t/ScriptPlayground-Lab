@@ -128,3 +128,91 @@ def test_wire_id_roundtrip():
     assert bot_runtime._wire_message_id("m5") == str(bot_runtime._WIRE_BASE + 5)
     assert bot_runtime._session_message_id(bot_runtime._wire_message_id("m12")) == "m12"
     assert bot_runtime._session_message_id("123456789012345678") is None
+
+
+@pytest.mark.timeout(120)
+def test_python_asyncio_run_entry_boots():
+    """Entries using asyncio.run(bot.start(...)) work: the call is redirected
+    onto the simulator's already-running loop instead of raising
+    'Cannot run the event loop while another loop is running'."""
+    async def run():
+        session = _session()
+        project = Path(bot_runtime._SANDBOX_ROOT) / "pytest-asyncio-run"
+        project.mkdir(parents=True, exist_ok=True)
+        (project / "main.py").write_text(
+            "import asyncio\n"
+            "import discord\n"
+            "from discord.ext import commands\n"
+            "intents = discord.Intents.default()\n"
+            "bot = commands.Bot(command_prefix='!', intents=intents)\n"
+            "@bot.tree.command(name='where')\n"
+            "async def where(interaction):\n"
+            "    await interaction.response.send_message('token-var=set')\n"
+            "def main():\n"
+            "    asyncio.run(bot.start('offline-simulated-token'))\n",
+            encoding="utf-8",
+        )
+        try:
+            runtime = await asyncio.wait_for(bot_runtime.run_project(session, project), timeout=90)
+            try:
+                assert runtime.bot is not None and runtime.bot.is_ready()
+                await runtime.dispatch_command("where", {})
+                reply = session.messages.get(session.order[-1])
+                assert reply["content"] == "token-var=set"
+            finally:
+                await runtime.shutdown()
+        finally:
+            session.close()
+
+    asyncio.run(run())
+
+
+def _write_node_project(target: "Path", body: str) -> None:
+    import json
+
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "package.json").write_text(
+        json.dumps({"name": "events-style-bot", "dependencies": {"discord.js": "^14"}}),
+        encoding="utf-8",
+    )
+    (target / "index.js").write_text(body, encoding="utf-8")
+
+
+@pytest.mark.timeout(120)
+def test_node_events_constants_and_options_reach_handlers():
+    """Bots written with Events.* constants + option getters dispatch correctly."""
+    async def run():
+        session = _session()
+        project = Path(bot_runtime._SANDBOX_ROOT) / "pytest-node-events"
+        _write_node_project(project, """
+const { Client, GatewayIntentBits, SlashCommandBuilder, REST, Routes,
+        Events } = require('discord.js');
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+client.on(Events.ClientReady, async () => {
+  const commands = [new SlashCommandBuilder()
+    .setName('echo')
+    .setDescription('say it back')
+    .addStringOption(o => o.setName('text').setDescription('words').setRequired(true))
+    ].map(c => c.toJSON());
+  const rest = new REST({ version: '10' }).setToken('x');
+  await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+});
+client.on(Events.InteractionCreate, async interaction => {
+  if (!interaction.isChatInputCommand()) return;
+  await interaction.reply(`echo: ${interaction.options.getString('text')}`);
+});
+client.login('offline-simulated-token');
+""")
+        try:
+            runtime = await asyncio.wait_for(
+                bot_runtime.run_project(session, project), timeout=90
+            )
+            assert "echo" in runtime.commands_payload()
+            await runtime.dispatch_command("echo", {"text": "package check"})
+            reply = session.messages.get(session.order[-1])
+            assert reply["content"] == "echo: package check"
+        finally:
+            await runtime.shutdown()
+            session.close()
+
+    asyncio.run(run())

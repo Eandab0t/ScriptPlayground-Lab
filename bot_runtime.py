@@ -37,13 +37,15 @@ import subprocess
 import sys
 import tempfile
 import types
+import typing
 import uuid
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import discord
-from discord.http import HTTPClient, Route
 import discord.webhook.async_ as webhook_async
+from discord.http import HTTPClient, Route
 
 import playground as pg
 from playground import MockRole
@@ -63,7 +65,7 @@ _SECRET_NAMES = {".env"}
 # Source-ish text files get the token scrub; binaries (.db, images) are copied as-is.
 _TEXT_SUFFIXES = {".py", ".pyw", ".js", ".mjs", ".cjs", ".ts", ".json", ".txt", ".md",
                   ".yaml", ".yml", ".toml", ".cfg", ".ini", ".sh", ".bat", ".ps1",
-                  ".html", ".css", ".env", ".example", ".cfg"}
+                  ".html", ".css", ".env", ".example"}
 _SKIP_DIRS = {"__pycache__", ".git", "node_modules", "browser-profile", ".venv", "venv", "backups"}
 _SANDBOX_ROOT = Path(
     os.getenv("SCRIPTPLAYGROUND_SANDBOX", Path(tempfile.gettempdir()) / "scriptplayground-sandbox")
@@ -88,11 +90,11 @@ def _session_message_id(wire_id: str) -> str | None:
 
 # ------------------------------------------------------------- registries
 
-_ACTIVE_BOOT: contextvars.ContextVar["ProjectRuntime | None"] = contextvars.ContextVar(
+_ACTIVE_BOOT: contextvars.ContextVar[ProjectRuntime | None] = contextvars.ContextVar(
     "playground_active_boot", default=None
 )
-_HTTP_RUNTIMES: dict[int, "ProjectRuntime"] = {}     # id(client.http) -> runtime
-_SESSION_RUNTIMES: dict[int, "ProjectRuntime"] = {}  # id(aiohttp session) -> runtime
+_HTTP_RUNTIMES: dict[int, ProjectRuntime] = {}     # id(client.http) -> runtime
+_SESSION_RUNTIMES: dict[int, ProjectRuntime] = {}  # id(aiohttp session) -> runtime
 _BOOT_LOCK = asyncio.Lock()  # one project boot per process (module cache is shared)
 
 _ORIGINAL_REQUEST = HTTPClient.request
@@ -152,7 +154,6 @@ def _ensure_patches() -> None:
         runtime = _HTTP_RUNTIMES.get(id(self.http)) or _ACTIVE_BOOT.get()
         if runtime is not None:
             await runtime._connected.wait()
-        return None
 
     def run_shim(self, *args, **kwargs):  # type: ignore[no-untyped-def]
         # Module-level `bot.run(TOKEN)` must not block the import; boot() finds
@@ -287,7 +288,6 @@ def _neutralize_keep_alive() -> None:
 
     def _quiet_run(self, *args, **kwargs):  # type: ignore[no-untyped-def]
         log.debug("Flask.run suppressed in simulator")
-        return None
 
     Flask.run = _quiet_run  # type: ignore[method-assign]
     Flask._playground_patched = True  # type: ignore[attr-defined]
@@ -383,7 +383,7 @@ class ProjectTransport:
     populated regex match for extracting channel/message/member ids.
     """
 
-    def __init__(self, runtime: "ProjectRuntime") -> None:
+    def __init__(self, runtime: ProjectRuntime) -> None:
         self.runtime = runtime
         self._routes: dict[tuple[str, str], Callable] = {
             ("GET", "/users/@me"): self._get_users_at_me,
@@ -454,7 +454,7 @@ class ProjectTransport:
         match = self._match(route)
         try:
             return handler(match, payload or {}, params or {})
-        except Exception as error:  # noqa: BLE001 - surface transport failures in the timeline
+        except Exception as error:
             self.session.log("💥", f"REST {route.method} {template} failed: {error}", "error",
                              details={"operation": "transport", "route": f"{route.method} {template}",
                                       "status": "script_error", "type": type(error).__name__,
@@ -589,7 +589,7 @@ class ProjectTransport:
                  "owner": False, "permissions": str(discord.Permissions.all().value), "features": []}]
 
     def _post_dm_channel(self, match, payload, params):
-        recipient_id = int((payload.get("recipient_id") or USER_ID))
+        recipient_id = int(payload.get("recipient_id") or USER_ID)
         user = self.session.guild.get_member(recipient_id)
         channel = self.session.make_channel(f"dm-{getattr(user, 'name', 'user')}")
         self.session.log("📨", f"DM channel opened → #{channel.name}", kind="action",
@@ -945,6 +945,7 @@ class ProjectRuntime:
         self._main_task: asyncio.Task | None = None
         self._connected = asyncio.Event()
         self._pending_modal: tuple[str, str | None] | None = None  # (custom_id, source message)
+        self._original_asyncio_run = asyncio.run
         self.entry: str | None = None
 
     # ------------------------------------------------ boot
@@ -966,20 +967,27 @@ class ProjectRuntime:
                                   "status": "starting"})
         async with _BOOT_LOCK:
             _purge_sandbox_modules()
-            module = self._import_entry(entry)
-            bot = self._scan_for_bot() or (self.clients[-1] if self.clients else None)
-            if bot is None:
-                main_fn = getattr(module, "main", None)
-                if callable(main_fn):
-                    await self._run_entry_main(main_fn)
-                    bot = self._scan_for_bot() or (self.clients[-1] if self.clients else None)
-            if bot is not None:
-                self.bot = bot
-                if not bot.is_ready():
-                    await self._boot_bot(bot)
-            self.session.log("🔌", "fake transport installed — no network will be contacted",
-                             kind="event", details={"operation": "project.transport",
-                                                    "status": "installed"})
+            # Projects legitimately call asyncio.run() in their entry (a fresh
+            # loop is fine standalone, but this server loop is already running).
+            # Redirect it onto the running loop for the runtime's lifetime.
+            asyncio.run = self._asyncio_run_shim
+            try:
+                module = self._import_entry(entry)
+                bot = self._scan_for_bot() or (self.clients[-1] if self.clients else None)
+                if bot is None:
+                    main_fn = getattr(module, "main", None)
+                    if callable(main_fn):
+                        await self._run_entry_main(main_fn)
+                        bot = self._scan_for_bot() or (self.clients[-1] if self.clients else None)
+                if bot is not None:
+                    self.bot = bot
+                    if not bot.is_ready():
+                        await self._boot_bot(bot)
+                self.session.log("🔌", "fake transport installed — no network will be contacted",
+                                 kind="event", details={"operation": "project.transport",
+                                                        "status": "installed"})
+            finally:
+                asyncio.run = self._original_asyncio_run
 
     def _import_entry(self, entry: Path):
         saved_cwd = os.getcwd()
@@ -993,6 +1001,13 @@ class ProjectRuntime:
             if token is not None:
                 _ACTIVE_BOOT.reset(token)
             os.chdir(saved_cwd)
+
+    def _asyncio_run_shim(self, awaitable, *args, **kwargs):  # type: ignore[no-untyped-def]
+        """asyncio.run() inside a project can't spawn a second loop here; the
+        coroutine is scheduled on the simulator's loop instead."""
+        self._main_task = asyncio.ensure_future(_wrap_main(awaitable, self))
+        self.session.log("🪄", "asyncio.run() redirected to the simulator loop", kind="action",
+                         details={"operation": "asyncio.run", "status": "adapted"})
 
     def _scan_for_bot(self) -> discord.Client | None:
         for module in list(sys.modules.values()):
@@ -1163,8 +1178,8 @@ class ProjectRuntime:
             self._originals[interaction_id] = message_id
         return payload
 
-    _COMPONENT_TYPE_BY_KIND = {"button": 2, "select": 3, "user_select": 5, "role_select": 6,
-                               "mentionable_select": 7, "channel_select": 8}
+    _COMPONENT_TYPE_BY_KIND: typing.ClassVar[dict[str, int]] = {"button": 2, "select": 3, "user_select": 5, "role_select": 6,
+                                               "mentionable_select": 7, "channel_select": 8}
 
     def _component_type(self, message_id: str | None, custom_id: str | None) -> int:
         if message_id and custom_id:
@@ -1174,7 +1189,7 @@ class ProjectRuntime:
                     return self._COMPONENT_TYPE_BY_KIND.get(item.get("kind"), 2)
         return 2
 
-    _OPTION_TYPES = {"string": 3, "integer": 4, "boolean": 5, "user": 6, "channel": 7,
+    _OPTION_TYPES: typing.ClassVar[dict[str, int]] = {"string": 3, "integer": 4, "boolean": 5, "user": 6, "channel": 7,
                      "role": 8, "mentionable": 9, "number": 10, "attachment": 11}
 
     def _command_data(self, name: str, args: dict) -> dict:
@@ -1342,6 +1357,7 @@ class ProjectRuntime:
 
     async def shutdown(self) -> None:
         self._connected.set()  # release any bot parked in connect()
+        asyncio.run = self._original_asyncio_run
         with contextlib.suppress(ValueError):
             sys.path.remove(str(self.sandbox))
         for bot in list(self.clients):
@@ -1373,7 +1389,7 @@ def inspect_awaitable(value) -> bool:  # tiny alias to keep imports honest
     return inspect.isawaitable(value)
 
 
-async def _wrap_main(awaitable, runtime: "ProjectRuntime") -> None:
+async def _wrap_main(awaitable, runtime: ProjectRuntime) -> None:
     """Entry main() runs as a background task; failures surface as events."""
     try:
         await awaitable
@@ -1399,7 +1415,7 @@ async def run_project(session: pg.Session, workspace: Path, tag: str | None = No
         runtime = ProjectRuntime(session, workspace, tag)
     try:
         await runtime.boot()
-    except BaseException as error:  # noqa: BLE001 - surface boot failures in the UI
+    except BaseException as error:
         import traceback
 
         text = "".join(traceback.format_exception(type(error), error, error.__traceback__))
@@ -1529,7 +1545,7 @@ class NodeProjectRuntime:
                 await self._handle_event(payload)
         except asyncio.CancelledError:
             raise
-        except BaseException as error:  # noqa: BLE001 - a dead reader must not stall boot silently
+        except BaseException as error:
             self.session.log("💥", f"node bridge reader crashed: {error}", "error",
                              details={"operation": "node.reader", "runtime": "node-shim",
                                       "status": "script_error"})
@@ -1560,7 +1576,6 @@ class NodeProjectRuntime:
         kind = payload.get("type")
         if kind == "hello":
             # Bridge announced itself; deliver the ready event immediately.
-            me = self.session.guild.me
             self._send({"type": "ready", "user": self._bot_user(),
                         "channel_id": str(self.session.channel.id),
                         "guild_id": str(GUILD_ID)})
