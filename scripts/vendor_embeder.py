@@ -1,19 +1,18 @@
 """Vendor DiscordEmbeder's build into the playground and inject the bridge.
 
-    python scripts/vendor_embeder.py [source]
+    python scripts/vendor_embeder.py /path/to/DiscordEmbeder
 
 Copies dist/index.html -> embeder/index.html and appends the bridge fragment
-before </body>. The upstream repo (E:/.../DiscordEmbeder) stays authoritative;
-run this again after rebuilding upstream to refresh.
+before </body>. Build the upstream checkout first and pass its path explicitly.
 """
 
+import argparse
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
-DEFAULT_SOURCE = Path(r"E:/Ean server assests/Ean Applications/DiscordEmbeder")
 
 
 def _source_commit(source: Path) -> str:
@@ -49,4 +48,6 @@ def vendor(source: Path) -> None:
 
 
 if __name__ == "__main__":
-    vendor(Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_SOURCE)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("source", type=Path, help="path to the DiscordEmbeder checkout")
+    vendor(parser.parse_args().source)

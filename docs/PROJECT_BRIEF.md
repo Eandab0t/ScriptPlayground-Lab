@@ -76,9 +76,9 @@ Inspect the resulting messages and console events
 - Readable permission-denial diagnostics that identify the existing resolution step that rejected an operation.
 - A runtime **State inspector** in the console pane showing the active user, bot, channel, counts, users, channels, current permission results, and recent event snapshot.
 - **Events** and **Actions** inspector tabs showing structured runtime entries; selecting an entry reveals its details and simulated API operation arguments, including missing, denied, blocked, and unanswered attempts. Expanded details remain visible while the session refreshes.
-- Local script library, saved design projects, and mock runtime stress coverage.
+- Local script and scenario libraries, saved design projects, a replayable single-session scenario runner, and mock runtime stress coverage.
 - Canonical project-state validation before design loading, saving, code generation, and runtime use.
-- A desktop-first Discord-like shell with local-simulation labeling, a server rail, and persisted Comfortable/Compact and Cozy/Compact display settings.
+- A desktop-first Discord-like shell with local-simulation labeling, an informational online member rail, channel topic/header treatment, persisted Comfortable/Compact and Cozy/Compact display settings, incremental message rendering, short interaction motion, and reduced-motion support.
 - Optional Discord identity sign-in through the server-side OAuth2 authorization-code flow; it requests only `identify` and does not connect the simulator to Discord.
 
 ## Deliberate constraints
@@ -87,11 +87,11 @@ Inspect the resulting messages and console events
 - Fixed fixture users and roles.
 - Single-file bot workspace execution (`bot.py`).
 - No Discord bot token, gateway, simulator REST calls, or production deployment by default; optional OAuth identity is the only explicitly configured Discord request and uses `identify` only.
-- No full permissions editor, voice transport, multi-guild model, scenario runner, or broad event bus yet.
+- No full permissions editor, voice transport, multi-guild model, or broad event bus.
 - No new dependency is needed for the current product.
 - Discord OAuth sign-in is optional and identity-only. Configure `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET`, and `DISCORD_REDIRECT_URI` to enable it; without all three, the UI remains in offline mode. No `guilds` scope or guild discovery is used.
 - OAuth state and identity sessions are memory-only and expire with the server; the client secret and access token stay server-side. This is not a security sandbox, and signing in does not authorize real Discord reads or writes.
-- The browser shell is dark-first and desktop-oriented, with semantic Discord-like theme tokens. View settings currently persist Comfortable/Compact tool spacing and Cozy/Compact message display locally; light theme and profile surfaces remain future work; OAuth does not yet provide account settings, guild import, or persistence.
+- The browser shell is dark-first and desktop-oriented, with semantic Discord-like theme and motion tokens. The timeline updates keyed rows rather than rebuilding on every refresh; Cozy groups nearby same-author messages and Compact does not. Motion is limited to short transform/opacity/color/filter states and is disabled for reduced-motion users. Light theme and profile surfaces remain future work; OAuth does not yet provide account settings, guild import, or persistence.
 
 ## What success looks like
 

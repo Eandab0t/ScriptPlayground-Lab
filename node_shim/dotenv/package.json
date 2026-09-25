@@ -1,0 +1,6 @@
+{
+  "name": "dotenv",
+  "version": "16.0.0-offline-shim",
+  "description": "Offline ScriptPlayground stub for dotenv.",
+  "main": "index.js"
+}

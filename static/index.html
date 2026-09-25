@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/png" href="/static/icon.png">
 <title>ScriptPlayground</title>
 <style>
   :root {
@@ -17,6 +18,8 @@
     --txt: var(--text-normal); --txt-dim: var(--text-muted); --txt-head: var(--text-heading);
     --blurple: var(--brand-primary); --green: var(--status-success); --red: var(--status-danger); --orange: var(--status-warning);
     --link: var(--text-link); --border: var(--border-subtle);
+    --motion-fast: 100ms; --motion-normal: 150ms; --motion-slow: 250ms;
+    --ease-standard: cubic-bezier(0.4, 0, 0.2, 1); --ease-decelerate: cubic-bezier(0.2, 0, 0, 1);
   }
   * { box-sizing: border-box; margin: 0; }
   html, body { height: 100%; }
@@ -28,11 +31,16 @@
   }
   button, input, select, textarea { font-family: var(--font-ui); }
   #app { display: grid; grid-template-columns: 72px 280px 1fr 460px; height: 100vh; }
+  button, a, .channel-row, .server-icon, .inspect-tab, .inspect-entry { transition: background-color var(--motion-fast) var(--ease-standard), border-color var(--motion-fast) var(--ease-standard), border-radius var(--motion-fast) var(--ease-standard), transform var(--motion-fast) var(--ease-standard), opacity var(--motion-fast) var(--ease-standard); }
 
   /* ---------- server rail ---------- */
   #server-rail { background: var(--background-tertiary); display: flex; flex-direction: column; align-items: center; gap: 8px; padding-top: 12px; border-right: 1px solid var(--border); }
-  .server-icon { width: 44px; height: 44px; border-radius: 22px; background: var(--background-primary); color: var(--text-normal); display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; letter-spacing: .02em; transition: border-radius .15s, background .15s; }
+  .server-icon { width: 44px; height: 44px; border-radius: 22px; background: var(--background-primary); color: var(--text-normal); display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; letter-spacing: .02em; position: relative; }
+  .server-icon::before { content: ""; position: absolute; left: -14px; width: 4px; height: 8px; border-radius: 0 4px 4px 0; background: var(--text-normal); transform: scaleY(0); transition: transform var(--motion-normal) var(--ease-standard); }
+  .server-icon:hover { border-radius: 14px; background: var(--background-modifier-hover); }
+  .server-icon:hover::before { transform: scaleY(1); }
   .server-icon.active { border-radius: 14px; background: var(--brand-primary); color: #fff; }
+  .server-icon.active::before { height: 32px; transform: scaleY(1); }
   .server-separator { width: 32px; height: 1px; background: var(--border); margin: 2px 0; }
 
   /* ---------- channel sidebar ---------- */
@@ -40,14 +48,19 @@
   .guild-head { padding: 10px 16px; font-weight: 700; color: var(--txt-head); font-size: 15px;
                 border-bottom: 1px solid var(--border); box-shadow: 0 1px 0 rgba(0,0,0,.2); }
   .local-label { color: var(--text-muted); font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
-  .channel-row { padding: 8px 16px; color: var(--txt-dim); cursor: pointer; display: flex; gap: 6px; align-items: center; }
-  .channel-row.active { background: var(--bg3); color: var(--txt-head); border-radius: 4px; margin: 0 8px; padding: 8px 8px; }
-  .channel-row:hover { color: var(--txt-head); }
+  .channel-row { padding: 8px 16px; color: var(--txt-dim); cursor: pointer; display: flex; gap: 6px; align-items: center; border-radius: 4px; }
+  .channel-row.active { background: var(--bg3); color: var(--txt-head); margin: 0 8px; padding: 8px 8px; }
+  .channel-row:hover { color: var(--txt-head); background: var(--background-modifier-hover); }
   .channel-row .unread { margin-left: auto; background: var(--red); color: #fff; font-size: 11px; font-weight: 700;
                           border-radius: 8px; padding: 0 6px; min-width: 10px; text-align: center; }
+  .channel-row .unread.new { animation: unread-in var(--motion-normal) var(--ease-decelerate); }
   .channel-cat { padding: 14px 16px 4px; font-size: 11px; font-weight: 700; letter-spacing: .05em;
-                 color: var(--txt-dim); text-transform: uppercase; }
+                 color: var(--txt-dim); text-transform: uppercase; cursor: pointer; display: flex; align-items: center; gap: 4px; }
+  .channel-chevron { display: inline-block; transform: rotate(0deg); transition: transform var(--motion-fast) var(--ease-standard); }
+  .channel-chevron.closed { transform: rotate(-90deg); }
+  .channel-items.collapsed { display: none; }
   .sidebar-foot { margin-top: auto; padding: 10px; background: var(--background-tertiary); display: flex; align-items: center; gap: 10px; border-top: 1px solid var(--border); }
+  .avatar.status-ring { border: 2px solid var(--status-success); box-shadow: 0 0 0 2px var(--background-tertiary); }
   .avatar { width: 34px; height: 34px; border-radius: 50%; flex: none; background: var(--brand-primary);
             display: flex; align-items: center; justify-content: center; font-weight: 700; color: #fff; font-size: 14px; }
   .me-context { color: var(--text-muted); font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
@@ -59,16 +72,39 @@
 
   /* ---------- chat ---------- */
   #chat-pane { display: flex; flex-direction: column; background: var(--bg2); min-width: 0; }
-  #chat-head { padding: 12px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px;
+  #chat-head { padding: 10px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 10px;
                color: var(--txt-head); font-weight: 700; box-shadow: 0 1px 0 rgba(0,0,0,.2); }
+  #chat-title { min-width: 0; display: flex; flex-direction: column; }
+  #chat-head-name { line-height: 1.2; }
+  #head-topic { color: var(--txt-dim); font-size: 11px; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #chat-head .desc { color: var(--txt-dim); font-weight: 400; font-size: 13px; border-left: 1px solid var(--border); padding-left: 10px;
                      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .sim-badge { margin-left: auto; color: var(--text-muted); font-size: 10px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; white-space: nowrap; }
-  #timeline { flex: 1; overflow-y: auto; padding: 16px 0 8px; }
+  #chat-content { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 180px; position: relative; }
+  #timeline { min-width: 0; overflow-y: auto; padding: 16px 0 8px; }
+  #member-list { overflow-y: auto; padding: 16px 10px; background: var(--bg1); border-left: 1px solid var(--border); }
+  .member-group { color: var(--txt-dim); font-size: 10px; font-weight: 700; letter-spacing: .06em; margin: 0 6px 6px; text-transform: uppercase; }
+  .member-row { display: flex; align-items: center; gap: 8px; padding: 5px 6px; color: var(--txt-dim); border-radius: 4px; }
+  .member-row:hover { background: var(--background-modifier-hover); color: var(--txt-head); }
+  .member-avatar { width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; color: #fff; font-size: 11px; font-weight: 700; flex: none; position: relative; }
+  .member-avatar::after { content: ""; position: absolute; right: -1px; bottom: -1px; width: 8px; height: 8px; border-radius: 50%; background: var(--status-success); border: 2px solid var(--bg1); }
+  .member-avatar[data-status="idle"]::after { background: var(--status-warning); }
+  .member-avatar[data-status="dnd"]::after, .member-avatar[data-status="offline"]::after, .member-avatar[data-status="invisible"]::after { background: var(--text-muted); }
+  .member-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+  .member-name.bot { color: var(--brand-primary); }
   .day-divider { display: flex; align-items: center; gap: 8px; margin: 8px 16px; color: var(--txt-dim); font-size: 11px; font-weight: 600; }
+  .day-divider.entering { animation: content-in var(--motion-normal) var(--ease-decelerate); }
   .day-divider::before, .day-divider::after { content: ""; flex: 1; height: 1px; background: var(--border); }
-  .msg { display: flex; gap: 12px; padding: 4px 16px; position: relative; }
+  .msg { display: flex; gap: 12px; padding: 4px 16px; position: relative; border-radius: 2px; }
   .msg:hover { background: rgba(0,0,0,.06); }
+  .msg.entering { animation: content-in var(--motion-normal) var(--ease-decelerate); }
+  .msg.grouped { padding-top: 1px; padding-bottom: 1px; }
+  .msg.grouped > .avatar { visibility: hidden; }
+  .msg.grouped .msg-author, .msg.grouped .msg-time { display: none; }
+  .msg-actions { position: absolute; top: -10px; right: 16px; display: flex; gap: 2px; padding: 2px; background: var(--background-floating); border: 1px solid var(--border); border-radius: 5px; opacity: 0; transform: translateY(4px); pointer-events: none; }
+  .msg:hover .msg-actions, .msg:focus-within .msg-actions { opacity: 1; transform: translateY(0); pointer-events: auto; }
+  .msg-action { border: 0; background: transparent; color: var(--interactive-normal); border-radius: 3px; padding: 3px 5px; cursor: pointer; font-size: 11px; }
+  .msg-action:hover { background: var(--background-modifier-hover); color: var(--interactive-hover); }
   .msg .avatar { margin-top: 2px; }
   .msg-author { font-weight: 600; color: var(--txt-head); font-size: 15px; }
   .bot-tag { background: var(--blurple); color: #fff; font-size: 10px; font-weight: 700; padding: 1px 5px; border-radius: 4px;
@@ -136,15 +172,16 @@
   #composer input::placeholder { color: var(--txt-dim); }
   #palette { position: absolute; bottom: calc(100% - 10px); left: 16px; right: 16px; background: var(--bg1);
              border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,.45);
-             display: none; z-index: 30; overflow: hidden; max-height: 260px; overflow-y: auto; }
-  #palette.open { display: block; }
+             visibility: hidden; opacity: 0; transform: translateY(4px); pointer-events: none; z-index: 30; overflow: hidden; max-height: 260px; overflow-y: auto;
+             transition: opacity var(--motion-fast) var(--ease-standard), transform var(--motion-fast) var(--ease-standard); }
+  #palette.open { visibility: visible; opacity: 1; transform: translateY(0); pointer-events: auto; }
   .palette-item { padding: 9px 14px; cursor: pointer; display: flex; gap: 10px; align-items: baseline; }
-  .palette-item:hover, .palette-item.active { background: var(--bg3); }
+  .palette-item:hover, .palette-item.active { background: var(--bg3); transform: translateX(2px); }
   .palette-item .pname { color: var(--txt-head); font-weight: 700; }
   .palette-item .pdesc { color: var(--txt-dim); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .palette-empty { padding: 10px 14px; color: var(--txt-dim); font-size: 13px; font-style: italic; }
-  #cmd-form { display: none; align-items: center; flex-wrap: wrap; gap: 8px; background: var(--bg3); border-radius: 8px; padding: 8px 12px; }
-  #cmd-form.open { display: flex; }
+  #cmd-form { position: absolute; left: 16px; right: 16px; bottom: 20px; z-index: 31; visibility: hidden; opacity: 0; transform: translateY(4px); pointer-events: none; display: flex; align-items: center; flex-wrap: wrap; gap: 8px; background: var(--bg3); border-radius: 8px; padding: 8px 12px; transition: opacity var(--motion-fast) var(--ease-standard), transform var(--motion-fast) var(--ease-standard); }
+  #cmd-form.open { visibility: visible; opacity: 1; transform: translateY(0); pointer-events: auto; }
   .cmd-chip { background: var(--blurple); color: #fff; border-radius: 4px; padding: 2px 8px; font-size: 12.5px; font-weight: 700; white-space: nowrap; }
   .cmd-chip.msg-chip { background: var(--bg1); border: 1px solid var(--border); color: var(--txt-dim); font-size: 11.5px; padding: 1px 6px; }
   #cmd-form .pf { display: flex; flex-direction: column; gap: 2px; min-width: 110px; flex: 1; }
@@ -172,7 +209,7 @@
   .v2-gallery-img { height: 96px; border-radius: 8px; object-fit: cover; max-width: 200px; }
   .v2-separator { height: 1px; background: var(--border); margin: 2px 0; }
   .v2-separator.large { height: 8px; background: transparent; }
-  .v2-spoiler { filter: blur(12px); transition: filter .15s; cursor: pointer; }
+  .v2-spoiler { filter: blur(12px); transition: filter var(--motion-fast) var(--ease-standard); cursor: pointer; }
   .v2-spoiler.revealed { filter: none; }
   .v2-spoiler-inline { filter: blur(4px); }
   .v2-container .comp-row { margin-top: 0; }
@@ -217,6 +254,9 @@
              padding: 8px 22px; font-size: 14px; cursor: pointer; font-family: inherit; }
   #btn-run:hover { background: var(--status-success-hover); }
   #btn-run:disabled { opacity: .5; cursor: default; }
+  body[data-running="true"] #btn-run { animation: run-pulse var(--motion-slow) var(--ease-standard) infinite; }
+  #btn-run:active, #cmd-send:active { transform: scale(.96); }
+  .btn:active { transform: scale(.98); }
   #btn-restart { background: transparent; border: 1px solid var(--border); color: var(--txt-dim); border-radius: 6px;
                  padding: 7px 12px; cursor: pointer; margin-left: 8px; font-family: inherit; font-size: 13px; }
   #btn-restart:hover { color: var(--txt-head); border-color: var(--txt-dim); }
@@ -239,7 +279,10 @@
   .inspect-tab { margin-left: auto; background: transparent; border: 1px solid var(--border); color: var(--txt-dim);
                  border-radius: 4px; padding: 3px 8px; cursor: pointer; font: inherit; font-size: 11px; text-transform: none; letter-spacing: 0; }
   .inspect-tab + .inspect-tab { margin-left: 0; }
+  .inspect-tab { position: relative; border-color: transparent; }
+  .inspect-tab::after { content: ""; position: absolute; left: 7px; right: 7px; bottom: -4px; height: 2px; background: var(--blurple); transform: scaleX(0); transition: transform var(--motion-fast) var(--ease-standard); }
   .inspect-tab:hover, .inspect-tab.active { color: var(--txt-head); border-color: var(--blurple); }
+  .inspect-tab.active::after { transform: scaleX(1); }
   #console-body { flex: 1; overflow-y: auto; padding: 0 14px 12px; font: 12px/1.5 "Cascadia Code", Consolas, monospace; }
   #inspector { display: none; flex: 1; overflow-y: auto; padding: 10px 14px 12px; }
   .inspect-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; margin-bottom: 12px; }
@@ -262,21 +305,57 @@
   .inspect-entry-copy { min-width: 0; }
   .inspect-entry-kind { color: var(--txt-dim); font-size: 10px; text-transform: uppercase; }
   .inspect-entry-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .inspect-detail { display: none; background: var(--bg0); color: var(--txt-dim); border: 1px solid var(--border); border-top: 0;
-                   margin: -4px 0 4px; padding: 7px 9px; white-space: pre-wrap; word-break: break-word; font: 11px/1.45 "Cascadia Code", Consolas, monospace; }
-  .inspect-detail.open { display: block; }
+  .inspect-detail { display: grid; grid-template-rows: 0fr; background: var(--bg0); color: var(--txt-dim); border: 1px solid transparent; border-top: 0;
+                   margin: -4px 0 4px; padding: 0 9px; max-height: 0; overflow: hidden; white-space: pre-wrap; word-break: break-word; font: 11px/1.45 "Cascadia Code", Consolas, monospace; transition: max-height var(--motion-normal) var(--ease-standard), border-color var(--motion-normal) var(--ease-standard); }
+  .inspect-detail.open { grid-template-rows: 1fr; max-height: 400px; padding: 7px 9px; border-color: var(--border); }
+  .inspect-detail-body { min-height: 0; overflow: hidden; }
+  .inspect-meta { display: flex; flex-wrap: wrap; gap: 5px 10px; color: var(--txt-dim); font: 10px/1.4 var(--font-ui); margin-bottom: 5px; }
+  .inspect-meta span { overflow-wrap: anywhere; }
   .inspect-empty { color: var(--txt-dim); font-size: 12px; padding: 12px 2px; }
   .console-line { white-space: pre-wrap; word-break: break-word; color: var(--txt-dim); }
   .console-line.error { color: #f2777a; }
   .run-stats { color: var(--txt-dim); font-size: 11px; padding: 4px 0; }
+  #run-error { display: none; margin: 0 10px 8px; padding: 9px 10px; border: 1px solid var(--status-danger); border-radius: 5px; background: color-mix(in srgb, var(--status-danger) 12%, var(--bg1)); }
+  #run-error.open { display: block; }
+  .run-error-title { color: var(--status-danger); font-weight: 700; font-size: 12px; }
+  .run-error-location { color: var(--txt-dim); font: 11px/1.4 "Cascadia Code", Consolas, monospace; }
+  .run-error-message { color: var(--txt); font-size: 12px; overflow-wrap: anywhere; margin: 3px 0 7px; }
+  .run-error-trace { margin-top: 5px; color: var(--txt-dim); font-size: 11px; }
+  .run-error-trace summary { cursor: pointer; }
+  .run-error-trace pre { max-height: 150px; overflow: auto; margin: 5px 0 0; white-space: pre-wrap; word-break: break-word; font: 10px/1.4 "Cascadia Code", Consolas, monospace; }
+  .run-error-actions, .inspect-links { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+  .tool-link { border: 1px solid var(--border); border-radius: 4px; background: var(--bg3); color: var(--txt); padding: 4px 7px; font: inherit; font-size: 10px; cursor: pointer; }
+  .tool-link:hover { border-color: var(--blurple); color: var(--txt-head); }
+  .inspect-detail pre { margin: 0; font: inherit; white-space: pre-wrap; word-break: break-word; }
+  .msg-more { position: relative; }
+  .msg-inspect-menu { display: none; position: absolute; right: 0; top: 100%; min-width: 150px; padding: 4px; z-index: 12; background: var(--background-floating); border: 1px solid var(--border); border-radius: 5px; box-shadow: 0 6px 18px rgba(0,0,0,.35); }
+  .msg-inspect-menu.open { display: grid; gap: 2px; }
+  .msg-inspect-menu .tool-link { text-align: left; border-color: transparent; background: transparent; }
+  #scenario-panel { display: none; flex: none; flex-direction: column; gap: 6px; max-height: 270px; padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--bg2); }
+  #scenario-panel.open { display: flex; }
+  #scenario-tools { display: flex; gap: 5px; align-items: center; flex-wrap: wrap; }
+  #scenario-select { flex: 1; min-width: 90px; background: var(--bg0); color: var(--txt); border: 1px solid var(--border); border-radius: 4px; padding: 5px; }
+  #scenario-json { height: 84px; min-height: 60px; resize: vertical; background: var(--bg0); color: var(--text-code); border: 1px solid var(--border); border-radius: 4px; padding: 6px; font: 11px/1.4 "Cascadia Code", Consolas, monospace; }
+  #scenario-results { display: none; max-height: 100px; overflow: auto; font-size: 11px; }
+  #scenario-results.open { display: block; }
+  .scenario-result { padding: 2px 4px; border-left: 2px solid var(--status-success); }
+  .scenario-result.failed { border-color: var(--status-danger); color: var(--status-danger); }
+  .scenario-runtime { margin: 4px 0; color: var(--txt-dim); }
+  .scenario-runtime pre { max-height: 100px; overflow: auto; margin-top: 3px; padding: 5px; background: var(--bg0); white-space: pre-wrap; word-break: break-word; font: 10px/1.4 "Cascadia Code", Consolas, monospace; }
+  #jump-present { position: absolute; left: calc((100% - 180px) / 2 - 90px); bottom: 10px; transform: translateY(8px); opacity: 0; visibility: hidden; pointer-events: none; background: var(--brand-primary); color: #fff; border: 0; border-radius: 16px; padding: 7px 14px; font: inherit; font-size: 12px; font-weight: 700; z-index: 10; transition: opacity var(--motion-normal) var(--ease-decelerate), transform var(--motion-normal) var(--ease-decelerate); }
+  #jump-present.open { opacity: 1; transform: translateY(0); visibility: visible; pointer-events: auto; }
 
   /* ---------- modal dialog ---------- */
-  #modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.7); display: none; align-items: center;
-                   justify-content: center; z-index: 50; }
-  #modal-overlay.open { display: flex; }
-  #modal { background: var(--bg1); border-radius: 6px; width: 460px; max-width: 92vw; box-shadow: 0 8px 24px rgba(0,0,0,.4);
-           animation: pop .12s ease-out; }
-  @keyframes pop { from { transform: scale(.94); opacity: 0; } }
+  #modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.7); visibility: hidden; opacity: 0; pointer-events: none; display: flex; align-items: center;
+                   justify-content: center; z-index: 50; transition: opacity var(--motion-fast) var(--ease-standard); }
+  #modal-overlay.open, #modal-overlay.closing { visibility: visible; }
+  #modal-overlay.open { opacity: 1; pointer-events: auto; }
+  #modal { background: var(--bg1); border-radius: 6px; width: 460px; max-width: 92vw; box-shadow: 0 8px 24px rgba(0,0,0,.4); opacity: 0; transform: scale(.96); transition: opacity var(--motion-normal) var(--ease-decelerate), transform var(--motion-normal) var(--ease-decelerate); }
+  #modal-overlay.open #modal { opacity: 1; transform: scale(1); }
+  #modal-overlay.closing #modal { opacity: 0; transform: scale(.96); transition-duration: var(--motion-fast); }
+  @keyframes content-in { from { transform: translateY(4px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+  @keyframes unread-in { from { transform: scale(.8); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+  @keyframes run-pulse { 50% { opacity: .72; } }
   #modal-head { padding: 14px 16px; color: var(--txt-head); font-weight: 700; font-size: 18px; }
   #modal-body { padding: 4px 16px 8px; }
   .modal-field { margin-bottom: 14px; }
@@ -301,9 +380,15 @@
   @media (max-width: 980px) {
     #app { grid-template-columns: 1fr; }
     #sidebar, #editor-pane { display: none; }
+    #member-list { display: none; }
     #chat-head .desc, #sim-context { display: none; }
     #chat-head { padding: 10px 12px; }
     #composer { padding: 0 12px 12px; }
+    #jump-present { left: calc(50% - 90px); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: 1ms !important; animation-iteration-count: 1 !important; transition-duration: 1ms !important; scroll-behavior: auto !important; }
+    .msg.entering, .day-divider.entering, .channel-row .unread, body[data-running="true"] #btn-run { animation: none; }
   }
 </style>
 </head>
@@ -318,7 +403,7 @@
     <div class="guild-head"><div class="local-label">Local simulation</div><div id="guild-name">Playground Server</div></div>
     <div id="channel-list"></div>
     <div class="sidebar-foot">
-      <div class="avatar" id="me-avatar">Y</div>
+      <div class="avatar status-ring" id="me-avatar">Y</div>
       <div><div class="me-context">Acting as</div><div class="me-name" id="me-name">You</div><div class="me-tag" id="me-sub">connected locally</div></div>
       <label><span class="sr-only">Act as user</span><select id="act-as" title="Act as user"></select></label>
     </div>
@@ -326,13 +411,17 @@
 
   <main id="chat-pane">
   <header id="chat-head">
-    <span id="chat-head-name"># playground</span>
+    <div id="chat-title"><span id="chat-head-name"># playground</span><span id="head-topic" hidden></span></div>
     <span class="desc" id="head-desc">Everything your script sends shows up here — live.</span>
     <span class="sim-badge" id="sim-context">LOCAL · ACTING AS YOU</span>
     <a class="head-link" href="/embeder" target="_blank" title="Open the Components V2 builder">✦ Embeder</a>
     <a class="head-link" id="account-link" href="/auth/discord/login" title="Optional Discord identity sign-in">Sign in</a>
   </header>
+  <div id="chat-content">
     <div id="timeline"></div>
+    <button id="jump-present" type="button">Jump to present</button>
+    <aside id="member-list" aria-label="Members"></aside>
+  </div>
     <div id="composer">
       <div id="palette"></div>
       <div id="cmd-form"></div>
@@ -358,8 +447,27 @@
       <button id="btn-save" class="lib-btn" title="Save the editor contents into the library">Save</button>
       <button id="btn-delete" class="lib-btn" title="Delete the loaded script from the library">🗑</button>
       <button id="btn-suite" class="lib-btn" title="Run every saved script in isolated mock sessions">🧪 Test</button>
+      <button id="btn-scenarios" class="lib-btn" title="Create and replay a saved interaction scenario">Scenarios</button>
       <button id="btn-design" class="lib-btn link-btn" title="Import a saved Components V2 design into the editor">✦ Design</button>
     </div>
+    <section id="scenario-panel" aria-label="Scenario runner">
+      <div id="scenario-tools">
+        <label for="scenario-select" class="local-label">Saved scenarios</label>
+        <select id="scenario-select"><option value="">New scenario…</option></select>
+        <button id="scenario-load" class="lib-btn" type="button">Load</button>
+        <button id="scenario-save" class="lib-btn" type="button">Save</button>
+        <button id="scenario-run" class="lib-btn link-btn" type="button">▶ Run scenario</button>
+      </div>
+      <textarea id="scenario-json" spellcheck="false" aria-label="Scenario JSON">{
+  "version": 1,
+  "name": "Greeting",
+  "steps": [
+    {"action": "message", "content": "!hello", "as": "Alice"},
+    {"assert": "message_exists", "content": "Hello, <@111111111111111111>!"}
+  ]
+}</textarea>
+      <div id="scenario-results" aria-live="polite"></div>
+    </section>
     <div id="block-panel" aria-label="Visual block editor">
       <div class="block-title">🧱 Live message blocks</div>
       <div class="block">Send message <input id="block-content" placeholder="Message text"></div>
@@ -402,6 +510,7 @@
         <button class="inspect-tab" data-inspector="events" type="button">Events</button>
         <button class="inspect-tab" data-inspector="actions" type="button">Actions</button>
       </div>
+      <div id="run-error" role="alert" aria-live="assertive"></div>
       <div id="console-body"></div>
       <div id="inspector" aria-label="Runtime state inspector"></div>
     </div>
@@ -426,6 +535,9 @@ const timeline = $("#timeline"), consoleBody = $("#console-body"), inspector = $
 let currentChannel = null;   // which channel's timeline we're viewing
 const seenCounts = {};       // channel key -> count of seen messages
 let SID = null, pollTimer = null, ws = null, lastRevision = "", lastModalKey = "";
+let messageRows = new Map(), dayRows = new Map(), renderedChannel = null, emptyTimeline = null;
+let previousShownIds = new Set(), timelinePainted = false, categoryCollapsed = false;
+const unreadCounts = {};
 const dismissedModals = new Set();
 const AVATAR_COLORS = ["#5865f2","#3ba55d","#faa81a","#ed4245","#eb459e","#9b59b6"];
 let lastState = null, cmdMode = null; // cmdMode: the command being composed
@@ -450,6 +562,7 @@ const viewSettings = {
     viewSettings.messages = event.target.value;
     localStorage.setItem("pg-message-display", viewSettings.messages);
     applyViewSettings();
+    if (lastState) { lastRevision = ""; render(lastState); }
   };
   applyViewSettings();
 
@@ -466,6 +579,15 @@ async function boot() {
   loadLibrary();
   loadWorkspaces();
 }
+function flushLocalState() {
+  localStorage.setItem("pg-code", $("#code").value);
+  const design = localStorage.getItem("discord-embeder:autosave:v1");
+  if (design !== null) localStorage.setItem("discord-embeder:autosave:v1", design);
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") flushLocalState();
+});
+window.addEventListener("beforeunload", flushLocalState);
 async function loadAuthStatus() {
   const link = $("#account-link");
   try {
@@ -516,6 +638,8 @@ async function refresh() {
 function render(st) {
   if (!st || st.ok === false) return;
   lastState = st;
+  document.body.dataset.running = String(Boolean(st.running));
+  renderRunError(st.last_run);
   $("#guild-name").textContent = st.guild.name;
   $("#me-name").textContent = st.user.name;
   $("#me-sub").textContent = st.running ? "runtime live" : "not running — press Run";
@@ -529,28 +653,104 @@ function render(st) {
   actAs.innerHTML = "";
   for (const user of st.users || []) actAs.appendChild(new Option(user.name, user.id));
   actAs.value = String(st.user.id);
-  renderChannels(st);
-  renderInspector(st);
-
-  // Stay on the channel you're viewing; if it vanished (fresh Run), fall back to the first.
   if (!currentChannel || !st.channels.some((c) => c.id == currentChannel)) {
     currentChannel = st.channels.length ? st.channels[0].id : null;
   }
-  const shown = st.messages.filter((m) => m.channel == currentChannel || (!m.channel && currentChannel === st.channels[0]?.id));
+  renderChannels(st);
+  renderMembers(st);
+  renderInspector(st);
+
+  const shown = st.messages.filter((m) => !m.deleted && (m.channel == currentChannel || (!m.channel && currentChannel === st.channels[0]?.id)));
   const chatKey = `${st.revision}|${currentChannel}`;
   if (chatKey === lastRevision) return;
-
   const stick = timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < 200;
-  timeline.innerHTML = "";
-  for (const m of shown) timeline.appendChild(renderMessage(m, st));
-  if (!shown.length) {
-    const empty = document.createElement("div");
-    empty.className = "day-divider";
-    empty.textContent = "#" + channelName(st) + " — no messages here yet";
-    timeline.appendChild(empty);
+  const channelChanged = renderedChannel !== currentChannel;
+  if (channelChanged) {
+    timeline.replaceChildren();
+    messageRows.clear();
+    dayRows.clear();
+    emptyTimeline = null;
+    previousShownIds = new Set();
+    renderedChannel = currentChannel;
+    timelinePainted = false;
   }
-  if (stick) timeline.scrollTop = timeline.scrollHeight;
-  lastRevision = chatKey; // mark only after a successful paint, so a crash retries
+  const shownIds = new Set(shown.map((message) => message.id));
+  for (const [id, row] of messageRows) {
+    if (!shownIds.has(id)) {
+      row.remove();
+      messageRows.delete(id);
+    }
+  }
+  for (const [day, row] of dayRows) {
+    if (!shown.some((message) => messageDay(message) === day)) {
+      row.remove();
+      dayRows.delete(day);
+    }
+  }
+  if (shown.length && emptyTimeline) {
+    emptyTimeline.remove();
+    emptyTimeline = null;
+  }
+  const desired = [];
+  let previous = null;
+  let previousDay = null;
+  for (const message of shown) {
+    const day = messageDay(message);
+    let divider = dayRows.get(day);
+    if (!divider) {
+      divider = document.createElement("div");
+      divider.className = "day-divider" + (timelinePainted ? " entering" : "");
+      divider.textContent = day;
+      dayRows.set(day, divider);
+      if (timelinePainted) divider.addEventListener("animationend", () => divider.classList.remove("entering"), { once: true });
+    }
+    if (day !== previousDay) desired.push(divider);
+    const grouped = viewSettings.messages === "cozy" && previous && canGroupMessages(previous, message);
+    const fingerprint = messageFingerprint(message, grouped);
+    let row = messageRows.get(message.id);
+    const isNew = !row;
+    if (!row) {
+      row = renderMessage(message, st, grouped);
+      messageRows.set(message.id, row);
+    } else if (row.dataset.fingerprint !== fingerprint) {
+      updateMessageRow(row, message, st, grouped);
+    }
+    row.dataset.fingerprint = fingerprint;
+    row.classList.toggle("grouped", grouped);
+    if (isNew && timelinePainted) {
+      row.classList.add("entering");
+      row.addEventListener("animationend", () => row.classList.remove("entering"), { once: true });
+    } else if (!isNew) {
+      row.classList.remove("entering");
+    }
+    desired.push(row);
+    previous = message;
+    previousDay = day;
+  }
+  if (!shown.length) {
+    if (!emptyTimeline) {
+      emptyTimeline = document.createElement("div");
+      emptyTimeline.className = "day-divider";
+      emptyTimeline.textContent = "#" + channelName(st) + " — no messages here yet";
+    }
+    desired.push(emptyTimeline);
+  }
+  // Reconcile keyed nodes in place. Existing rows stay in the DOM; only a new
+  // row/divider is inserted, or a changed row's children are refreshed above.
+  for (let index = 0; index < desired.length; index += 1) {
+    const node = desired[index];
+    if (timeline.children[index] !== node) timeline.insertBefore(node, timeline.children[index] || null);
+  }
+  while (timeline.children.length > desired.length) timeline.lastElementChild.remove();
+  const newMessageArrived = [...shownIds].some((id) => !previousShownIds.has(id));
+  if (newMessageArrived && !stick && timelinePainted) $("#jump-present").classList.add("open");
+  if (stick) {
+    timeline.scrollTop = timeline.scrollHeight;
+    $("#jump-present").classList.remove("open");
+  }
+  previousShownIds = shownIds;
+  timelinePainted = true;
+  lastRevision = chatKey;
 
   const mk = JSON.stringify(st.modals);
   if (mk !== lastModalKey) {
@@ -571,8 +771,56 @@ function render(st) {
   }
 }
 
+function messageDay(message) {
+  return (message.timestamp || "").slice(0, 10) || "Today";
+}
+function canGroupMessages(previous, current) {
+  if (previous.author.id !== current.author.id || previous.author.bot !== current.author.bot) return false;
+  const a = Date.parse(previous.timestamp || ""), b = Date.parse(current.timestamp || "");
+  return messageDay(previous) === messageDay(current) && Number.isFinite(a) && Number.isFinite(b) && b - a <= 5 * 60 * 1000;
+}
+function messageFingerprint(message, grouped) {
+  return JSON.stringify([message.author, message.channel, message.command, message.timestamp,
+    message.content, message.embeds, message.components, message.v2, message.files,
+    message.ephemeral, message.deleted, message.revision, grouped]);
+}
+function updateMessageRow(row, message, st, grouped) {
+  const fresh = renderMessage(message, st, grouped);
+  row.className = fresh.className;
+  row.replaceChildren(...fresh.childNodes);
+}
+$("#jump-present").onclick = () => {
+  timeline.scrollTop = timeline.scrollHeight;
+  $("#jump-present").classList.remove("open");
+};
+timeline.addEventListener("scroll", () => {
+  if (timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < 200) $("#jump-present").classList.remove("open");
+});
+
 let inspectorMode = "console";
 let expandedInspectorEntry = null;
+
+function setInspector(mode, entryId = null) {
+  inspectorMode = mode;
+  expandedInspectorEntry = entryId && entryId !== "permissions" ? `${mode}:${entryId}` : null;
+  document.querySelectorAll("[data-inspector]").forEach((tab) =>
+    tab.classList.toggle("active", tab.dataset.inspector === mode));
+  renderInspector(lastState);
+  if (mode === "state" && entryId === "permissions") {
+    requestAnimationFrame(() => $("#inspect-permissions")?.scrollIntoView({ block: "start" }));
+  } else if (entryId && mode !== "state") {
+    requestAnimationFrame(() => inspector.querySelector(".inspect-entry[aria-expanded='true']")?.scrollIntoView({ block: "nearest" }));
+  }
+}
+
+function toolLink(label, mode, entryId = null) {
+  const button = document.createElement("button");
+  button.className = "tool-link";
+  button.type = "button";
+  button.textContent = label;
+  button.onclick = (event) => { event.stopPropagation(); setInspector(mode, entryId); };
+  return button;
+}
 
 function renderInspector(st) {
   const showInspector = inspectorMode !== "console";
@@ -629,8 +877,11 @@ function renderInspector(st) {
     list.innerHTML = `<div class="inspect-empty">${inspectorMode === "actions" ? "Run or interact with a script to see simulated API operations here." : "Run a script or interact with the chat to see events here."}</div>`;
     return;
   }
+  const visibleEntryIds = new Set(events.map((entry) => `${inspectorMode}:${entry.id || JSON.stringify([entry.icon, entry.kind, entry.text, entry.details])}`));
+  if (expandedInspectorEntry && !visibleEntryIds.has(expandedInspectorEntry)) expandedInspectorEntry = null;
   for (const [position, entry] of events.slice().reverse().entries()) {
-    const key = `${inspectorMode}:${JSON.stringify([entry.icon, entry.kind, entry.text, entry.details])}`;
+    const entryId = entry.id || JSON.stringify([entry.icon, entry.kind, entry.text, entry.details]);
+    const key = `${inspectorMode}:${entryId}`;
     const row = document.createElement("button");
     row.className = "inspect-entry";
     row.type = "button";
@@ -642,7 +893,41 @@ function renderInspector(st) {
     const detail = document.createElement("div");
     detail.className = `inspect-detail${expandedInspectorEntry === key ? " open" : ""}`;
     detail.id = `inspect-detail-${position}`;
-    detail.textContent = JSON.stringify(entry.details || { text: entry.text }, null, 2);
+    const detailBody = document.createElement("div");
+    detailBody.className = "inspect-detail-body";
+    const metadata = document.createElement("div");
+    metadata.className = "inspect-meta";
+    const details = entry.details || {};
+    for (const [label, value] of [["Time", entry.timestamp], ["Actor", details.actor],
+      ["Channel", details.channel && `#${details.channel}`],
+      ["Target", details.message_id && `message ${details.message_id}`]]) {
+      if (!value) continue;
+      const item = document.createElement("span");
+      item.textContent = `${label}: ${value}`;
+      metadata.appendChild(item);
+    }
+    if (metadata.childNodes.length) detailBody.appendChild(metadata);
+    const json = document.createElement("pre");
+    json.textContent = JSON.stringify(details.text ? details : { ...details, text: entry.text }, null, 2);
+    detailBody.appendChild(json);
+    const links = document.createElement("div");
+    links.className = "inspect-links";
+    if (inspectorMode === "events") {
+      for (const actionId of entry.action_ids || []) {
+        const action = (st.events || []).find((candidate) => candidate.id === actionId);
+        if (action) links.appendChild(toolLink(`Inspect ${action.details?.operation || "action"}`, "actions", action.id));
+      }
+    } else {
+      const triggeringEvent = entry.event_id && (st.events || []).find((candidate) => candidate.id === entry.event_id);
+      if (triggeringEvent) links.appendChild(toolLink("Inspect triggering event", "events", triggeringEvent.id));
+      for (const actionId of entry.action_ids || []) {
+        const action = (st.events || []).find((candidate) => candidate.id === actionId);
+        if (action) links.appendChild(toolLink(`Inspect ${action.details?.operation || "action"}`, "actions", action.id));
+      }
+    }
+    links.appendChild(toolLink("Inspect State", "state"));
+    detailBody.appendChild(links);
+    detail.appendChild(detailBody);
     row.setAttribute("aria-controls", detail.id);
     row.onclick = () => {
       expandedInspectorEntry = expandedInspectorEntry === key ? null : key;
@@ -653,17 +938,21 @@ function renderInspector(st) {
 }
 
 document.querySelectorAll("[data-inspector]").forEach((button) => {
-  button.onclick = () => {
-    inspectorMode = button.dataset.inspector;
-    document.querySelectorAll("[data-inspector]").forEach((tab) =>
-      tab.classList.toggle("active", tab === button));
-    renderInspector(lastState);
-  };
+  button.onclick = () => setInspector(button.dataset.inspector);
+});
+window.addEventListener("click", (event) => {
+  document.querySelectorAll(".msg-inspect-menu.open").forEach((menu) => {
+    if (!menu.parentElement.contains(event.target)) {
+      menu.classList.remove("open");
+      menu.parentElement.querySelector('[aria-haspopup="menu"]')?.setAttribute("aria-expanded", "false");
+    }
+  });
 });
 
-function renderMessage(m, st) {
+function renderMessage(m, st, grouped = false) {
   const row = document.createElement("div");
-  row.className = "msg";
+  row.className = "msg" + (grouped ? " grouped" : "");
+  row.dataset.messageId = m.id;
   const av = document.createElement("div");
   av.className = "avatar";
   av.style.background = AVATAR_COLORS[m.author.id % AVATAR_COLORS.length];
@@ -735,8 +1024,102 @@ function renderMessage(m, st) {
   rev.textContent = m.revision > 0 ? `(edited ×${m.revision})` : "";
   head.appendChild(rev);
 
-  row.appendChild(av); row.appendChild(body);
+  const actions = document.createElement("div");
+  actions.className = "msg-actions";
+  const copy = document.createElement("button");
+  copy.className = "msg-action";
+  copy.type = "button";
+  copy.textContent = "Copy";
+  copy.title = "Copy message text";
+  copy.onclick = () => copyMessage(m);
+  actions.appendChild(copy);
+  const more = document.createElement("div");
+  more.className = "msg-more";
+  const moreButton = document.createElement("button");
+  moreButton.className = "msg-action";
+  moreButton.type = "button";
+  moreButton.textContent = "More";
+  moreButton.title = "Inspect related runtime details";
+  moreButton.setAttribute("aria-haspopup", "menu");
+  moreButton.setAttribute("aria-expanded", "false");
+  const menu = document.createElement("div");
+  menu.className = "msg-inspect-menu";
+  menu.setAttribute("role", "menu");
+  const entries = st.events || [];
+  const directActions = entries.filter((entry) => entry.kind === "action" && entry.details?.message_id === m.id);
+  const directActionIds = new Set(directActions.map((entry) => entry.id));
+  const relatedEvent = entries.slice().reverse().find((entry) => entry.kind === "event" && (
+    entry.details?.message_id === m.id || (entry.action_ids || []).some((id) => directActionIds.has(id)) ||
+    directActions.some((action) => action.event_id === entry.id)
+  ));
+  const relatedActionIds = new Set([...directActionIds, ...(relatedEvent?.action_ids || [])]);
+  const relatedActions = entries.filter((entry) => entry.kind === "action" && relatedActionIds.has(entry.id));
+  const menuItems = [
+    ["Inspect event", "events", relatedEvent?.id || null],
+    ["Inspect action", "actions", relatedActions.at(-1)?.id || null],
+    ["Inspect permissions", "state", "permissions"],
+  ];
+  for (const [label, mode, id] of menuItems) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.textContent = label;
+    item.setAttribute("role", "menuitem");
+    item.className = "tool-link";
+    if (!id && mode !== "state") {
+      item.disabled = true;
+      item.title = "No related runtime entry was retained for this message";
+    }
+    item.onclick = (event) => {
+      event.stopPropagation();
+      menu.classList.remove("open");
+      moreButton.setAttribute("aria-expanded", "false");
+      moreButton.focus();
+      setInspector(mode, id || null);
+    };
+    menu.appendChild(item);
+  }
+  const closeMenu = () => {
+    menu.classList.remove("open");
+    moreButton.setAttribute("aria-expanded", "false");
+  };
+  menu.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") { closeMenu(); moreButton.focus(); return; }
+    const items = [...menu.querySelectorAll("button:not(:disabled)")];
+    if (!items.length) return;
+    const current = items.indexOf(document.activeElement);
+    let next = null;
+    if (event.key === "ArrowDown") next = (current + 1) % items.length;
+    else if (event.key === "ArrowUp") next = (current - 1 + items.length) % items.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = items.length - 1;
+    if (next !== null) { event.preventDefault(); items[next].focus(); }
+  });
+  moreButton.onclick = (event) => {
+    event.stopPropagation();
+    const open = !menu.classList.contains("open");
+    menu.classList.toggle("open", open);
+    moreButton.setAttribute("aria-expanded", String(open));
+    if (open) menu.querySelector("button:not(:disabled)")?.focus();
+  };
+  moreButton.onkeydown = (event) => {
+    if (event.key === "ArrowDown" && !menu.classList.contains("open")) {
+      event.preventDefault();
+      moreButton.click();
+    }
+  };
+  more.append(moreButton, menu);
+  actions.appendChild(more);
+  row.appendChild(av); row.appendChild(body); row.appendChild(actions);
   return row;
+}
+
+async function copyMessage(message) {
+  try {
+    await navigator.clipboard.writeText(message.content || "");
+    $("#run-stats").textContent = "— message copied";
+  } catch (_) {
+    pgAlert("Copy is unavailable in this browser context.");
+  }
 }
 
 function fmt(text, st) {
@@ -1078,7 +1461,9 @@ function openModal(modal) {
     }
     body.appendChild(f);
   }
-  $("#modal-overlay").classList.add("open");
+  const overlay = $("#modal-overlay");
+  overlay.classList.remove("closing");
+  overlay.classList.add("open");
   body.querySelector("input")?.focus();
 }
 function closeModal(submit) {
@@ -1091,7 +1476,10 @@ function closeModal(submit) {
   }
   const modal = activeModal;
   activeModal = null;
-  $("#modal-overlay").classList.remove("open");
+  const overlay = $("#modal-overlay");
+  overlay.classList.remove("open");
+  overlay.classList.add("closing");
+  setTimeout(() => overlay.classList.remove("closing"), 100);
   if (submit) post("submit", { modal_id: modal.id, values });
   else dismissedModals.add(modal.id);
 }
@@ -1105,6 +1493,40 @@ document.addEventListener("keydown", (e) => {
 });
 
 /* ---------------- channels ---------------- */
+function renderMembers(st) {
+  const list = $("#member-list");
+  list.innerHTML = "";
+  const details = st.member_details || Object.entries(st.members || {})
+    .filter(([id]) => id.length > 0 && [...id].every((char) => char >= "0" && char <= "9"))
+    .map(([id, name]) => ({ id, name, status: "online", bot: id === String(st.bot.id) }));
+  const online = details.filter((member) => !["offline", "invisible"].includes(member.status));
+  const offline = details.filter((member) => ["offline", "invisible"].includes(member.status));
+  const addGroup = (title, members, offset) => {
+    const group = document.createElement("div");
+    group.className = "member-group";
+    group.textContent = `${title} — ${members.length}`;
+    list.appendChild(group);
+    members.forEach((member, index) => {
+      const row = document.createElement("div");
+      row.className = "member-row";
+      const avatar = document.createElement("div");
+      avatar.className = "member-avatar";
+      avatar.dataset.status = member.status || "online";
+      avatar.style.background = member.bot ? "var(--brand-primary)"
+        : (member.role_color || AVATAR_COLORS[(index + offset) % AVATAR_COLORS.length]);
+      avatar.textContent = (member.name || "?")[0].toUpperCase();
+      const label = document.createElement("span");
+      label.className = "member-name" + (member.bot ? " bot" : "");
+      if (!member.bot && member.role_color) label.style.color = member.role_color;
+      label.textContent = member.name;
+      row.append(avatar, label);
+      list.appendChild(row);
+    });
+  };
+  addGroup("ONLINE", online, 0);
+  addGroup("OFFLINE", offline, online.length);
+}
+
 function channelName(st) {
   const c = (st.channels || []).find((c) => c.id == currentChannel);
   return c ? c.name : (st.channel ? st.channel.name : "playground");
@@ -1115,8 +1537,18 @@ function renderChannels(st) {
   list.innerHTML = "";
   const cat = document.createElement("div");
   cat.className = "channel-cat";
-  cat.textContent = "TEXT CHANNELS";
-  list.appendChild(cat);
+  const chevron = document.createElement("span");
+  chevron.className = "channel-chevron" + (categoryCollapsed ? " closed" : "");
+  chevron.textContent = "▾";
+  cat.append(chevron, document.createTextNode("TEXT CHANNELS"));
+  const channelItems = document.createElement("div");
+  channelItems.className = "channel-items" + (categoryCollapsed ? " collapsed" : "");
+  cat.onclick = () => {
+    categoryCollapsed = !categoryCollapsed;
+    channelItems.classList.toggle("collapsed", categoryCollapsed);
+    chevron.classList.toggle("closed", categoryCollapsed);
+  };
+  list.append(cat, channelItems);
   for (const c of st.channels || []) {
     const row = document.createElement("div");
     row.className = "channel-row" + (c.id == currentChannel ? " active" : "");
@@ -1129,14 +1561,18 @@ function renderChannels(st) {
     } else if (total > (seenCounts[c.id] || 0)) {
       const unread = total - (seenCounts[c.id] || 0);
       const badge = document.createElement("span");
-      badge.className = "unread";
+      badge.className = "unread" + (unread > (unreadCounts[c.id] || 0) ? " new" : "");
       badge.textContent = unread > 9 ? "9+" : unread;
       row.appendChild(badge);
     }
-    row.onclick = () => { currentChannel = c.id; render(lastState); };
-    list.appendChild(row);
+    unreadCounts[c.id] = total - (seenCounts[c.id] || 0);
+    row.onclick = () => { currentChannel = c.id; lastRevision = ""; render(lastState); };
+    channelItems.appendChild(row);
   }
+  const channel = (st.channels || []).find((item) => item.id == currentChannel) || st.channel;
   $("#chat-head-name").textContent = "# " + channelName(st);
+  $("#head-topic").textContent = channel?.topic || "";
+  $("#head-topic").hidden = !channel?.topic;
   composerInput.placeholder = `Message #${channelName(st)} — type !ping, !hello, or / for commands`;
 }
 
@@ -1282,25 +1718,35 @@ document.addEventListener("keydown", (e) => {
 
 /* editor */
 let activeWorkspace = null;
+let activeEntry = "bot.py";
 
 async function loadWorkspaces() {
   const res = await fetch("/api/workspaces");
   const items = (await res.json()).workspaces;
   const select = $("#workspace-select");
   select.innerHTML = '<option value="">connect a folder…</option>';
-  for (const item of items) select.appendChild(new Option(`${item.name} (${item.files.length} files)`, item.name));
+  for (const item of items) {
+    const entry = item.files.find((f) => f === "main.py") || item.files.find((f) => f === "bot.py") || item.files[0] || "";
+    const option = new Option(`${item.name} (${item.files.length} files)`, item.name);
+    option.dataset.entry = entry;
+    select.appendChild(option);
+  }
 }
 
 $("#btn-connect").onclick = async () => {
-  const name = $("#workspace-select").value;
+  const select = $("#workspace-select");
+  const name = select.value;
   if (!name) { pgAlert("Choose a bot folder first."); return; }
-  const res = await fetch(`/api/workspaces/${encodeURIComponent(name)}/files/bot.py`);
-  if (!res.ok) { pgAlert("That folder has no bot.py yet."); return; }
+  const entry = select.selectedOptions[0].dataset.entry;
+  if (!entry) { pgAlert("That folder has no Python entry file."); return; }
+  const res = await fetch(`/api/workspaces/${encodeURIComponent(name)}/files/${encodeURIComponent(entry)}`);
+  if (!res.ok) { pgAlert("Could not load the bot's entry file."); return; }
   const data = await res.json();
   activeWorkspace = name;
+  activeEntry = entry;
   loadedScript = null;
   $("#code").value = data.code;
-  $("#run-stats").textContent = `— connected ${name}/bot.py`;
+  $("#run-stats").textContent = `— connected ${name}/${entry}`;
 };
 
 $("#btn-save").dataset.workspaceSave = "true";
@@ -1308,12 +1754,12 @@ $("#btn-save").addEventListener("click", async (event) => {
   if (!activeWorkspace || event.__workspaceHandled) return;
   event.__workspaceHandled = true;
   event.stopImmediatePropagation();
-  const res = await fetch(`/api/workspaces/${encodeURIComponent(activeWorkspace)}/files/bot.py`, {
+  const res = await fetch(`/api/workspaces/${encodeURIComponent(activeWorkspace)}/files/${encodeURIComponent(activeEntry)}`, {
     method: "PUT", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ code: $("#code").value }),
   });
   const data = await res.json();
-  $("#run-stats").textContent = data.ok ? `— saved ${activeWorkspace}/bot.py` : `— ${data.error}`;
+  $("#run-stats").textContent = data.ok ? `— saved ${activeWorkspace}/${activeEntry}` : `— ${data.error}`;
 });
 
 function blockCode() {
@@ -1340,21 +1786,120 @@ $("#btn-apply-blocks").onclick = () => {
   $("#run-stats").textContent = "— blocks applied to editor";
 };
 
+function jumpToEditorLine(line) {
+  const editor = $("#code");
+  const lines = editor.value.split("\n");
+  if (!Number.isInteger(line) || line < 1 || line > lines.length) return;
+  const start = lines.slice(0, line - 1).reduce((total, value) => total + value.length + 1, 0);
+  editor.focus();
+  editor.setSelectionRange(start, start + lines[line - 1].length);
+  const lineHeight = Number.parseFloat(getComputedStyle(editor).lineHeight) || 20;
+  editor.scrollTop = Math.max(0, (line - 3) * lineHeight);
+}
+
+let runErrorFingerprint;
+function renderRunError(run) {
+  const fingerprint = JSON.stringify(run ?? null);
+  if (fingerprint === runErrorFingerprint) return;
+  runErrorFingerprint = fingerprint;
+  const panel = $("#run-error");
+  panel.replaceChildren();
+  const error = run && run.exception;
+  if (!error || run.ok) { panel.classList.remove("open"); return; }
+  const heading = document.createElement("div");
+  heading.className = "run-error-title";
+  heading.textContent = `ERROR · ${error.type || "ScriptError"}`;
+  const location = document.createElement("div");
+  location.className = "run-error-location";
+  const filename = error.file === "<playground>" ? "bot.py" : error.file;
+  location.textContent = filename && Number.isInteger(error.line) ? `${filename}:${error.line}` : "Script location unavailable";
+  const message = document.createElement("div");
+  message.className = "run-error-message";
+  message.textContent = error.message || run.error || "Script failed";
+  const trace = document.createElement("details");
+  trace.className = "run-error-trace";
+  if (run.error && run.error !== error.message) {
+    const summary = document.createElement("summary");
+    summary.textContent = "Show traceback";
+    const pre = document.createElement("pre");
+    pre.textContent = run.error;
+    trace.append(summary, pre);
+  }
+  const actions = document.createElement("div");
+  actions.className = "run-error-actions";
+  const copy = document.createElement("button");
+  copy.type = "button";
+  copy.className = "tool-link";
+  copy.textContent = "Copy error";
+  copy.onclick = async () => {
+    const summary = `${error.type || "ScriptError"}: ${error.message || run.error || "Script failed"}`
+      + (filename && error.line ? `\n${filename}:${error.line}` : "")
+      + (run.error && run.error !== error.message ? `\n\n${run.error}` : "");
+    try {
+      await navigator.clipboard.writeText(summary);
+      copy.textContent = "Copied";
+    } catch (_) {
+      const fallback = document.createElement("textarea");
+      fallback.value = summary;
+      fallback.setAttribute("readonly", "");
+      fallback.style.position = "fixed";
+      fallback.style.opacity = "0";
+      document.body.appendChild(fallback);
+      fallback.select();
+      const copied = document.execCommand("copy");
+      fallback.remove();
+      if (copied) copy.textContent = "Copied";
+      else pgAlert("Could not copy the error in this browser context.");
+    }
+  };
+  actions.appendChild(copy);
+  if (error.file === "<playground>" && Number.isInteger(error.line)) {
+    const jump = document.createElement("button");
+    jump.type = "button";
+    jump.className = "tool-link";
+    jump.textContent = "Jump to line";
+    jump.onclick = () => {
+      jumpToEditorLine(error.line);
+      $("#run-stats").textContent = `— ${lastRunSource}:${error.line}`;
+    };
+    actions.appendChild(jump);
+  }
+  const stateButton = document.createElement("button");
+  stateButton.type = "button";
+  stateButton.className = "tool-link";
+  stateButton.textContent = "Inspect State";
+  stateButton.onclick = () => setInspector("state");
+  actions.appendChild(stateButton);
+  panel.append(heading, location, message);
+  if (trace.childNodes.length) panel.appendChild(trace);
+  panel.appendChild(actions);
+  panel.classList.add("open");
+}
+
 $("#btn-run").onclick = async () => {
   const code = $("#code").value;
   localStorage.setItem("pg-code", code);
+  lastRunSource = activeWorkspace ? `${activeWorkspace}/${activeEntry}` : loadedScript ? `${loadedScript}.py` : "editor";
   $("#btn-run").disabled = true;
   try {
-    const res = await fetch(`/api/session/${SID}/run`, {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code }),
+    const url = activeWorkspace ? `/api/session/${SID}/project` : `/api/session/${SID}/run`;
+    const payload = activeWorkspace ? { workspace: activeWorkspace } : { code };
+    const res = await fetch(url, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
     });
-    const data = await res.json();
-    if (!data.ok && data.error) {
-      const line = document.createElement("div");
-      line.className = "console-line error";
-      line.textContent = "⛔ " + data.error;
-      consoleBody.appendChild(line);
+    if (!res.ok) {
+      const error = await res.json();
+      pgAlert(error.error || "Run failed.");
+      return;
     }
+    if (activeWorkspace) {
+      const data = await res.json();
+      const status = data.status || {};
+      $("#run-stats").textContent =
+        `— ${status.bot || "bot"} · cogs: ${(status.cogs || []).join(", ") || "none"} · ${(status.commands || []).length} slash commands`;
+    }
+  } catch (error) {
+    pgAlert(error.message || "Run request failed.");
   } finally { $("#btn-run").disabled = false; await refresh(); }
 };
 $("#code").addEventListener("keydown", (e) => {
@@ -1373,6 +1918,7 @@ $("#btn-restart").onclick = async () => {
 
 /* ---------------- script library ---------------- */
 let loadedScript = null; // which library script is in the editor, if any
+let lastRunSource = "editor";
 
 function pgAlert(message) {
   $("#run-stats").textContent = "— " + message;
@@ -1437,6 +1983,101 @@ $("#btn-suite").onclick = async () => {
     consoleBody.appendChild(line);
   }
   $("#run-stats").textContent = `— ${data.reports.filter((report) => report.ok).length}/${data.reports.length} scripts passed`;
+};
+
+const scenarioPanel = $("#scenario-panel");
+const scenarioEditor = $("#scenario-json");
+const scenarioResults = $("#scenario-results");
+
+$("#btn-scenarios").onclick = () => {
+  scenarioPanel.classList.toggle("open");
+  if (scenarioPanel.classList.contains("open")) loadScenarios();
+};
+
+async function loadScenarios(selectedName = $("#scenario-select").value) {
+  const response = await fetch("/api/scenarios");
+  if (!response.ok) { pgAlert("Could not load scenarios."); return; }
+  const { scenarios } = await response.json();
+  const select = $("#scenario-select");
+  select.innerHTML = "";
+  select.appendChild(new Option("New scenario…", ""));
+  for (const scenario of scenarios) {
+    select.appendChild(new Option(`${scenario.name} (${scenario.steps} steps)`, scenario.name));
+  }
+  if ([...select.options].some((option) => option.value === selectedName)) select.value = selectedName;
+}
+
+$("#scenario-load").onclick = async () => {
+  const name = $("#scenario-select").value;
+  if (!name) { pgAlert("Choose a saved scenario first."); return; }
+  const response = await fetch(`/api/scenarios/${encodeURIComponent(name)}`);
+  if (!response.ok) { pgAlert("Could not load that scenario."); return; }
+  scenarioEditor.value = JSON.stringify(await response.json(), null, 2);
+  scenarioResults.classList.remove("open");
+  $("#run-stats").textContent = `— loaded scenario ${name}`;
+};
+
+function parseScenarioEditor() {
+  try { return JSON.parse(scenarioEditor.value); }
+  catch (error) { throw new Error(`Scenario JSON is invalid: ${error.message}`); }
+}
+
+$("#scenario-save").onclick = async () => {
+  let scenario;
+  try { scenario = parseScenarioEditor(); }
+  catch (error) { pgAlert(error.message); return; }
+  const response = await fetch("/api/scenarios", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scenario }),
+  });
+  const data = await response.json();
+  if (!response.ok || !data.ok) { pgAlert(data.error || "Scenario save failed."); return; }
+  await loadScenarios(data.name);
+  $("#run-stats").textContent = data.existed ? `— updated scenario ${data.name}` : `— saved scenario ${data.name}`;
+};
+
+$("#scenario-run").onclick = async () => {
+  let scenario;
+  try { scenario = parseScenarioEditor(); }
+  catch (error) { pgAlert(error.message); return; }
+  const button = $("#scenario-run");
+  button.disabled = true;
+  button.textContent = "Running…";
+  scenarioResults.replaceChildren();
+  scenarioResults.classList.add("open");
+  try {
+    const response = await fetch(`/api/session/${SID}/scenario`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scenario }),
+    });
+    const data = await response.json();
+    if (!response.ok) { pgAlert(data.error || "Scenario failed to start."); return; }
+    if (data.state) render(data.state);
+    for (const result of data.results || []) {
+      const row = document.createElement("div");
+      row.className = "scenario-result" + (result.passed ? "" : " failed");
+      row.textContent = `${result.passed ? "PASS" : "FAIL"} · Step ${result.step}: ${result.label} — ${result.actual} (expected: ${result.expected})`;
+      scenarioResults.appendChild(row);
+    }
+    if (data.runtime_state) {
+      const details = document.createElement("details");
+      details.className = "scenario-runtime";
+      const summary = document.createElement("summary");
+      summary.textContent = data.ok ? "Runtime state after replay" : `Runtime state at failed step ${data.failed_step}`;
+      const pre = document.createElement("pre");
+      pre.textContent = JSON.stringify(data.runtime_state, null, 2);
+      details.append(summary, pre);
+      scenarioResults.appendChild(details);
+    }
+    $("#run-stats").textContent = data.ok
+      ? `— scenario passed (${data.results.length} steps)`
+      : `— scenario failed at step ${data.failed_step}`;
+  } catch (error) {
+    pgAlert(error.message || "Scenario request failed.");
+  } finally {
+    button.disabled = false;
+    button.textContent = "▶ Run scenario";
+  }
 };
 
 $("#btn-delete").onclick = async () => {

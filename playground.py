@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import contextvars
 import inspect
 import io
 import logging
@@ -40,6 +41,7 @@ import discord
 from discord import app_commands
 
 log = logging.getLogger(__name__)
+_ACTIVE_EVENT: contextvars.ContextVar[str | None] = contextvars.ContextVar("playground_active_event", default=None)
 
 USER_ID = 123456789012345678
 USER_NAME = "You"
@@ -234,6 +236,7 @@ class MockChannel:
         self._session = session
         self.id = channel_id
         self.name = name
+        self.topic: str | None = None
         self.guild = session.guild
         self.mention = f"<#{channel_id}>"
         self.overwrites: dict[int, discord.PermissionOverwrite] = {}
@@ -298,7 +301,8 @@ class MockChannel:
         msg = self._session.add_message(channel_id=self.id, content=content, **kwargs)
         self._session.log("↗️", f"channel.send → message #{msg['index']}", kind="action",
                           details={"operation": "channel.send", "channel": self.name,
-                                   "message_id": msg["id"], "content": content or ""})
+                                   "actor": author.name, "message_id": msg["id"], "content": content or "",
+                                   "status": "success"})
         return MockMessage(self._session, msg["id"], msg.get("author_obj"))
 
     async def delete(self) -> None:
@@ -770,43 +774,52 @@ async def _do_command(session: Session, name: str, args: dict) -> None:
     if not env:
         raise RuntimeError("Nothing is running yet — press Run first.")
     command_details = {"operation": "interaction.command", "command": name, "arguments": args}
-    cmd = session.cmd_objects.get(name)
-    if cmd is None:
-        session.log("⚠️", f"/{name} is not defined by the current script", "warn",
-                    kind="action", details={**command_details, "status": "missing_command"})
-        return
-    spec = session.commands.get(name) or {"params": []}
-    params = {p["name"]: p for p in spec["params"]}
-    kwargs = {}
-    for pname, raw in args.items():
-        if pname in params and raw is not None and raw != "":
-            kwargs[pname] = _coerce_arg(session, params[pname], raw)
-    missing = [p["name"] for p in spec["params"] if p["required"] and p["name"] not in kwargs]
-    if missing:
-        session.log("⚠️", f"/{name} is missing required argument(s): {', '.join(missing)}", "warn",
-                    kind="action", details={**command_details, "status": "missing_arguments",
-                                             "missing": missing})
-        return
-    session.pending_command = name
+    event = session.log("⌨️", f"command invoked: /{name}", kind="event",
+                        details={**command_details, "interaction": "application_command",
+                                 "actor": session.active_user.name, "channel": session.channel.name,
+                                 "status": "attempted"})
+    event_token = _ACTIVE_EVENT.set(event["id"])
     try:
-        session.log("⚡", f"command invoked: /{name}", kind="action",
-                    details={**command_details, "status": "dispatched"})
-        interaction = session.build_interaction(
-            source_message_id=None,
-            interaction_type=discord.InteractionType.application_command,
-        )
-        interaction.channel = session.channel
-        interaction.channel_id = session.channel.id
-        interaction.command = _CommandRef(name)
-        result = cmd._callback(cmd, interaction, **kwargs) if inspect.ismethod(cmd._callback) else cmd._callback(interaction, **kwargs)
-        if inspect.isawaitable(result):
-            await result
-        if not interaction.is_done():
-            session.log("⚠️", "that interaction was never answered — real Discord shows "
-                        "'This interaction failed'", "warn", kind="event",
-                        details={**command_details, "status": "unanswered"})
+        cmd = session.cmd_objects.get(name)
+        if cmd is None:
+            session.log("⚠️", f"/{name} is not defined by the current script", "warn",
+                        kind="action", details={**command_details, "status": "missing_command"})
+            return
+        spec = session.commands.get(name) or {"params": []}
+        params = {p["name"]: p for p in spec["params"]}
+        kwargs = {}
+        for pname, raw in args.items():
+            if pname in params and raw is not None and raw != "":
+                kwargs[pname] = _coerce_arg(session, params[pname], raw)
+        missing = [p["name"] for p in spec["params"] if p["required"] and p["name"] not in kwargs]
+        if missing:
+            session.log("⚠️", f"/{name} is missing required argument(s): {', '.join(missing)}", "warn",
+                        kind="action", details={**command_details, "status": "missing_arguments",
+                                                 "missing": missing})
+            return
+        session.pending_command = name
+        try:
+            session.log("⚡", f"interaction.command → /{name}", kind="action",
+                        details={**command_details, "actor": session.active_user.name,
+                                 "channel": session.channel.name, "status": "dispatched"})
+            interaction = session.build_interaction(
+                source_message_id=None,
+                interaction_type=discord.InteractionType.application_command,
+            )
+            interaction.channel = session.channel
+            interaction.channel_id = session.channel.id
+            interaction.command = _CommandRef(name)
+            result = cmd._callback(cmd, interaction, **kwargs) if inspect.ismethod(cmd._callback) else cmd._callback(interaction, **kwargs)
+            if inspect.isawaitable(result):
+                await result
+            if not interaction.is_done():
+                session.log("⚠️", "that interaction was never answered — real Discord shows "
+                            "'This interaction failed'", "warn", kind="event",
+                            details={**command_details, "status": "unanswered"})
+        finally:
+            session.pending_command = None
     finally:
-        session.pending_command = None
+        _ACTIVE_EVENT.reset(event_token)
 
 
 # --------------------------------------------------------------- session
@@ -884,6 +897,8 @@ class Session:
         self.next_index = 1
         self.next_modal_id = 1
         self.last_run: dict | None = None
+        self.next_event_id = 1
+        self.next_action_id = 1
         self.runner = SessionRunner()
         self.env: dict | None = None
         self.main_task: asyncio.Task | None = None
@@ -897,16 +912,30 @@ class Session:
         self.revision += 1
 
     def log(self, icon: str, text: str, cls: str | None = None, *,
-            kind: str = "event", details: dict | None = None) -> None:
-        event = {"icon": icon, "text": text, "kind": kind}
+            kind: str = "event", details: dict | None = None) -> dict:
+        if kind == "action":
+            event = {"id": f"a{self.next_action_id}", "icon": icon, "text": text, "kind": kind}
+            self.next_action_id += 1
+        else:
+            event = {"id": f"e{self.next_event_id}", "icon": icon, "text": text, "kind": kind,
+                     "action_ids": []}
+            self.next_event_id += 1
+        event["timestamp"] = _now()
         if cls:
             event["cls"] = cls
         if details is not None:
-            event["details"] = details
+            event["details"] = dict(details)
+        related_event_id = _ACTIVE_EVENT.get()
+        if kind == "action" and related_event_id:
+            event["event_id"] = related_event_id
+            related = next((item for item in reversed(self.events) if item["id"] == related_event_id), None)
+            if related is not None:
+                related["action_ids"].append(event["id"])
         self.events.append(event)
         self._touch()
         if len(self.events) > _MAX_EVENTS:
             del self.events[:-_MAX_EVENTS]
+        return event
 
     def add_message(self, content=None, **kwargs) -> dict:
         mid = f"m{self.next_index}"
@@ -1076,6 +1105,8 @@ class Session:
         self.reset_channels()
         self.clear_timeline()
         self.events.clear()
+        self.next_event_id = 1
+        self.next_action_id = 1
         self.last_run = None
 
     def close(self) -> None:
@@ -1140,8 +1171,41 @@ async def _stop_main(session: Session) -> None:
             await task
 
 
+def _script_error_details(error: BaseException) -> dict:
+    """Map a script exception to the last user-code frame for editor navigation."""
+    filename = None
+    line = None
+    if isinstance(error, SyntaxError) and error.filename == "<playground>":
+        filename, line = error.filename, error.lineno
+    else:
+        frame = next((frame for frame in reversed(traceback.extract_tb(error.__traceback__ or None))
+                      if frame.filename == "<playground>"), None)
+        if frame is not None:
+            filename, line = frame.filename, frame.lineno
+    message = error.msg if isinstance(error, SyntaxError) else str(error)
+    return {"type": type(error).__name__, "message": message, "file": filename, "line": line}
+
+
+def _record_script_error(session: Session, error: Exception, started: float) -> None:
+    """Expose callback failures through the same error panel as startup failures."""
+    details = _script_error_details(error)
+    summary = f"{type(error).__name__}: {error}"
+    traceback_text = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    current = session.last_run or {}
+    session.log("💥", summary, "error", details={
+        **details, "operation": "script.callback", "status": "script_error",
+    })
+    session.last_run = {
+        "ok": False, "error": traceback_text, "exception": details,
+        "ms": (time.perf_counter() - started) * 1000 + current.get("ms", 0.0),
+    }
+
+
 async def _do_run(session: Session, code: str) -> None:
     await _stop_main(session)
+    session.env = None
+    session.reset_commands()
+    session.last_run = None
     session.clear_timeline()
     session.reset_channels()  # a fresh Run bootstraps its own channels
     env = _build_env(session)
@@ -1152,11 +1216,12 @@ async def _do_run(session: Session, code: str) -> None:
     try:
         with contextlib.redirect_stdout(buffer):
             exec(compile(code, "<playground>", "exec"), env)  # noqa: S102 - the whole point
-    except BaseException:  # noqa: BLE001 - user code may raise anything, incl. SystemExit
+    except BaseException as error:  # noqa: BLE001 - user code may raise anything, incl. SystemExit
         _flush_stdout(buffer, session)
         tb = traceback.format_exc(limit=6)
         session.log("💥", tb, "error")
-        session.last_run = {"ok": False, "error": tb, "ms": (time.perf_counter() - started) * 1000}
+        session.last_run = {"ok": False, "error": tb, "exception": _script_error_details(error),
+                            "ms": (time.perf_counter() - started) * 1000}
         return
     finally:
         sys.settrace(previous_trace)
@@ -1191,10 +1256,10 @@ async def _run_main(main_fn, session: Session, started: asyncio.Event) -> None:
             await result
     except asyncio.CancelledError:
         session.log("🛑", "main() was cancelled.")
-    except BaseException:  # noqa: BLE001 - background task must swallow-and-report
+    except BaseException as error:  # noqa: BLE001 - background task must swallow-and-report
         tb = "".join(traceback.format_exception(*sys.exc_info()))
         session.log("💥", tb, "error")
-        session.last_run = {"ok": False, "error": tb, "ms": 0.0}
+        session.last_run = {"ok": False, "error": tb, "exception": _script_error_details(error), "ms": 0.0}
 
 
 async def _do_click(session: Session, message_id: str, custom_id: str, values: list) -> None:
@@ -1202,29 +1267,36 @@ async def _do_click(session: Session, message_id: str, custom_id: str, values: l
     if not env:
         raise RuntimeError("Nothing is running yet — press Run first.")
     handler = env.get("on_click")
+    message = session.messages.get(message_id) or {}
+    channel = session.channels.get(message.get("channel") or "", session.channel)
     click_details = {"interaction": "component", "custom_id": custom_id,
-                     "message_id": message_id, "values": values}
-    session.log("🖱️", f"component used: {custom_id!r}", kind="event",
-                details={**click_details, "status": "attempted"})
+                     "message_id": message_id, "values": values,
+                     "actor": session.active_user.name, "channel": channel.name}
+    event = session.log("🖱️", f"component used: {custom_id!r}", kind="event",
+                        details={**click_details, "status": "attempted"})
     if not callable(handler):
         session.log("⚠️", f"clicked {custom_id!r} but no `on_click` handler is defined", "warn",
                     kind="event", details={**click_details, "status": "missing_handler"})
         return
-    interaction = session.build_interaction(
-        message_id, custom_id, values, discord.InteractionType.component
-    )
-    result = _call(handler, interaction, custom_id, values)
-    if inspect.isawaitable(result):
-        await result
-    if not interaction.is_done():
-        session.log(
-            "⚠️",
-            "that interaction was never answered — real Discord shows "
-            "'This interaction failed'",
-            "warn",
-            kind="event",
-            details={**click_details, "status": "unanswered"},
+    event_token = _ACTIVE_EVENT.set(event["id"])
+    try:
+        interaction = session.build_interaction(
+            message_id, custom_id, values, discord.InteractionType.component
         )
+        result = _call(handler, interaction, custom_id, values)
+        if inspect.isawaitable(result):
+            await result
+        if not interaction.is_done():
+            session.log(
+                "⚠️",
+                "that interaction was never answered — real Discord shows "
+                "'This interaction failed'",
+                "warn",
+                kind="event",
+                details={**click_details, "status": "unanswered"},
+            )
+    finally:
+        _ACTIVE_EVENT.reset(event_token)
 
 
 async def _do_submit(session: Session, modal_id: str, values: dict) -> None:
@@ -1232,32 +1304,39 @@ async def _do_submit(session: Session, modal_id: str, values: dict) -> None:
     if not env:
         raise RuntimeError("Nothing is running yet — press Run first.")
     handler = env.get("on_submit")
-    submit_details = {"interaction": "modal_submit", "modal_id": modal_id, "values": values}
-    session.log("📝", f"modal submitted: {modal_id!r}", kind="event",
-                details={**submit_details, "status": "attempted"})
+    modal = next((m for m in session.modals if m["id"] == modal_id), None)
+    source = session.messages.get((modal or {}).get("source") or "") or {}
+    channel = session.channels.get(source.get("channel") or "", session.channel)
+    submit_details = {"interaction": "modal_submit", "modal_id": modal_id, "values": values,
+                      "actor": session.active_user.name, "channel": channel.name}
+    event = session.log("📝", f"modal submitted: {modal_id!r}", kind="event",
+                        details={**submit_details, "status": "attempted"})
     if not callable(handler):
         session.log("⚠️", f"modal {modal_id} submitted but no `on_submit` handler is defined", "warn",
                     kind="event", details={**submit_details, "status": "missing_handler"})
         return
-    modal = next((m for m in session.modals if m["id"] == modal_id), None)
     if modal is not None:
         session.modals.remove(modal)
-    interaction = session.build_interaction(
-        modal["source"] if modal else None,
-        interaction_type=discord.InteractionType.modal_submit,
-    )
-    result = _call(handler, interaction, values, modal_id)
-    if inspect.isawaitable(result):
-        await result
-    if not interaction.is_done():
-        session.log(
-            "⚠️",
-            "that interaction was never answered — real Discord shows "
-            "'This interaction failed'",
-            "warn",
-            kind="event",
-            details={**submit_details, "status": "unanswered"},
+    event_token = _ACTIVE_EVENT.set(event["id"])
+    try:
+        interaction = session.build_interaction(
+            modal["source"] if modal else None,
+            interaction_type=discord.InteractionType.modal_submit,
         )
+        result = _call(handler, interaction, values, modal_id)
+        if inspect.isawaitable(result):
+            await result
+        if not interaction.is_done():
+            session.log(
+                "⚠️",
+                "that interaction was never answered — real Discord shows "
+                "'This interaction failed'",
+                "warn",
+                kind="event",
+                details={**submit_details, "status": "unanswered"},
+            )
+    finally:
+        _ACTIVE_EVENT.reset(event_token)
 
 
 async def _do_message(session: Session, content: str, channel_id=None) -> None:
@@ -1277,15 +1356,21 @@ async def _do_message(session: Session, content: str, channel_id=None) -> None:
                               author=session.active_user)
     handle = MockMessage(session, msg["id"], msg.get("author_obj"))
     handler = env.get("on_message")
+    message_details = {"interaction": "message_create", "operation": "message.send",
+                       "message_id": msg["id"],        "channel": channel.name, "channel_id": str(channel.id), "actor": session.active_user.name,
+                       "content": content, "status": "dispatched" if callable(handler) else "missing_handler"}
+
+    event = session.log("💬", f"message received from {session.active_user.name}",
+                        None if callable(handler) else "warn", kind="event", details=message_details)
     if not callable(handler):
-        session.log("⚠️", "message received but no `on_message` handler is defined", "warn",
-                    kind="event", details={"interaction": "message_create", "operation": "message.send",
-                                           "channel": channel.name, "actor": session.active_user.name,
-                                           "status": "missing_handler"})
         return
-    result = _call(handler, handle)
-    if inspect.isawaitable(result):
-        await result
+    event_token = _ACTIVE_EVENT.set(event["id"])
+    try:
+        result = _call(handler, handle)
+        if inspect.isawaitable(result):
+            await result
+    finally:
+        _ACTIVE_EVENT.reset(event_token)
 
 
 async def _gated(session: Session, coro_fn) -> None:
@@ -1297,7 +1382,9 @@ async def run_script(session: Session, code: str, timeout: float = 20.0) -> dict
     if len(code) > 1_000_000:
         message = "Script is too large (maximum 1 MB)."
         session.log("⚠️", message, "error")
-        session.last_run = {"ok": False, "error": message, "ms": 0.0}
+        session.last_run = {"ok": False, "error": message,
+                            "exception": {"type": "ScriptLimitError", "message": message,
+                                          "file": None, "line": None}, "ms": 0.0}
         return {"ok": False, "ms": 0.0}
     started = time.perf_counter()
     session.user_deadline = time.monotonic() + timeout
@@ -1305,53 +1392,51 @@ async def run_script(session: Session, code: str, timeout: float = 20.0) -> dict
         await session.runner.run(lambda: _gated(session, lambda: _do_run(session, code)), timeout)
     except ScriptStuck as exc:
         session.log("🛑", str(exc), "error")
-        session.last_run = {"ok": False, "error": str(exc), "ms": (time.perf_counter() - started) * 1000}
+        session.last_run = {"ok": False, "error": str(exc), "exception": _script_error_details(exc),
+                            "ms": (time.perf_counter() - started) * 1000}
     return {"ok": bool(session.last_run and session.last_run["ok"]),
             "ms": round(session.last_run["ms"], 1) if session.last_run else 0.0}
 
 
+async def _dispatch(session: Session, callback, timeout: float) -> dict:
+    started = time.perf_counter()
+    try:
+        await session.runner.run(lambda: _gated(session, callback), timeout)
+    except ScriptStuck as error:
+        message = str(error)
+        session.log("🛑", message, "error", details={
+            "operation": "script.callback", "status": "script_error",
+            "type": type(error).__name__, "message": message,
+        })
+        session.last_run = {
+            "ok": False, "error": message,
+            "exception": {"type": type(error).__name__, "message": message,
+                          "file": None, "line": None},
+            "ms": (time.perf_counter() - started) * 1000,
+        }
+    except Exception as error:  # noqa: BLE001 - report callback errors to the workbench
+        _record_script_error(session, error, started)
+    return state(session)
+
+
 async def dispatch_click(session: Session, message_id: str, custom_id: str,
                          values: list, timeout: float = 10.0) -> dict:
-    try:
-        await session.runner.run(
-            lambda: _gated(session, lambda: _do_click(session, message_id, custom_id, values)), timeout
-        )
-    except ScriptStuck as exc:
-        session.log("🛑", str(exc), "error")
-    return state(session)
+    return await _dispatch(session, lambda: _do_click(session, message_id, custom_id, values), timeout)
 
 
 async def dispatch_submit(session: Session, modal_id: str, values: dict,
                           timeout: float = 10.0) -> dict:
-    try:
-        await session.runner.run(
-            lambda: _gated(session, lambda: _do_submit(session, modal_id, values)), timeout
-        )
-    except ScriptStuck as exc:
-        session.log("🛑", str(exc), "error")
-    return state(session)
+    return await _dispatch(session, lambda: _do_submit(session, modal_id, values), timeout)
 
 
 async def dispatch_message(session: Session, content: str, channel_id=None,
                            timeout: float = 10.0) -> dict:
-    try:
-        await session.runner.run(
-            lambda: _gated(session, lambda: _do_message(session, content, channel_id)), timeout
-        )
-    except ScriptStuck as exc:
-        session.log("🛑", str(exc), "error")
-    return state(session)
+    return await _dispatch(session, lambda: _do_message(session, content, channel_id), timeout)
 
 
 async def dispatch_command(session: Session, name: str, args: dict,
                            timeout: float = 10.0) -> dict:
-    try:
-        await session.runner.run(
-            lambda: _gated(session, lambda: _do_command(session, name, args)), timeout
-        )
-    except ScriptStuck as exc:
-        session.log("🛑", str(exc), "error")
-    return state(session)
+    return await _dispatch(session, lambda: _do_command(session, name, args), timeout)
 
 
 # --------------------------------------------------------------- state
@@ -1364,12 +1449,30 @@ def _members_json(session: Session) -> dict:
     return names
 
 
+def _member_details_json(session: Session) -> list[dict]:
+    details = []
+    for member in session.guild.members:
+        role = next((item for item in reversed(member.roles) if item.name != "@everyone"), None)
+        color = getattr(getattr(role, "color", None), "value", None)
+        status = getattr(member.status, "name", str(member.status))
+        details.append({
+            "id": str(member.id),
+            "name": member.name,
+            "bot": member.bot,
+            "status": status,
+            "role": role.name if role else None,
+            "role_color": f"#{color:06x}" if color is not None else None,
+        })
+    return details
+
+
 def state(session: Session) -> dict:
     msgs = []
     for mid in session.order:
         msg = {k: v for k, v in session.messages[mid].items() if k != "author_obj"}
         msgs.append(msg)
     permission_names = ("view_channel", "send_messages", "manage_messages", "manage_channels")
+    events = session.events[-300:]
     permissions = {
         label: {
             name: {"allowed": allowed, "reason": reason}
@@ -1385,17 +1488,321 @@ def state(session: Session) -> dict:
         "users": [{"id": str(member.id), "name": member.name}
                   for member in session.guild.members if not member.bot],
         "guild": {"id": session.guild.id, "name": session.guild.name},
-        "channel": {"id": str(session.channel.id), "name": session.channel.name},
+        "channel": {"id": str(session.channel.id), "name": session.channel.name,
+                    "topic": session.channel.topic},
         "revision": session.revision,
         # ids as strings: 18-digit snowflakes lose precision as JS numbers
-        "channels": [{"id": str(c.id), "name": c.name} for c in session.channels.values()],
+        "channels": [{"id": str(c.id), "name": c.name, "topic": c.topic}
+                     for c in session.channels.values()],
         "bot": {"id": session.guild.me.id, "name": session.guild.me.name},
         "permissions": permissions,
         "members": _members_json(session),
+        "member_details": _member_details_json(session),
         "messages": msgs,
         "modals": session.modals,
         "commands": session.commands,
-        "events": session.events[-300:],
+        "events": events,
         "last_run": session.last_run,
         "running": session.env is not None,
     }
+
+
+_SCENARIO_ACTIONS = {
+    "message": {"action", "content", "as", "channel"},
+    "click": {"action", "message_id", "custom_id", "values", "as"},
+    "submit": {"action", "modal_id", "values", "as"},
+    "command": {"action", "name", "args", "channel", "as"},
+}
+_SCENARIO_ASSERTIONS = {
+    "message_exists": {"assert", "message_id", "content", "channel"},
+    "content": {"assert", "message_id", "equals"},
+    "embed_field": {"assert", "message_id", "embed", "name", "value"},
+    "component_exists": {"assert", "message_id", "custom_id"},
+    "channel_exists": {"assert", "name"},
+    "channel_missing": {"assert", "name"},
+    "event_occurred": {"assert", "text", "interaction", "operation", "custom_id", "status"},
+}
+
+
+def validate_scenario(scenario: dict) -> dict:
+    """Validate and return the small, versioned JSON scenario format."""
+    if not isinstance(scenario, dict) or set(scenario) != {"version", "name", "steps"}:
+        raise ValueError("scenario must contain exactly version, name, and steps")
+    if type(scenario["version"]) is not int or scenario["version"] != 1:
+        raise ValueError("scenario version must be 1")
+    name = scenario["name"]
+    if not isinstance(name, str) or not name.strip() or len(name.strip()) > 50 \
+            or not re.fullmatch(r"[A-Za-z0-9_ -]{1,50}", name.strip()):
+        raise ValueError("scenario name must use letters, numbers, spaces, dashes, or underscores (max 50)")
+    steps = scenario["steps"]
+    if not isinstance(steps, list) or not 1 <= len(steps) <= 100:
+        raise ValueError("scenario steps must be an array containing 1 to 100 steps")
+    normalized = []
+    for index, raw in enumerate(steps, 1):
+        if not isinstance(raw, dict):
+            raise TypeError(f"step {index} must be an object")
+        discriminator = raw.get("action")
+        if discriminator is not None:
+            allowed = _SCENARIO_ACTIONS.get(discriminator)
+            if allowed is None:
+                raise ValueError(f"step {index}: unsupported action {discriminator!r}")
+            if set(raw) - allowed:
+                raise ValueError(f"step {index}: unknown action fields: {', '.join(sorted(set(raw) - allowed))}")
+            required = {
+                "message": ("content",), "click": ("message_id", "custom_id"),
+                "submit": ("modal_id",), "command": ("name",),
+            }[discriminator]
+            if any(key not in raw for key in required):
+                raise ValueError(f"step {index}: {discriminator} requires {', '.join(required)}")
+            for key in ("content", "message_id", "custom_id", "modal_id", "name"):
+                if key in raw and (not isinstance(raw[key], str) or not raw[key].strip()):
+                    raise ValueError(f"step {index}: {key} must be a non-empty string")
+            if discriminator == "click" and "values" in raw and not isinstance(raw["values"], list):
+                raise ValueError(f"step {index}: click values must be an array")
+            if discriminator == "submit" and "values" in raw and not isinstance(raw["values"], dict):
+                raise ValueError(f"step {index}: submit values must be an object")
+            if "args" in raw and not isinstance(raw["args"], dict):
+                raise ValueError(f"step {index}: args must be an object")
+            for key in ("as", "channel"):
+                if key in raw and (isinstance(raw[key], bool) or not isinstance(raw[key], (str, int))):
+                    raise ValueError(f"step {index}: {key} must be a user/channel name or ID")
+            if any(key in raw for key in ("message_id", "modal_id")):
+                reference = raw.get("message_id", raw.get("modal_id"))
+                if not isinstance(reference, str) or not reference.strip():
+                    raise ValueError(f"step {index}: target ID must be a non-empty string or 'latest'")
+            step = dict(raw)
+        else:
+            assertion = raw.get("assert")
+            allowed = _SCENARIO_ASSERTIONS.get(assertion)
+            if allowed is None:
+                raise ValueError(f"step {index}: unsupported assertion {assertion!r}")
+            if set(raw) - allowed:
+                raise ValueError(f"step {index}: unknown assertion fields: {', '.join(sorted(set(raw) - allowed))}")
+            required = {
+                "message_exists": (), "content": ("equals",), "embed_field": ("name", "value"),
+                "component_exists": ("custom_id",), "channel_exists": ("name",),
+                "channel_missing": ("name",), "event_occurred": (),
+            }[assertion]
+            if any(key not in raw for key in required):
+                raise ValueError(f"step {index}: {assertion} requires {', '.join(required)}")
+            if assertion == "event_occurred" and not any(
+                raw.get(key) not in (None, "") for key in ("text", "interaction", "operation", "custom_id")
+            ):
+                raise ValueError(f"step {index}: event_occurred needs text, interaction, operation, or custom_id")
+            if "message_id" in raw and not isinstance(raw["message_id"], str):
+                raise TypeError(f"step {index}: message_id must be a string")
+            if "message_id" in raw and (not isinstance(raw["message_id"], str) or not raw["message_id"].strip()):
+                raise ValueError(f"step {index}: message_id must be 'latest' or an ID")
+            if "channel" in raw and (not isinstance(raw["channel"], str) or not raw["channel"].strip()):
+                raise ValueError(f"step {index}: channel must be a channel name or ID")
+            for key in ("message_id", "content", "equals", "name", "value", "custom_id", "text", "interaction", "operation", "status"):
+                if key in raw and not isinstance(raw[key], str):
+                    raise ValueError(f"step {index}: {key} must be a string")
+            if "embed" in raw and (type(raw["embed"]) is not int or raw["embed"] < 0):
+                raise ValueError(f"step {index}: embed must be a zero-based non-negative index")
+            step = dict(raw)
+            step["assert"] = assertion
+        normalized.append(step)
+    return {"version": 1, "name": name.strip(), "steps": normalized}
+
+
+def _scenario_channel(session: Session, reference):
+    if reference is None:
+        return session.channel
+    channel = session.channels.get(str(reference)) or next(
+        (item for item in session.channels.values() if item.name.casefold() == str(reference).casefold()), None
+    )
+    if channel is None:
+        raise ValueError(f"channel {reference!r} does not exist")
+    return channel
+
+
+def _scenario_user(session: Session, reference) -> None:
+    if reference is None:
+        return
+    if isinstance(reference, int) or str(reference).isdigit():
+        user = session.guild.get_member(int(reference))
+    else:
+        user = next((member for member in session.guild.members
+                     if member.name.casefold() == str(reference).casefold()), None)
+    if user is None or user.bot:
+        raise ValueError(f"simulated user {reference!r} does not exist")
+    session.set_user(user.id)
+
+
+def _scenario_message(session: Session, reference="latest") -> dict | None:
+    message_id = session.order[-1] if reference == "latest" and session.order else reference
+    message = session.messages.get(str(message_id)) if message_id is not None else None
+    return message if message and not message.get("deleted") else None
+
+
+def _scenario_component_ids(tree):
+    if isinstance(tree, dict):
+        if tree.get("custom_id"):
+            yield tree["custom_id"]
+        for value in tree.values():
+            yield from _scenario_component_ids(value)
+    elif isinstance(tree, list):
+        for value in tree:
+            yield from _scenario_component_ids(value)
+
+
+def _scenario_component(tree, custom_id: str) -> dict | None:
+    if isinstance(tree, dict):
+        if tree.get("custom_id") == custom_id:
+            return tree
+        for value in tree.values():
+            component = _scenario_component(value, custom_id)
+            if component is not None:
+                return component
+    elif isinstance(tree, list):
+        for value in tree:
+            component = _scenario_component(value, custom_id)
+            if component is not None:
+                return component
+    return None
+
+
+def _scenario_assertion(session: Session, step: dict) -> tuple[bool, str, str]:
+    assertion = step["assert"]
+    message = _scenario_message(session, step.get("message_id", "latest"))
+    if assertion == "message_exists":
+        matches = [session.messages[mid] for mid in session.order if mid in session.messages]
+        if step.get("message_id", "latest") == "latest":
+            matches = matches[-1:]
+        else:
+            matches = [candidate for candidate in matches if candidate.get("id") == step["message_id"]]
+        if "content" in step:
+            matches = [candidate for candidate in matches if step["content"] in candidate.get("content", "")]
+        if "channel" in step:
+            channel = _scenario_channel(session, step["channel"])
+            matches = [candidate for candidate in matches if candidate.get("channel") == str(channel.id)]
+
+        actual = ", ".join(f"{item['id']}: {item['content'][:80]!r}" for item in matches) or "no matching message"
+        return bool(matches), "a matching message exists", actual
+    if assertion == "content":
+        actual = message.get("content", "") if message else "message not found"
+        return bool(message and actual == step["equals"]), f"content equals {step['equals']!r}", repr(actual)
+    if assertion == "embed_field":
+        index = step.get("embed", 0)
+        embeds = message.get("embeds", []) if message else []
+        fields = embeds[index].get("fields", []) if index < len(embeds) else []
+        found = next((field for field in fields if field.get("name") == step["name"]), None)
+        actual = found.get("value") if found else "field not found"
+        return bool(found and actual == step["value"]), f"embed[{index}] field {step['name']!r} equals {step['value']!r}", repr(actual)
+    if assertion == "component_exists":
+        present = bool(message and step["custom_id"] in list(_scenario_component_ids(
+            [message.get("components"), message.get("v2")]
+        )))
+        actual = "present" if present else "component not found"
+        return present, f"component {step['custom_id']!r} exists", actual
+    if assertion in ("channel_exists", "channel_missing"):
+        channel = next((item for item in session.channels.values()
+                        if item.name.casefold() == step["name"].casefold() or str(item.id) == step["name"]), None)
+        exists = channel is not None
+        expected = assertion == "channel_exists"
+        return exists is expected, f"channel {step['name']!r} {'exists' if expected else 'is missing'}", \
+            "present" if exists else "missing"
+    criteria = {key: step[key] for key in ("text", "interaction", "operation", "custom_id", "status") if key in step}
+    matched = next((event for event in reversed(session.events) if event.get("kind") == "event" and all(
+        (criteria[key].casefold() in event.get("text", "").casefold() if key == "text"
+         else criteria[key] == event.get("details", {}).get(key))
+        for key in criteria
+    )), None)
+    return bool(matched), f"event occurred matching {criteria!r}", \
+        f"{matched.get('id')}: {matched.get('text')}" if matched else "no matching event"
+
+
+def _scenario_runtime_state(session: Session) -> dict:
+    return {
+        "active_user": session.active_user.name,
+        "channels": [{"id": str(channel.id), "name": channel.name} for channel in session.channels.values()],
+        "messages": [{"id": mid, "channel": session.messages[mid].get("channel"),
+                      "author": session.messages[mid].get("author", {}).get("name"),
+                      "content": session.messages[mid].get("content", "")[:160]}
+                     for mid in session.order if mid in session.messages],
+        "last_run": session.last_run,
+        "open_modals": [{"id": modal["id"], "title": modal["title"]} for modal in session.modals],
+        "recent_events": session.events[-8:],
+    }
+
+
+async def run_scenario(session: Session, scenario: dict) -> dict:
+    """Replay a validated sequence through the existing session dispatch paths."""
+    definition = validate_scenario(scenario)
+    results = []
+    for index, step in enumerate(definition["steps"], 1):
+        kind = "action" if "action" in step else "assertion"
+        label = step.get("action", step.get("assert"))
+        try:
+            if kind == "assertion":
+                passed, expected, actual = _scenario_assertion(session, step)
+                result = {"step": index, "kind": kind, "label": label,
+                          "passed": passed, "expected": expected, "actual": actual}
+            else:
+                _scenario_user(session, step.get("as"))
+                channel = _scenario_channel(session, step["channel"]) if "channel" in step else session.channel
+                event_count = len(session.events)
+                extra = {}
+                if label == "message":
+                    message_count = len(session.order)
+                    await dispatch_message(session, step["content"], channel_id=channel.id)
+                    user_message = next((event.get("details", {}).get("message_id")
+                                         for event in session.events[event_count:]
+                                         if event.get("details", {}).get("interaction") == "message_create"
+                                         and event.get("details", {}).get("message_id")), None)
+                    if not user_message and len(session.order) > message_count:
+                        user_message = session.order[message_count]
+                    if user_message:
+                        extra["message_id"] = user_message
+                elif label == "click":
+                    message_id = step["message_id"]
+                    if message_id == "latest":
+                        message_id = next((mid for mid in reversed(session.order)
+                                           if (component := _scenario_component(
+                                               [session.messages[mid].get("components"), session.messages[mid].get("v2")],
+                                               step["custom_id"],
+                                           )) and not component.get("disabled")), None)
+                    if message_id is None or str(message_id) not in session.messages:
+                        raise ValueError(f"message {step['message_id']!r} with component {step['custom_id']!r} does not exist")
+                    message = session.messages[str(message_id)]
+                    if message.get("deleted"):
+                        raise ValueError(f"message {message_id!r} was deleted")
+                    component = _scenario_component(
+                        [message.get("components"), message.get("v2")], step["custom_id"]
+                    )
+                    if component is None:
+                        raise ValueError(f"component {step['custom_id']!r} is not on message {message_id!r}")
+                    if component.get("disabled"):
+                        raise ValueError(f"component {step['custom_id']!r} is disabled")
+                    await dispatch_click(session, str(message_id), step["custom_id"], step.get("values", []))
+                    extra["message_id"] = str(message_id)
+                elif label == "submit":
+                    modal_id = session.modals[-1]["id"] if step["modal_id"] == "latest" and session.modals else step["modal_id"]
+                    if not any(modal["id"] == modal_id for modal in session.modals):
+                        raise ValueError(f"modal {step['modal_id']!r} is not open")
+                    await dispatch_submit(session, str(modal_id), step.get("values", {}))
+                else:
+                    if label == "command":
+                        session.channel = channel
+                        await dispatch_command(session, step["name"], step.get("args", {}))
+
+                failures = [event for event in session.events[event_count:]
+                            if event.get("details", {}).get("status") in {
+                                "denied", "missing_handler", "missing_command", "missing_arguments",
+                                "unanswered", "missing_channel", "blocked_last_channel", "script_error",
+                            }]
+                passed = not failures
+                actual = failures[-1]["text"] if failures else f"dispatched {label}"
+                result = {"step": index, "kind": kind, "label": label, "passed": passed,
+                          "expected": "dispatch completes without a simulator denial, missing handler, or script error",
+                          "actual": actual, **extra}
+        except Exception as error:  # noqa: BLE001 - scenario output needs a failing step, not a 500
+            result = {"step": index, "kind": kind, "label": label, "passed": False,
+                      "expected": f"{kind} {label} succeeds", "actual": f"{type(error).__name__}: {error}"}
+        results.append(result)
+        if not result["passed"]:
+            return {"ok": False, "name": definition["name"], "failed_step": index,
+                    "results": results, "runtime_state": _scenario_runtime_state(session)}
+    return {"ok": True, "name": definition["name"], "failed_step": None,
+            "results": results, "runtime_state": _scenario_runtime_state(session)}

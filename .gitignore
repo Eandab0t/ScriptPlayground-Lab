@@ -1,5 +1,18 @@
 __pycache__/
 .ruff_cache/
+.venv/
 server.log
 .test-artifacts/
 .env
+build/
+dist/
+
+# local bot workspaces: real bots carry live tokens and local databases —
+# never commit them (the tracked demo_bot sample stays)
+bots/*
+!bots/demo_bot/
+browser-profile/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

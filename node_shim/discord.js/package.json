@@ -1,0 +1,6 @@
+{
+  "name": "discord.js",
+  "version": "14.0.0-offline-shim",
+  "description": "Offline ScriptPlayground stand-in for discord.js (no network).",
+  "main": "index.js"
+}
