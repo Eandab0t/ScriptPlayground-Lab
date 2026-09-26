@@ -308,6 +308,36 @@ def _purge_sandbox_modules() -> None:
             sys.modules.pop(name, None)
 
 
+_CWD_STACK: list["ProjectRuntime"] = []  # live runtimes, last = sandbox owning the CWD
+
+
+def _app_dir() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _chdir_sandbox(runtime: "ProjectRuntime") -> None:
+    """Park the process CWD inside a runtime's sandbox — no restore-on-exit.
+
+    Bots open sqlite databases, logs, and exports by relative path long after
+    boot (lazily, inside command callbacks); restoring CWD after the boot-time
+    import let those files spill into the app directory.
+    """
+    if runtime in _CWD_STACK:
+        _CWD_STACK.remove(runtime)
+    _CWD_STACK.append(runtime)
+    os.chdir(runtime.sandbox)
+
+
+def _chdir_active_sandbox() -> None:
+    """Re-park CWD in the newest still-running sandbox, else the app dir."""
+    while _CWD_STACK and not _CWD_STACK[-1].sandbox.is_dir():
+        _CWD_STACK.pop()
+    if _CWD_STACK:
+        os.chdir(_CWD_STACK[-1].sandbox)
+    else:
+        os.chdir(_app_dir())
+
+
 def _neutralize_keep_alive() -> None:
     """Flask dev servers must never listen while simulating a bot."""
     try:
@@ -1020,17 +1050,18 @@ class ProjectRuntime:
                 _restore_asyncio_run_patch()
 
     def _import_entry(self, entry: Path):
-        saved_cwd = os.getcwd()
         token = None
         try:
-            os.chdir(self.sandbox)  # sqlite/env filenames resolve like a real launch
+            # Park CWD in the sandbox for the runtime's whole life (restored in
+            # shutdown): relative sqlite/log writes during dispatch must stay
+            # inside the emulated folder.
+            _chdir_sandbox(self)  # sqlite/env filenames resolve like a real launch
             token = _ACTIVE_BOOT.set(self)
             module = importlib.import_module(entry.stem)
             return module
         finally:
             if token is not None:
                 _ACTIVE_BOOT.reset(token)
-            os.chdir(saved_cwd)
 
     def _asyncio_run_shim(self, awaitable, *args, **kwargs):  # type: ignore[no-untyped-def]
         """Deprecated: the shim moved to module level. Fail loudly if referenced."""
@@ -1387,6 +1418,8 @@ class ProjectRuntime:
         _restore_asyncio_run_patch()
         with contextlib.suppress(ValueError):
             sys.path.remove(str(self.sandbox))
+        if self in _CWD_STACK:
+            _CWD_STACK.remove(self)
         for bot in list(self.clients):
             _HTTP_RUNTIMES.pop(id(bot.http), None)
         session_obj = None
@@ -1405,6 +1438,8 @@ class ProjectRuntime:
         if session_obj is not None:
             with contextlib.suppress(Exception):
                 await session_obj.close()
+        with contextlib.suppress(OSError):
+            _chdir_active_sandbox()  # leave the sandbox before it is deleted
         with contextlib.suppress(Exception):
             shutil.rmtree(self.sandbox, ignore_errors=True)
         _purge_sandbox_modules()
