@@ -27,7 +27,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
-import importlib
+import importlib.util
 import json
 import logging
 import os
@@ -294,28 +294,30 @@ def _find_entry(root: Path) -> Path | None:
     return top[0] if top else None
 
 
-def _purge_sandbox_modules() -> None:
-    """Drop cached modules from any sandbox (fresh boot must re-import).
-
-    Namespace packages have __file__ = None, so their __path__ entries are
-    checked too — otherwise a stale package would keep importing its siblings
-    from a deleted sandbox of a previous boot.
-    """
+def _purge_sandbox_modules(sandbox: Path | None = None) -> None:
+    """Drop cached modules from a sandbox, or all sandboxes before a fresh boot."""
+    root = sandbox.resolve() if sandbox is not None else None
     for name, module in list(sys.modules.items()):
-        file = str(getattr(module, "__file__", "") or "")
-        paths = "".join(str(p) for p in (getattr(module, "__path__", None) or []))
-        if "scriptplayground-sandbox" in (file + paths + name):
+        paths = [str(getattr(module, "__file__", "") or "")]
+        paths.extend(str(path) for path in (getattr(module, "__path__", None) or []))
+        if (
+            root is not None and any(
+                Path(path).resolve().is_relative_to(root) for path in paths if path
+            )
+        ) or (
+            root is None and "scriptplayground-sandbox" in ("".join(paths) + name)
+        ):
             sys.modules.pop(name, None)
 
 
-_CWD_STACK: list["ProjectRuntime"] = []  # live runtimes, last = sandbox owning the CWD
+_CWD_STACK: list[ProjectRuntime] = []  # live runtimes, last = sandbox owning the CWD
 
 
 def _app_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
-def _chdir_sandbox(runtime: "ProjectRuntime") -> None:
+def _chdir_sandbox(runtime: ProjectRuntime) -> None:
     """Park the process CWD inside a runtime's sandbox — no restore-on-exit.
 
     Bots open sqlite databases, logs, and exports by relative path long after
@@ -504,6 +506,8 @@ class ProjectTransport:
     # ------------------------------------------------ dispatch plumbing
 
     def handle(self, route: Route, *, payload=None, files=None, params=None) -> Any:
+        if self.runtime._shutdown_requested:
+            raise RuntimeError("project runtime is shutting down")
         template = route.path
         handler = self._routes.get((route.method, template))
         if handler is None:
@@ -545,29 +549,35 @@ class ProjectTransport:
             return {
                 "id": str(member.id), "username": member.name,
                 "global_name": getattr(member, "global_name", None) or member.name,
-                "discriminator": "0", "avatar": None, "bot": bool(member.bot), "public_flags": 0,
+                "discriminator": "0", "avatar": member.avatar_url, "bot": bool(member.bot), "public_flags": 0,
+                "avatar_url": member.avatar_url, "banner": member.banner_url,
+                "bio": member.bio, "accent_color": int(member.accent_color[1:], 16) if member.accent_color else None,
             }
         return {"id": str(fallback_id or BOT_ID), "username": fallback_name or "Bot",
                 "global_name": fallback_name or "Bot", "discriminator": "0", "avatar": None,
                 "bot": True, "public_flags": 0}
 
     def _member_payload(self, member: pg.MockMember) -> dict:
+        color = member.roles[-1].color.value if member.roles else 0
         return {
-            "user": self._user_payload(member), "nick": None, "avatar": None, "banner": None,
+            "user": self._user_payload(member), "nick": member.display_name,
+            "avatar": member.avatar_url, "banner": member.banner_url,
             "roles": [str(role.id) for role in member.roles if role.id != GUILD_ID],
             "joined_at": "2024-01-01T00:00:00+00:00", "deaf": False, "mute": False,
-            "pending": False, "permissions": str(member.guild_permissions.value),
+            "pending": False, "permissions": str(member.guild_permissions.value), "color": color,
+            "premium_since": None,
             "communication_disabled_until": None, "flags": 0,
         }
 
     def _channel_payload(self, channel: pg.MockChannel) -> dict:
+        role_ids = {role.id for role in self.session.guild.roles}
         return {
             "id": str(channel.id), "type": 0, "guild_id": str(GUILD_ID), "name": channel.name,
             "topic": channel.topic, "position": 0, "nsfw": False, "last_message_id": None,
             "rate_limit_per_user": 0, "parent_id": None,
             "permission_overwrites": [
-                {"id": str(target_id), "type": 0 if target_id == GUILD_ID else 1,
-                 "allow": str(overwrite.allow.value), "deny": str(overwrite.deny.value)}
+                {"id": str(target_id), "type": 0 if target_id in role_ids else 1,
+                 "allow": str(overwrite.pair()[0].value), "deny": str(overwrite.pair()[1].value)}
                 for target_id, overwrite in getattr(channel, "overwrites", {}).items()
             ],
         }
@@ -589,7 +599,7 @@ class ProjectTransport:
             "channel_id": str(stored.get("channel") or CHANNEL_ID),
             "guild_id": str(GUILD_ID),
             "author": self._user_payload(member, fallback_id=author.get("id"),
-                                         fallback_name=author.get("name")),
+                                         fallback_name=author.get("username") or author.get("name")),
             "member": self._member_payload(member) if member else None,
             "content": stored.get("content") or "",
             "timestamp": stored.get("timestamp") or "2024-01-01T00:00:00+00:00",
@@ -598,13 +608,14 @@ class ProjectTransport:
             "pinned": False, "type": 0, "flags": 64 if stored.get("ephemeral") else 0,
         }
 
-    def _store(self, channel: pg.MockChannel, payload: dict, *, ephemeral: bool = False) -> dict:
+    def _store(self, channel: pg.MockChannel, payload: dict, *, ephemeral: bool = False,
+               ephemeral_user_id: int | None = None) -> dict:
         """Store an outgoing REST message in the timeline; revive classic views for the UI."""
         view = _revive_classic_view(payload.get("components"))
         stored = self.session.add_message(
             channel_id=channel.id, content=payload.get("content"),
             embeds=_embeds_from_payload(payload.get("embeds")),
-            view=view, ephemeral=ephemeral,
+            view=view, ephemeral=ephemeral, ephemeral_user_id=ephemeral_user_id,
         )
         return stored
 
@@ -641,9 +652,7 @@ class ProjectTransport:
 
     def _get_users_at_me(self, match, payload, params):
         me = self._me()
-        return {"id": str(me.id), "username": me.name, "global_name": me.name,
-                "discriminator": "0", "avatar": None, "bot": True, "verified": True,
-                "mfa_enabled": False, "flags": 0}
+        return self._user_payload(me) | {"verified": True, "mfa_enabled": False, "flags": 0}
 
     def _get_users_guilds(self, match, payload, params):
         return [{"id": str(GUILD_ID), "name": self.session.guild.name, "icon": None,
@@ -765,6 +774,7 @@ class ProjectTransport:
         role = self.session.guild.get_role(int(match["role_id"]))
         if member is not None and role is not None and role not in member.roles:
             member.roles.append(role)
+            self.session._touch()
             self.session.log("➕", f"role added: {member.name} += {role.name}", kind="action",
                              details={"operation": "member.add_roles", "member": member.name,
                                       "role": role.name, "status": "success"})
@@ -775,6 +785,7 @@ class ProjectTransport:
         role = self.session.guild.get_role(int(match["role_id"]))
         if member is not None and role is not None and role in member.roles:
             member.roles.remove(role)
+            self.session._touch()
             self.session.log("➖", f"role removed: {member.name} -= {role.name}", kind="action",
                              details={"operation": "member.remove_roles", "member": member.name,
                                       "role": role.name, "status": "success"})
@@ -791,6 +802,13 @@ class ProjectTransport:
             channel.name = payload["name"]
         if "topic" in payload:
             channel.topic = payload["topic"]
+        if "permission_overwrites" in payload:
+            channel.overwrites.clear()
+            for item in payload.get("permission_overwrites") or []:
+                target_id = int(item["id"])
+                allow = discord.Permissions(int(item.get("allow") or 0))
+                deny = discord.Permissions(int(item.get("deny") or 0))
+                channel.overwrites[target_id] = discord.PermissionOverwrite.from_pair(allow, deny)
         self.session._touch()
         return self._channel_payload(channel)
 
@@ -822,7 +840,8 @@ class ProjectTransport:
         out = []
         for message_id in reversed(self.session.order):
             stored = self.session.messages.get(message_id)
-            if stored is None or stored.get("deleted") or stored.get("channel") != str(channel.id):
+            if (stored is None or stored.get("deleted") or stored.get("ephemeral")
+                    or stored.get("channel") != str(channel.id)):
                 continue
             out.append(self._message_payload(stored))
             if len(out) >= limit:
@@ -853,11 +872,14 @@ class ProjectTransport:
         return {}
 
     def _post_reaction(self, match, payload, params):
-        channel = self._channel_or_raise(match["channel_id"])
-        self.session.log("➕", f"bot reacted {match['emoji']!r} in #{channel.name}", kind="action",
-                         details={"operation": "message.add_reaction", "emoji": match["emoji"],
-                                  "message_id": _session_message_id(match["message_id"]),
-                                  "status": "success"})
+        from urllib.parse import unquote
+
+        self._channel_or_raise(match["channel_id"])
+        # Reactions are stored on the session message so they render as pills
+        # in the client, matching how the hosted interaction path behaves.
+        self.session.toggle_reaction(
+            _session_message_id(match["message_id"]), unquote(match["emoji"]),
+            user_id=self.session.guild.me.id, actor="bot")
         return {}
 
     # ------------------------------------------------ application commands
@@ -904,16 +926,22 @@ class ProjectTransport:
         interaction_id = match["webhook_id"]
         callback_type = int(payload.get("type") or 4)
         data = payload.get("data") or {}
+        user_id = self.runtime._interaction_users.get(interaction_id, self.session.active_user.id)
+        channel = self.session.channels.get(
+            self.runtime._interaction_channels.get(interaction_id, ""), self.session.channel
+        )
         stored: dict | None = None
         if callback_type in (4, 5):  # channel message with source / deferred "thinking"
-            stored = self._store(self.session.channel, data,
-                                 ephemeral=bool(int(data.get("flags") or 0) & 64))
+            ephemeral = bool(int(data.get("flags") or 0) & 64)
+            stored = self._store(channel, data, ephemeral=ephemeral,
+                                 ephemeral_user_id=user_id if ephemeral else None)
             self.session.log("💬", f"interaction response → message #{stored['index']}", kind="action",
                              details={"operation": "interaction.response", "message_id": stored["id"],
                                       "callback_type": callback_type, "transport": "project-rest",
                                       "status": "success"})
         elif callback_type == 7:  # component message update
             original = self.runtime._originals.get(interaction_id)
+            self._assert_ephemeral_owner(self.session.messages.get(original or ""), interaction_id)
             stored = self._edit(original, data)
             self.session.log("✏️", "interaction updated its message", kind="action",
                              details={"operation": "interaction.update_message",
@@ -927,8 +955,11 @@ class ProjectTransport:
                 modal = store._modals.get(data.get("custom_id"))
             if modal is not None:
                 source = self.runtime._originals.get(interaction_id)
-                self.session.open_modal(modal, source)
-                self.runtime._pending_modal = (data.get("custom_id"), source)
+                opened = self.session.open_modal(
+                    modal, source, channel_id=channel.id,
+                    user_id=user_id, custom_id=data.get("custom_id"),
+                )
+                self.runtime._pending_modal = (data.get("custom_id"), source, opened["id"])
             else:
                 self.session.log("📋", "modal opened by interaction", kind="action",
                                  details={"operation": "interaction.send_modal",
@@ -946,8 +977,15 @@ class ProjectTransport:
         return self._callback_payload(callback_type, stored, interaction_id)
 
     def _post_webhook_message(self, match, payload, params):
-        stored = self._store(self.session.channel, payload,
-                             ephemeral=bool(int(payload.get("flags") or 0) & 64))
+        interaction_id = match["webhook_id"]
+        channel = self.session.channels.get(
+            self.runtime._interaction_channels.get(interaction_id, ""), self.session.channel
+        )
+        ephemeral = bool(int(payload.get("flags") or 0) & 64)
+        stored = self._store(channel, payload, ephemeral=ephemeral,
+                             ephemeral_user_id=self.runtime._interaction_users.get(
+                                 interaction_id, self.session.active_user.id
+                             ) if ephemeral else None)
         self.session.log("💬", f"followup.send → message #{stored['index']}", kind="action",
                          details={"operation": "interaction.followup", "message_id": stored["id"],
                                   "transport": "project-rest", "status": "success"})
@@ -956,32 +994,57 @@ class ProjectTransport:
     def _get_webhook(self, match, payload, params):
         return {"id": match["webhook_id"], "type": 3, "token": match["webhook_token"],
                 "application_id": str(BOT_ID), "name": self._me().name,
-                "channel_id": str(self.session.channel.id)}
+                "channel_id": self.runtime._interaction_channels.get(
+                    match["webhook_id"], str(self.session.channel.id)
+                )}
 
     def _original_target(self, match) -> str | None:
         return self.runtime._originals.get(match["webhook_id"])
 
+    def _assert_ephemeral_owner(self, stored: dict | None, interaction_id: str) -> None:
+        if (stored and stored.get("ephemeral")
+                and stored.get("ephemeral_user_id") != str(self.runtime._interaction_users.get(interaction_id))):
+            raise RuntimeError("ephemeral message is only visible to its interaction user")
+
     def _get_original(self, match, payload, params):
+        interaction_id = match["webhook_id"]
         stored = self.session.messages.get(self._original_target(match) or "")
+        self._assert_ephemeral_owner(stored, interaction_id)
         return self._message_payload(stored or {})
 
     def _patch_original(self, match, payload, params):
-        stored = self._edit(self._original_target(match), payload)
+        interaction_id = match["webhook_id"]
+        message_id = self._original_target(match)
+        self._assert_ephemeral_owner(self.session.messages.get(message_id or ""), interaction_id)
+        stored = self._edit(message_id, payload)
         return self._message_payload(stored)
 
     def _delete_original(self, match, payload, params):
-        self.session.delete_message(self._original_target(match))
+        interaction_id = match["webhook_id"]
+        message_id = self._original_target(match)
+        stored = self.session.messages.get(message_id or "")
+        self._assert_ephemeral_owner(stored, interaction_id)
+        self.session.delete_message(message_id, actor_id=self.runtime._interaction_users.get(interaction_id))
         return {}
 
     def _get_webhook_message(self, match, payload, params):
-        return self._message_payload(self._message_or_raise(match["message_id"]))
+        interaction_id = match["webhook_id"]
+        stored = self._message_or_raise(match["message_id"])
+        self._assert_ephemeral_owner(stored, interaction_id)
+        return self._message_payload(stored)
 
     def _patch_webhook_message(self, match, payload, params):
-        stored = self._edit(_session_message_id(match["message_id"]), payload)
+        interaction_id = match["webhook_id"]
+        message_id = _session_message_id(match["message_id"])
+        self._assert_ephemeral_owner(self.session.messages.get(message_id or ""), interaction_id)
+        stored = self._edit(message_id, payload)
         return self._message_payload(stored)
 
     def _delete_webhook_message(self, match, payload, params):
-        self.session.delete_message(_session_message_id(match["message_id"]))
+        interaction_id = match["webhook_id"]
+        message_id = _session_message_id(match["message_id"])
+        self._assert_ephemeral_owner(self.session.messages.get(message_id or ""), interaction_id)
+        self.session.delete_message(message_id, actor_id=self.runtime._interaction_users.get(interaction_id))
         return {}
 
 
@@ -991,9 +1054,11 @@ class ProjectTransport:
 class ProjectRuntime:
     """Boots a real discord.py bot project offline against one simulator session."""
 
-    def __init__(self, session: pg.Session, workspace: Path, tag: str | None = None) -> None:
+    def __init__(self, session: pg.Session, workspace: Path, tag: str | None = None,
+                 on_exception: Callable[[], None] | None = None) -> None:
         self.session = session
         self.workspace = Path(workspace)
+        self.on_exception = on_exception
         self.tag = tag or uuid.uuid4().hex[:8]
         self.sandbox = _make_sandbox(self.workspace, self.tag)
         self.bot: discord.Client | None = None
@@ -1003,10 +1068,141 @@ class ProjectRuntime:
         self._originals: dict[str, str | None] = {}  # interaction id -> original message id
         self._interaction_counter = 9_000_000_000_000_000_000
         self._command_counter = 10_000_000_000_000_000_000
+        self._interaction_users: dict[str, int] = {}
+        self._interaction_channels: dict[str, str] = {}
         self._main_task: asyncio.Task | None = None
+        self._cleanup_task: asyncio.Task | None = None
+        self._shutdown_requested = False
         self._connected = asyncio.Event()
-        self._pending_modal: tuple[str, str | None] | None = None  # (custom_id, source message)
+        self._log_filters = []
+        self._pending_modal: tuple[str, str | None, str] | None = None  # (custom_id, source message, modal id)
         self.entry: str | None = None
+
+    def _record_exception(self, error: BaseException, operation: str) -> dict:
+        if self._shutdown_requested:
+            return {}
+        import traceback
+
+        if operation == "project.command":
+            error = getattr(error, "original", None) or error
+        sandbox_root = self.sandbox.resolve()
+        source_file = None
+        line = None
+        if isinstance(error, SyntaxError) and error.filename:
+            try:
+                relative = Path(error.filename).resolve().relative_to(sandbox_root)
+            except (OSError, RuntimeError, ValueError):
+                pass
+            else:
+                source_file, line = relative.as_posix(), error.lineno
+        if source_file is None:
+            for frame in reversed(traceback.extract_tb(error.__traceback__ or None)):
+                try:
+                    relative = Path(frame.filename).resolve().relative_to(sandbox_root)
+                except (OSError, RuntimeError, ValueError):
+                    continue
+                source_file, line = relative.as_posix(), frame.lineno
+                break
+
+        message = error.msg if isinstance(error, SyntaxError) else str(error)
+        for path in {str(sandbox_root), str(sandbox_root).replace("\\", "/"), str(sandbox_root).replace("/", "\\")}:
+            message = message.replace(path, self.workspace.name)
+        traceback_text = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        sandbox_path = str(sandbox_root)
+        for path in {sandbox_path, sandbox_path.replace("\\", "/"), sandbox_path.replace("/", "\\")}:
+            traceback_text = traceback_text.replace(path, self.workspace.name)
+        traceback_text = re.sub(
+            r'(File "[^"]+")', lambda match: match.group(1).replace("\\", "/"), traceback_text
+        )
+        exception = {
+            "type": type(error).__name__, "message": message, "file": source_file,
+            "line": line, "workspace": self.workspace.name, "traceback": traceback_text,
+        }
+        self.session.last_run = {"ok": False, "error": traceback_text, "exception": exception, "ms": 0.0}
+        location = f" at {source_file}:{line}" if source_file and line is not None else ""
+        self.session.log("💥", f"{exception['type']}: {exception['message']}{location}", "error",
+                         details={key: value for key, value in exception.items() if key != "traceback"}
+                         | {"operation": operation, "status": "script_error"})
+        if self.on_exception is not None:
+            self.on_exception()
+        return exception
+
+    def _install_error_reporting(self, bot: discord.Client) -> None:
+        import traceback
+
+        logger = logging.getLogger("discord.app_commands.tree")
+        sandbox_root = str(self.sandbox.resolve())
+        sandbox_paths = (sandbox_root, sandbox_root.replace("\\", "/"),
+                         sandbox_root.replace("/", "\\"))
+
+        def sanitize(record):
+            if record.exc_info:
+                original = "".join(traceback.format_exception(*record.exc_info))
+                text = original
+                for path in sandbox_paths:
+                    text = text.replace(path, self.workspace.name)
+                if text != original:
+                    record.exc_text = text
+                    record.exc_info = None
+            message = record.getMessage()
+            for path in sandbox_paths:
+                message = message.replace(path, self.workspace.name)
+            if message != record.getMessage():
+                record.msg, record.args = message, ()
+            return True
+
+        current = logger
+        while current is not None:
+            for handler in current.handlers:
+                handler.addFilter(sanitize)
+                self._log_filters.append((handler, sanitize))
+            if not current.propagate:
+                break
+            current = current.parent
+        original_run_event = bot._run_event
+
+        async def report_event(coro, event_method, *args, **kwargs):
+            async def capture(*event_args, **event_kwargs):
+                try:
+                    result = coro(*event_args, **event_kwargs)
+                    if inspect_awaitable(result):
+                        return await result
+                    return result
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as error:  # noqa: BLE001 - preserve hosted callback failures
+                    self._record_exception(error, f"project.event.{event_method}")
+                    return None
+
+            return await original_run_event(capture, event_method, *args, **kwargs)
+
+        bot._run_event = report_event
+
+        tree = getattr(bot, "tree", None)
+        if tree is not None:
+            original_tree_error = tree.on_error
+
+            async def report_command(interaction, error):
+                self._record_exception(error, "project.command")
+                if self.on_exception is not None:
+                    return
+                result = original_tree_error(interaction, error)
+                if inspect_awaitable(result):
+                    await result
+
+            tree.on_error = report_command
+
+        original_command_error = getattr(bot, "on_command_error", None)
+        if callable(original_command_error):
+            async def report_prefix_command(context, error):
+                self._record_exception(error, "project.command")
+                if self.on_exception is not None:
+                    return
+                result = original_command_error(context, error)
+                if inspect_awaitable(result):
+                    await result
+
+            bot.on_command_error = report_prefix_command
 
     # ------------------------------------------------ boot
 
@@ -1026,7 +1222,7 @@ class ProjectRuntime:
                                   "sandbox": self.sandbox.name, "entry": entry.name,
                                   "status": "starting"})
         async with _BOOT_LOCK:
-            _purge_sandbox_modules()
+            _purge_sandbox_modules(self.sandbox)
             # Projects legitimately call asyncio.run() in their entry (a fresh
             # loop is fine standalone, but this server loop is already running).
             # Redirect it for the duration of the boot under the global lock.
@@ -1057,7 +1253,10 @@ class ProjectRuntime:
             # inside the emulated folder.
             _chdir_sandbox(self)  # sqlite/env filenames resolve like a real launch
             token = _ACTIVE_BOOT.set(self)
-            module = importlib.import_module(entry.stem)
+            spec = importlib.util.spec_from_file_location(f"_scriptplayground_{uuid.uuid4().hex}", entry)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
             return module
         finally:
             if token is not None:
@@ -1091,6 +1290,7 @@ class ProjectRuntime:
 
     async def _boot_bot(self, bot: discord.Client) -> None:
         session = self.session
+        self._install_error_reporting(bot)
         with contextlib.suppress(Exception):
             bot.intents.message_content = True  # simulator auto-grants privileged intents
         state = bot._connection
@@ -1125,8 +1325,7 @@ class ProjectRuntime:
         me = self.session.guild.me
         return {
             "v": 10,
-            "user": {"id": str(me.id), "username": me.name, "discriminator": "0",
-                     "avatar": None, "bot": True, "global_name": me.name},
+            "user": self.transport._user_payload(me),
             "guilds": [],
             "session_id": f"playground-{self.tag}",
             "resume_gateway_url": "wss://offline.invalid",
@@ -1196,12 +1395,46 @@ class ProjectRuntime:
         self._interaction_counter += 1
         return str(self._interaction_counter)
 
+    def refresh_guild_state(self) -> None:
+        """Refresh hosted discord.py member and channel caches after scenario mutations."""
+        bot = self.bot
+        guild = bot.get_guild(GUILD_ID) if bot is not None else None
+        if guild is None:
+            return
+        for role in self.session.guild.roles:
+            cached_role = guild.get_role(role.id)
+            if cached_role is not None:
+                cached_role._update(self.transport._role_payload(role))
+        if guild._members is None:
+            guild._members = {}
+        for member in self.session.guild.members:
+            payload = self.transport._member_payload(member)
+            cached = guild.get_member(member.id)
+            if cached is None:
+                cached = discord.Member(data=payload, guild=guild, state=bot._connection)
+                guild._add_member(cached)
+            else:
+                cached._update(payload)
+        for channel in self.session.channels.values():
+            payload = self.transport._channel_payload(channel)
+            if guild.get_channel(channel.id) is None:
+                bot._connection.parse_channel_create(payload)
+            else:
+                bot._connection.parse_channel_update(payload)
+
+    def refresh_member_profile(self, _member: pg.MockMember) -> None:
+        """Compatibility hook for scenario profile updates."""
+        self.refresh_guild_state()
+
     def _interaction_payload(self, *, kind: str, message_id: str | None = None,
                              custom_id: str | None = None, values: Any = None,
-                             data: dict | None = None) -> dict:
+                             data: dict | None = None, channel_id=None,
+                             user_id: int | None = None) -> dict:
         session = self.session
-        channel = session.channel
+        stored = session.messages.get(message_id or "") or {}
+        channel = session.channels.get(str(stored.get("channel") or channel_id or ""), session.channel)
         interaction_id = self._next_interaction_id()
+        member = session.guild.get_member(user_id or session.active_user.id)
         payload = {
             "id": interaction_id,
             "application_id": str(BOT_ID),
@@ -1209,16 +1442,21 @@ class ProjectRuntime:
             "token": _PLACEHOLDER_TOKEN,
             "version": 1,
             "guild_id": str(GUILD_ID),
-            "channel": {"id": str(channel.id), "type": 0, "name": channel.name},
+            "channel": self.transport._channel_payload(channel),
             "channel_id": str(channel.id),
             "locale": "en-US",
             "guild_locale": "en-US",
-            "app_permissions": str(discord.Permissions.all().value),
+            "app_permissions": str(channel.permissions_for(session.guild.me).value),
             "attachment_size_limit": 26214400,
             "entitlements": [],
             "authorizing_integration_owners": {},
-            "member": self.transport._member_payload(session.active_user),
+            "member": self.transport._member_payload(member),
         }
+        payload["member"]["permissions"] = str(member.guild_permissions.value)
+        payload["permissions"] = str(channel.permissions_for(member).value)
+        payload["app_permissions"] = str(channel.permissions_for(session.guild.me).value)
+        self._interaction_users[interaction_id] = member.id
+        self._interaction_channels[interaction_id] = str(channel.id)
         if message_id is not None:
             stored = session.messages.get(message_id) or {}
             payload["message"] = self.transport._message_payload(stored)
@@ -1240,12 +1478,9 @@ class ProjectRuntime:
                                                "mentionable_select": 7, "channel_select": 8}
 
     def _component_type(self, message_id: str | None, custom_id: str | None) -> int:
-        if message_id and custom_id:
-            stored = self.session.messages.get(message_id) or {}
-            for item in stored.get("components") or []:
-                if item.get("custom_id") == custom_id:
-                    return self._COMPONENT_TYPE_BY_KIND.get(item.get("kind"), 2)
-        return 2
+        stored = self.session.messages.get(message_id or "") or {}
+        item = pg._find_component(stored.get("components") or [], stored.get("v2") or [], custom_id or "")
+        return self._COMPONENT_TYPE_BY_KIND.get((item or {}).get("kind"), 2)
 
     _OPTION_TYPES: typing.ClassVar[dict[str, int]] = {"string": 3, "integer": 4, "boolean": 5, "user": 6, "channel": 7,
                      "role": 8, "mentionable": 9, "number": 10, "attachment": 11}
@@ -1294,7 +1529,7 @@ class ProjectRuntime:
         self._originals.setdefault(payload["id"], None)
         bot._connection.parse_interaction_create(payload)
 
-    async def dispatch_command(self, name: str, args: dict) -> None:
+    async def dispatch_command(self, name: str, args: dict, channel_id=None) -> None:
         command = None
         if self.bot is not None and getattr(self.bot, "tree", None) is not None:
             command = self.bot.tree.get_command(name)
@@ -1303,23 +1538,66 @@ class ProjectRuntime:
                              details={"operation": "interaction.command", "command": name,
                                       "status": "missing_command"})
             return
-        self.session.log("⌨️", f"command invoked: /{name}", kind="event",
-                         details={"operation": "interaction.command", "command": name,
-                                  "arguments": args, "actor": self.session.active_user.name,
-                                  "status": "dispatched"})
-        payload = self._interaction_payload(kind="command", data=self._command_data(name, args))
-        self._call_interaction(payload)
-        await self._drain()
+        channel = self.session.channels.get(str(channel_id or ""), self.session.channel)
+        allowed, reason = channel.permission_check(self.session.active_user, "view_channel")
+        if not allowed:
+            self.session.log("🚫", f"command blocked: missing view_channel permission ({reason})", "warn",
+                             kind="event", details={"operation": "interaction.command", "command": name,
+                                                      "status": "denied", "permission": "view_channel",
+                                                      "reason": reason})
+            return
+        event = self.session.log("⌨️", f"command invoked: /{name}", kind="event",
+                                 details={"operation": "interaction.command", "command": name,
+                                          "arguments": args, "actor": self.session.active_user.name,
+                                          "channel": channel.name, "status": "dispatched"})
+        from playground import _ACTIVE_EVENT
+        token = _ACTIVE_EVENT.set(event["id"])
+        try:
+            payload = self._interaction_payload(kind="command", data=self._command_data(name, args),
+                                                channel_id=channel.id)
+            self._call_interaction(payload)
+            await self._drain()
+        finally:
+            _ACTIVE_EVENT.reset(token)
 
     async def dispatch_click(self, message_id: str, custom_id: str, values: list) -> None:
-        self.session.log("🖱️", f"component used: {custom_id!r}", kind="event",
-                         details={"operation": "interaction.component", "custom_id": custom_id,
-                                  "message_id": message_id, "actor": self.session.active_user.name,
-                                  "status": "dispatched"})
-        payload = self._interaction_payload(kind="click", message_id=message_id,
-                                            custom_id=custom_id, values=values)
-        self._call_interaction(payload)
-        await self._drain()
+        message = self.session.messages.get(message_id) or {}
+        details = {"operation": "interaction.component", "custom_id": custom_id,
+                   "message_id": message_id, "actor": self.session.active_user.name}
+        if message.get("deleted"):
+            self.session.log("⚠️", "component message is no longer available", "warn", kind="event",
+                             details={**details, "status": "invalid_message"})
+            return
+        if message.get("ephemeral") and message.get("ephemeral_user_id") != str(self.session.active_user.id):
+            self.session.log("🚫", "ephemeral message is only visible to its interaction user", "warn", kind="event",
+                             details={**details, "status": "denied"})
+            return
+        channel = self.session.channels.get(str(message.get("channel") or ""), self.session.channel)
+        allowed, reason = channel.permission_check(self.session.active_user, "view_channel")
+        if not allowed:
+            self.session.log("🚫", f"component use blocked: missing view_channel permission ({reason})", "warn",
+                             kind="event", details={**details, "status": "denied",
+                                                     "permission": "view_channel", "reason": reason})
+            return
+        component = pg._find_component(message.get("components") or [], message.get("v2") or [], custom_id)
+        if message.get("deleted") or component is None or component.get("disabled"):
+            self.session.log("⚠️", f"component {custom_id!r} is not available on this message", "warn",
+                             kind="event", details={**details, "status": "invalid_component"})
+            return
+        event = self.session.log("🖱️", f"component used: {custom_id!r}", kind="event",
+                                 details={**details, "channel": channel.name, "status": "attempted"})
+        from playground import _ACTIVE_EVENT
+        token = _ACTIVE_EVENT.set(event["id"])
+        try:
+            payload = self._interaction_payload(kind="click", message_id=message_id,
+                                                custom_id=custom_id, values=values)
+            self._call_interaction(payload)
+            await self._drain()
+        finally:
+            _ACTIVE_EVENT.reset(token)
+        if not event.get("action_ids"):
+            self.session.log("⚠️", "that interaction was never answered — real Discord shows 'This interaction failed'",
+                             "warn", kind="event", details={**details, "status": "unanswered"})
 
     async def dispatch_submit(self, message_id: str, custom_id: str, values: dict) -> None:
         self.session.log("📝", f"modal submitted: {custom_id!r}", kind="event",
@@ -1330,14 +1608,75 @@ class ProjectRuntime:
         self._call_interaction(payload)
         await self._drain()
 
-    async def dispatch_pending_modal(self, values: dict) -> bool:
+    async def dispatch_pending_modal(self, values: dict, modal_id: str | None = None) -> bool:
         """Submit the UI-filled modal the bot last opened. False if none is open."""
         if self._pending_modal is None:
             return False
-        custom_id, source = self._pending_modal
+        custom_id, _source, expected_modal_id = self._pending_modal
+        if modal_id and modal_id != expected_modal_id:
+            return False
+        modal = next((item for item in reversed(self.session.modals)
+                      if item.get("id") == expected_modal_id), None)
+        if modal is None:
+            self._pending_modal = None
+            return False
+        if modal.get("user_id") != str(self.session.active_user.id):
+            self.session.log("🚫", "modal is only visible to the user who opened it", "warn", kind="event",
+                             details={"operation": "interaction.modal_submit", "modal_id": expected_modal_id,
+                                      "actor": self.session.active_user.name, "status": "denied"})
+            return True
+        invalid = next((item for item in modal.get("items", [])
+                        if (item.get("required") and not pg._modal_value(values, item).strip())
+                        or len(pg._modal_value(values, item)) < (item.get("min_length") or 0)
+                        or len(pg._modal_value(values, item)) > (item.get("max_length") or 4000)), None)
+        if invalid is not None:
+            self.session.log("⚠️", "modal submission contains an invalid field", "warn", kind="event",
+                             details={"operation": "interaction.modal_submit", "modal_id": expected_modal_id,
+                                      "field": invalid.get("custom_id"), "status": "invalid_form"})
+            return True
+        from playground import _ACTIVE_EVENT
+        source = _source
+        source_message = self.session.messages.get(source or "") or {}
+        channel = self.session.channels.get(modal.get("channel_id") or source_message.get("channel") or "",
+                                           self.session.channel)
+        event = self.session.log("📝", f"modal submitted: {custom_id!r}", kind="event",
+                                 details={"interaction": "modal_submit", "modal_id": expected_modal_id,
+                                          "custom_id": custom_id, "actor": self.session.active_user.name,
+                                          "channel": channel.name, "status": "attempted"})
+        payload = self._interaction_payload(kind="submit", message_id=source,
+                                            custom_id=custom_id, values=values, user_id=int(modal["user_id"]))
+        payload["channel_id"] = str(channel.id)
+        payload["channel"] = {"id": str(channel.id), "type": 0, "name": channel.name}
+        self._originals[payload["id"]] = source
+        self.session.modals.remove(modal)
+        self.session._touch()
         self._pending_modal = None
-        await self.dispatch_submit(source, custom_id, values)
+        token = _ACTIVE_EVENT.set(event["id"])
+        try:
+            self._call_interaction(payload)
+            await self._drain()
+            await self._settle_modal_error(event, custom_id, channel)
+        finally:
+            _ACTIVE_EVENT.reset(token)
         return True
+
+    async def _settle_modal_error(self, event: dict, custom_id: str, channel: pg.MockChannel) -> None:
+        await asyncio.sleep(0)
+        if not event.get("action_ids"):
+            self.session.log("⚠️", "modal submit received but the bot did not acknowledge it",
+                             "warn", kind="event",
+                             details={"interaction": "modal_submit", "custom_id": custom_id,
+                                      "channel": channel.name, "status": "unanswered"})
+
+    def dismiss_modal(self, modal_id: str) -> bool:
+        pending = self._pending_modal
+        if pending is None or pending[2] != modal_id:
+            self.session.dismiss_modal(modal_id, self.session.active_user.id)
+            return False
+        result = self.session.dismiss_modal(modal_id, self.session.active_user.id)
+        if result:
+            self._pending_modal = None
+        return result
 
     async def dispatch_message(self, content: str, channel_id: str | None = None) -> None:
         """User chat message → real MESSAGE_CREATE → on_message + prefix commands."""
@@ -1351,14 +1690,22 @@ class ProjectRuntime:
                                                "permission": "send_messages", "reason": reason,
                                                "status": "denied"})
             return
-        stored = session.add_message(channel_id=channel.id, content=content, author=session.active_user)
         bot = self.bot
-        if bot is not None:
-            payload = self.transport._message_payload(stored)
-            payload["mentions"] = []
-            payload["mention_roles"] = []
-            bot._connection.parse_message_create(payload)
-        await self._drain()
+        if bot is None:
+            raise RuntimeError("no project bot is running")
+        stored = session.add_message(channel_id=channel.id, content=content, author=session.active_user)
+        event = session.log("💬", f"message received from {session.active_user.name}", kind="event",
+                            details={"interaction": "message_create", "operation": "message.send",
+                                     "message_id": stored["id"], "channel": channel.name,
+                                     "actor": session.active_user.name, "content": content,
+                                     "status": "dispatched"})
+        from playground import _ACTIVE_EVENT
+        token = _ACTIVE_EVENT.set(event["id"])
+        try:
+            bot._connection.parse_message_create(self.transport._message_payload(stored))
+            await self._drain()
+        finally:
+            _ACTIVE_EVENT.reset(token)
 
     # ------------------------------------------------ introspection for the UI
 
@@ -1413,28 +1760,25 @@ class ProjectRuntime:
 
     # ------------------------------------------------ shutdown
 
-    async def shutdown(self) -> None:
-        self._connected.set()  # release any bot parked in connect()
-        _restore_asyncio_run_patch()
+    def _begin_cleanup(self, session_obj) -> asyncio.Task:
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._finish_shutdown(session_obj))
+        return self._cleanup_task
+
+    async def _finish_shutdown(self, session_obj) -> None:
+        for handler, log_filter in self._log_filters:
+            handler.removeFilter(log_filter)
+        self._log_filters.clear()
         with contextlib.suppress(ValueError):
             sys.path.remove(str(self.sandbox))
         if self in _CWD_STACK:
             _CWD_STACK.remove(self)
         for bot in list(self.clients):
             _HTTP_RUNTIMES.pop(id(bot.http), None)
-        session_obj = None
         for bot in self.clients:
             http_session = _http_session(bot.http)
             if http_session is not None:
                 _SESSION_RUNTIMES.pop(id(http_session), None)
-                session_obj = http_session
-        if self.bot is not None and not self.bot.is_closed():
-            with contextlib.suppress(Exception):
-                await self.bot.close()
-        if self._main_task is not None and not self._main_task.done():
-            self._main_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._main_task
         if session_obj is not None:
             with contextlib.suppress(Exception):
                 await session_obj.close()
@@ -1442,7 +1786,46 @@ class ProjectRuntime:
             _chdir_active_sandbox()  # leave the sandbox before it is deleted
         with contextlib.suppress(Exception):
             shutil.rmtree(self.sandbox, ignore_errors=True)
-        _purge_sandbox_modules()
+        _purge_sandbox_modules(self.sandbox)
+        if getattr(self.session, "_project_runtime_shutdown_pending", None) is self:
+            del self.session._project_runtime_shutdown_pending
+
+    async def shutdown(self) -> None:
+        if self._shutdown_requested:
+            if self._cleanup_task is not None:
+                await asyncio.shield(self._cleanup_task)
+            return
+        self._shutdown_requested = True
+        self._connected.set()  # release any bot parked in connect()
+        session_obj = None
+        for bot in self.clients:
+            http_session = _http_session(bot.http)
+            if http_session is not None:
+                session_obj = http_session
+        if self.bot is not None and not self.bot.is_closed():
+            with contextlib.suppress(Exception):
+                await self.bot.close()
+        if self._main_task is not None and not self._main_task.done():
+            self._main_task.cancel()
+            try:
+                async with asyncio.timeout(0.5):
+                    await asyncio.shield(self._main_task)
+            except TimeoutError:
+                self._main_task.cancel()
+            except (asyncio.CancelledError, Exception) as error:  # noqa: BLE001
+                if not isinstance(error, asyncio.CancelledError):
+                    log.debug("Hosted main task errored during shutdown: %s", error)
+            if not self._main_task.done():
+                # asyncio can't kill a coroutine that suppresses cancellation.
+                # Quarantine effects and retain resources until it really exits.
+                self.session._project_runtime_shutdown_pending = self
+                self._main_task.add_done_callback(lambda _: self._begin_cleanup(session_obj))
+                return
+        await asyncio.shield(self._begin_cleanup(session_obj))
+
+def project_shutdown_pending(session: pg.Session) -> bool:
+    """Whether a cancellation-resistant hosted project still owns this session."""
+    return getattr(session, "_project_runtime_shutdown_pending", None) is not None
 
 
 def inspect_awaitable(value) -> bool:  # tiny alias to keep imports honest
@@ -1458,34 +1841,37 @@ async def _wrap_main(awaitable, runtime: ProjectRuntime) -> None:
     except asyncio.CancelledError:
         raise
     except BaseException as error:  # noqa: BLE001
-        import traceback
-
-        text = "".join(traceback.format_exception(type(error), error, error.__traceback__))
-        runtime.session.log("💥", f"main() failed: {error}", "error",
-                            details={"operation": "project.main", "status": "script_error",
-                                     "type": type(error).__name__, "message": str(error),
-                                     "traceback": text[-2000:]})
+        runtime._record_exception(error, "project.main")
 
 
-async def run_project(session: pg.Session, workspace: Path, tag: str | None = None):
+async def run_project(session: pg.Session, workspace: Path, tag: str | None = None,
+                      on_exception: Callable[[], None] | None = None):
     """Create + boot a runtime (Python or Node); raises with a logged event on failure."""
     workspace = Path(workspace)
     runtime: ProjectRuntime | NodeProjectRuntime
     if _is_node_project(workspace):
         runtime = NodeProjectRuntime(session, workspace, tag)
     else:
-        runtime = ProjectRuntime(session, workspace, tag)
+        runtime = ProjectRuntime(session, workspace, tag, on_exception)
     try:
         await runtime.boot()
-    except BaseException as error:
-        import traceback
-
-        text = "".join(traceback.format_exception(type(error), error, error.__traceback__))
-        session.log("💥", f"project boot failed: {error}", "error",
-                    details={"operation": "project.run", "status": "script_error",
-                             "type": type(error).__name__, "message": str(error),
-                             "traceback": text[-4000:]})
+    except asyncio.CancelledError:
         await runtime.shutdown()
+        raise
+    except BaseException as error:
+        if isinstance(runtime, ProjectRuntime):
+            runtime._record_exception(error, "project.run")
+        else:
+            import traceback
+
+            text = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+            session.log("💥", f"project boot failed: {error}", "error",
+                        details={"operation": "project.run", "status": "script_error",
+                                 "type": type(error).__name__, "message": str(error),
+                                 "traceback": text[-4000:]})
+        await runtime.shutdown()
+        if not isinstance(error, Exception):
+            raise RuntimeError(f"{type(error).__name__}: {error}") from error  # noqa: TRY004
         raise
     session.commands = runtime.commands_payload()
     return runtime
@@ -1543,6 +1929,15 @@ class NodeProjectRuntime:
         self.process: asyncio.subprocess.Process | None = None
         self._synced_commands: list[dict] = []
         self._interaction_counter = 9_000_000_000_000_000_000
+        self._interaction_users: dict[str, int] = {}
+        self._interaction_channels: dict[str, str] = {}
+        self._interaction_replies: dict[str, str] = {}
+        self._interaction_source_messages: dict[str, str] = {}
+        self._interaction_events: dict[str, dict] = {}
+        self._interaction_done: dict[str, asyncio.Event] = {}
+        self._interaction_ack: dict[str, bool] = {}
+        self._guild_cache_revision = 0
+        self._pending_modal: tuple[str, str | None, str] | None = None
         self._ready = asyncio.Event()
         self._reader_task: asyncio.Task | None = None
         self._stderr_task: asyncio.Task | None = None
@@ -1635,12 +2030,31 @@ class NodeProjectRuntime:
             self.process.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
 
     async def _handle_event(self, payload: dict) -> None:
+        interaction_id = str(payload.get("interaction_id") or "")
+        event = self._interaction_events.get(interaction_id)
+        if event is None:
+            await self._handle_event_impl(payload)
+            return
+        from playground import _ACTIVE_EVENT
+
+        token = _ACTIVE_EVENT.set(event["id"])
+        try:
+            await self._handle_event_impl(payload)
+        finally:
+            _ACTIVE_EVENT.reset(token)
+
+    async def _handle_event_impl(self, payload: dict) -> None:
         kind = payload.get("type")
         if kind == "hello":
-            # Bridge announced itself; deliver the ready event immediately.
+            # Seed discord.js caches like the initial guild/member/channel gateway events.
+            guild = self.session.guild
             self._send({"type": "ready", "user": self._bot_user(),
-                        "channel_id": str(self.session.channel.id),
-                        "guild_id": str(GUILD_ID)})
+                        "guild": {"id": str(GUILD_ID), "name": guild.name,
+                                  "members": [self._member_payload(member) for member in guild.members],
+                                  "roles": [self._role_payload(role) for role in guild.roles],
+                                  "channels": [self._channel_payload(channel)
+                                               for channel in self.session.channels.values()]}})
+            self._guild_cache_revision = self.session.revision
         elif kind == "ready":
             self._ready.set()
             self.session.log("⚙️", f"node client ready as {self.session.guild.me.name}", kind="event",
@@ -1654,8 +2068,9 @@ class NodeProjectRuntime:
                                       "runtime": "node-shim", "status": "success"})
         elif kind == "send":
             stored = self._store_outgoing(payload)
-            self.session.log("↗️", f"channel.send → #{self.session.channel.name}", kind="action",
-                             details={"operation": "channel.send", "channel": self.session.channel.name,
+            channel = self.session.channels.get(str(payload.get("channel_id") or ""), self.session.channel)
+            self.session.log("↗️", f"channel.send → #{channel.name}", kind="action",
+                             details={"operation": "channel.send", "channel": channel.name,
                                       "message_id": stored["id"], "runtime": "node-shim",
                                       "status": "success"})
         elif kind == "typing":
@@ -1667,20 +2082,148 @@ class NodeProjectRuntime:
                              details={"operation": "change_presence", "runtime": "node-shim",
                                       "activity": payload.get("activity"), "status": "success"})
         elif kind == "interaction_reply":
-            self._last_reply = payload.get("interaction_id")
-            stored = self._store_outgoing(payload)
+            interaction_id = str(payload.get("interaction_id"))
+            followup = bool(payload.get("followup"))
+            if not followup:
+                self._interaction_ack[interaction_id] = True
+            channel = self.session.channels.get(
+                self._interaction_channels.get(interaction_id, ""), self.session.channel
+            )
+            outgoing = {**payload, "channel_id": channel.id}
+            ephemeral = bool(payload.get("ephemeral"))
+            if ephemeral:
+                outgoing["ephemeral_user_id"] = self._interaction_users.get(interaction_id)
+            if followup or interaction_id not in self._interaction_replies:
+                stored = self._store_outgoing(outgoing)
+                if not followup:
+                    self._interaction_replies[interaction_id] = stored["id"]
+            else:
+                message_id = self._interaction_replies[interaction_id]
+                stored = self.session.messages.get(message_id) or {}
+                self.session.update_message(message_id, content=payload.get("content"),
+                                            embeds=self._embeds(payload),
+                                            view=_revive_classic_view(payload.get("components")))
+                if stored.get("ephemeral"):
+                    stored["ephemeral_user_id"] = self._interaction_users.get(interaction_id)
             self.session.log("💬", f"interaction reply → message #{stored['index']}", kind="action",
-                             details={"operation": "interaction.response",
+                             details={"operation": "interaction.followup" if followup else "interaction.response",
                                       "message_id": stored["id"], "runtime": "node-shim",
                                       "status": "success"})
         elif kind == "interaction_defer":
-            self.session.log("💭", "interaction deferred (thinking)", kind="action",
-                             details={"operation": "interaction.defer", "runtime": "node-shim",
-                                      "status": "success"})
+            interaction_id = str(payload.get("interaction_id"))
+            self._interaction_ack[interaction_id] = True
+            channel = self.session.channels.get(
+                self._interaction_channels.get(interaction_id, ""), self.session.channel
+            )
+            if payload.get("thinking"):
+                deferred = self.session.add_message(
+                    channel_id=channel.id, content="Thinking…", author=self.session.guild.me,
+                    ephemeral=bool(payload.get("ephemeral")),
+                    ephemeral_user_id=self._interaction_users.get(interaction_id)
+                    if payload.get("ephemeral") else None,
+                )
+                self._interaction_replies[interaction_id] = deferred["id"]
+            else:
+                self._interaction_replies[interaction_id] = self._interaction_source_messages.get(interaction_id)
+            self.session.log("💭", "interaction deferred (thinking)" if payload.get("thinking") else "interaction deferred",
+                             kind="action", details={"operation": "interaction.defer", "runtime": "node-shim",
+                                                       "status": "success"})
+        elif kind == "interaction_delete":
+            interaction_id = str(payload.get("interaction_id"))
+            message_id = (self._interaction_replies.get(interaction_id)
+                          or self._interaction_source_messages.get(interaction_id))
+            stored = self.session.messages.get(message_id or "")
+            if stored and stored.get("ephemeral") and stored.get("ephemeral_user_id") != str(
+                self._interaction_users.get(interaction_id)
+            ):
+                self.session.log("🚫", "ephemeral response is only visible to its interaction user", "warn",
+                                 kind="action", details={"operation": "interaction.delete_response",
+                                                          "status": "denied", "permission": "ephemeral_owner_only"})
+            elif message_id is not None:
+                self.session.delete_message(message_id, actor_id=self._interaction_users.get(interaction_id))
+        elif kind == "interaction_update":
+            interaction_id = str(payload.get("interaction_id"))
+            message_id = (self._interaction_replies.get(interaction_id)
+                          or self._interaction_source_messages.get(interaction_id))
+            stored = self.session.messages.get(message_id or "")
+            if stored and stored.get("ephemeral") and stored.get("ephemeral_user_id") != str(
+                self._interaction_users.get(interaction_id)
+            ):
+                self.session.log("🚫", "ephemeral response is only visible to its interaction user", "warn",
+                                 kind="action", details={"operation": "interaction.update_message",
+                                                          "status": "denied", "permission": "ephemeral_owner_only"})
+            else:
+                self._interaction_ack[interaction_id] = True
+                if message_id is None:
+                    self.session.log("⚠️", "component update has no response target", "warn", kind="event",
+                                     details={"operation": "interaction.update_message", "status": "missing_message"})
+                else:
+                    changes = {}
+                    if "content" in payload:
+                        changes["content"] = payload["content"]
+                    if "embeds" in payload:
+                        changes["embeds"] = self._embeds(payload)
+                    if "components" in payload:
+                        changes["view"] = _revive_classic_view(payload["components"])
+                    self.session.update_message(message_id, **changes)
+        elif kind == "interaction_modal":
+            interaction_id = str(payload.get("interaction_id"))
+            self._interaction_ack[interaction_id] = True
+            channel = self.session.channels.get(
+                self._interaction_channels.get(interaction_id, ""), self.session.channel
+            )
+            raw = payload.get("modal") or {}
+            if not raw.get("custom_id") or len(raw.get("title") or "") > 45:
+                self.session.log("⚠️", "bot sent an invalid modal", "warn", kind="event",
+                                 details={"operation": "interaction.send_modal", "status": "invalid_modal"})
+                return
+            fields = [component for row in raw.get("components", [])
+                      for component in row.get("components", [])]
+            if not 1 <= len(fields) <= 5 or any(
+                not item.get("custom_id") or not item.get("label")
+                or len(item.get("label", "")) > 45
+                or (item.get("min_length") is not None and item["min_length"] < 0)
+                or (item.get("max_length") is not None and item["max_length"] > 4000)
+                or (item.get("min_length") is not None and item.get("max_length") is not None
+                    and item["min_length"] > item["max_length"])
+                for item in fields
+            ):
+                self.session.log("⚠️", "bot sent an invalid modal form", "warn", kind="event",
+                                 details={"operation": "interaction.send_modal", "status": "invalid_modal"})
+                return
+            source = self._interaction_source_messages.get(interaction_id)
+            opened = self.session.open_modal_payload(
+                raw.get("title") or "Modal", fields, source,
+                channel_id=channel.id, custom_id=raw.get("custom_id"),
+                user_id=self._interaction_users.get(interaction_id),
+            )
+            self._pending_modal = (raw.get("custom_id"), opened.get("source"), opened["id"])
         elif kind == "interaction_edit":
-            if self._last_reply is not None:
-                self.session.update_message(self._last_reply, content=payload.get("content"),
-                                            embeds=self._embeds(payload))
+            interaction_id = str(payload.get("interaction_id"))
+            self._interaction_ack[interaction_id] = True
+            message_id = (self._interaction_replies.get(interaction_id)
+                          or self._interaction_source_messages.get(interaction_id))
+            stored = self.session.messages.get(message_id or "")
+            if stored and stored.get("ephemeral") and stored.get("ephemeral_user_id") != str(
+                self._interaction_users.get(interaction_id)
+            ):
+                self.session.log("🚫", "ephemeral response is only visible to its interaction user", "warn",
+                                 kind="action", details={"operation": "interaction.edit_response",
+                                                          "status": "denied", "permission": "ephemeral_owner_only"})
+            elif message_id is not None:
+                changes = {}
+                if "content" in payload:
+                    changes["content"] = payload["content"]
+                if "embeds" in payload:
+                    changes["embeds"] = self._embeds(payload)
+                if "components" in payload:
+                    changes["view"] = _revive_classic_view(payload["components"])
+                self.session.update_message(message_id, **changes)
+        elif kind == "interaction_complete":
+            interaction_id = str(payload.get("interaction_id"))
+            self._interaction_ack[interaction_id] = bool(payload.get("acknowledged"))
+            if done := self._interaction_done.get(interaction_id):
+                done.set()
         elif kind == "error":
             self.session.log("💥", str(payload.get("message"))[:1500], "error",
                              details={"operation": "node.error", "runtime": "node-shim",
@@ -1696,8 +2239,8 @@ class NodeProjectRuntime:
 
     def _bot_user(self) -> dict:
         me = self.session.guild.me
-        return {"id": str(me.id), "username": me.name, "global_name": me.name,
-                "bot": True, "avatar": None, "discriminator": "0"}
+        return {"id": str(me.id), "username": me.name, "global_name": me.display_name,
+                "bot": True, "avatar": me.avatar_url, "discriminator": "0"}
 
     def _embeds(self, payload: dict) -> list | None:
         raw = payload.get("embeds")
@@ -1711,23 +2254,76 @@ class NodeProjectRuntime:
 
     def _store_outgoing(self, payload: dict) -> dict:
         view = _revive_classic_view(payload.get("components"))
+        ephemeral = bool(payload.get("ephemeral"))
         return self.session.add_message(
-            channel_id=self.session.channel.id, content=payload.get("content"),
-            embeds=self._embeds(payload), view=view,
-            ephemeral=bool(payload.get("ephemeral")),
+            channel_id=payload.get("channel_id") or self.session.channel.id, content=payload.get("content"),
+            embeds=self._embeds(payload), view=view, ephemeral=ephemeral,
+            ephemeral_user_id=payload.get("ephemeral_user_id") or self.session.active_user.id if ephemeral else None,
         )
 
     # ------------------------------------------------ dispatch
 
+    _OPTION_NAMES: typing.ClassVar[dict[int, str]] = {
+        3: "string", 4: "integer", 5: "boolean", 6: "user", 7: "channel",
+        8: "role", 9: "mentionable", 10: "number", 11: "attachment",
+    }
+
     def commands_payload(self) -> dict:
         out = {}
         for command in self._synced_commands:
+            params = [{"name": item.get("name"), "description": item.get("description") or "",
+                       "required": bool(item.get("required")),
+                       "type": self._OPTION_NAMES.get(item.get("type"), "string"),
+                       "choices": [[choice.get("name"), choice.get("value")]
+                                   for choice in item.get("choices", [])]}
+                      for item in command.get("options", []) if item.get("type") in self._OPTION_NAMES]
             out[command.get("name")] = {
                 "name": command.get("name"),
                 "description": command.get("description") or "",
-                "params": [],
+                "params": params,
             }
         return out
+
+    def _command_payload(self, command: dict, args: dict, channel: pg.MockChannel) -> dict:
+        params = {item.get("name"): item for item in command.get("options", [])}
+        resolved = {"users": {}, "members": {}, "roles": {}, "channels": {}}
+        options = {}
+        for name, raw in (args or {}).items():
+            if raw in (None, ""):
+                continue
+            option = params.get(name) or {}
+            kind = option.get("type", 3)
+            if kind == 4:
+                value = int(raw)
+            elif kind == 5:
+                value = str(raw).lower() in ("1", "true", "yes", "on")
+            elif kind == 10:
+                value = float(raw)
+            else:
+                value = str(raw)
+            if kind in (6, 9):
+                member = self.session.guild.get_member(int(value)) if str(value).isdigit() else None
+                if member is not None:
+                    resolved["users"][str(member.id)] = self._member_payload_for(member)
+                    resolved["members"][str(member.id)] = self._member_payload(member)
+            if kind in (7, 9):
+                target_channel = self.session.channels.get(str(value))
+                if target_channel is not None:
+                    resolved["channels"][str(target_channel.id)] = self._channel_payload(target_channel)
+            if kind in (8, 9):
+                role = self.session.guild.get_role(int(value)) if str(value).isdigit() else None
+                if role is not None:
+                    resolved["roles"][str(role.id)] = self._role_payload(role)
+            options[name] = value
+        active = self.session.active_user
+        return {"type": "interaction", "interaction_id": "", "command_name": command.get("name"),
+                "options": options, "resolved": resolved, "user": self._member_payload_for(active),
+                "member": self._member_payload(active),
+                "permissions": str(channel.permissions_for(active).value),
+                "app_permissions": str(channel.permissions_for(self.session.guild.me).value),
+                "channel_id": str(channel.id),
+                "channel": self._channel_payload(channel),
+                "guild_id": str(GUILD_ID), "guild": {"id": str(GUILD_ID), "name": self.session.guild.name}}
 
     def status(self) -> dict:
         return {
@@ -1741,30 +2337,119 @@ class NodeProjectRuntime:
             "synced": len(self._synced_commands),
         }
 
+    def refresh_guild_state(self) -> None:
+        """Refresh discord.js caches after a scenario member or permission change."""
+        self._refresh_guild_cache()
+
+    def refresh_member_profile(self, _member: pg.MockMember) -> None:
+        self.refresh_guild_state()
+
+    def _refresh_guild_cache(self) -> None:
+        if self.session.revision == self._guild_cache_revision:
+            return
+        self._send({"type": "guild_cache", "guild_id": str(GUILD_ID),
+                    "members": [self._member_payload(member) for member in self.session.guild.members],
+                    "roles": [self._role_payload(role) for role in self.session.guild.roles],
+                    "channels": [self._channel_payload(channel)
+                                 for channel in self.session.channels.values()]})
+        self._guild_cache_revision = self.session.revision
+
     def _member_payload_for(self, member: pg.MockMember) -> dict:
         return {"id": str(member.id), "username": member.name,
-                "global_name": member.name, "bot": False, "avatar": None,
-                "discriminator": "0"}
+                "global_name": member.display_name, "bot": member.bot,
+                "avatar": member.avatar_url, "avatar_url": member.avatar_url,
+                "banner": member.banner_url, "bio": member.bio,
+                "accent_color": int(member.accent_color[1:], 16) if member.accent_color else None,
+                "status": getattr(member.status, "name", "online"), "discriminator": "0"}
+
+    def _member_payload(self, member: pg.MockMember) -> dict:
+        user = self._member_payload_for(member)
+        return {"user": user, "nick": member.display_name,
+                "roles": [str(role.id) for role in member.roles if role.id != GUILD_ID],
+                "joined_at": "2024-01-01T00:00:00+00:00", "deaf": False, "mute": False,
+                "pending": False, "permissions": str(member.guild_permissions.value)}
+
+    def _channel_payload(self, channel: pg.MockChannel) -> dict:
+        role_ids = {role.id for role in self.session.guild.roles}
+        return {"id": str(channel.id), "type": 0, "guild_id": str(GUILD_ID),
+                "name": channel.name, "topic": channel.topic,
+                "permission_overwrites": [
+                {"id": str(target_id), "type": 0 if target_id in role_ids else 1,
+                 "allow": str(overwrite.pair()[0].value), "deny": str(overwrite.pair()[1].value)}
+                for target_id, overwrite in channel.overwrites.items()
+                ]}
+
+    def _role_payload(self, role: pg.MockRole) -> dict:
+        return {"id": str(role.id), "name": role.name, "color": role.color.value,
+                "permissions": str(role.permissions.value), "position": role.position}
+
+    def _message_event_payload(self, message_id: str, message: dict) -> dict:
+        wire_id = _wire_message_id(message_id)
+        channel = self.session.channels.get(str(message.get("channel") or ""), self.session.channel)
+        author_id = (message.get("author") or {}).get("id")
+        author = self.session.guild.get_member(int(author_id)) if str(author_id or "").isdigit() else None
+        author = author or self.session.guild.me
+        return {"id": wire_id, "message_id": wire_id, "content": message.get("content", ""),
+                "channel_id": str(channel.id), "guild_id": str(GUILD_ID),
+                "components": message.get("components") or [], "v2": message.get("v2") or [],
+                "embeds": message.get("embeds") or [], "author": self._member_payload_for(author),
+                "member": self._member_payload(author)}
 
     async def _settle(self) -> None:
         await asyncio.sleep(0.35)  # give the child a beat to answer
 
-    async def dispatch_command(self, name: str, args: dict) -> None:
-        if name not in self.commands_payload():
+    def _begin_interaction(self, operation: str, icon: str, text: str,
+                           details: dict) -> tuple[str, dict]:
+        event = self.session.log(icon, text, kind="event",
+                                 details={"operation": operation, **details, "status": "dispatched"})
+        self._interaction_counter += 1
+        interaction_id = str(self._interaction_counter)
+        self._interaction_events[interaction_id] = event
+        self._interaction_done[interaction_id] = asyncio.Event()
+        self._interaction_ack[interaction_id] = False
+        return interaction_id, event
+
+    async def _settle_interaction(self, interaction_id: str, event: dict, label: str) -> None:
+        done = self._interaction_done[interaction_id]
+        try:
+            await asyncio.wait_for(done.wait(), timeout=3.0)
+        except asyncio.TimeoutError:
+            pass
+        if not self._interaction_ack.get(interaction_id):
+            self.session.log("⚠️", f"{label} interaction was never acknowledged — real Discord shows 'This interaction failed'",
+                             "warn", kind="event", details={"status": "unanswered",
+                                                              "operation": "interaction.acknowledgement"})
+        self._interaction_events.pop(interaction_id, None)
+        self._interaction_done.pop(interaction_id, None)
+        self._interaction_ack.pop(interaction_id, None)
+
+    async def dispatch_command(self, name: str, args: dict, channel_id=None) -> None:
+        command = next((item for item in self._synced_commands if item.get("name") == name), None)
+        if command is None:
             self.session.log("⚠️", f"/{name} is not registered by this bot", "warn", kind="event",
                              details={"operation": "interaction.command", "command": name,
                                       "status": "missing_command"})
             return
-        self._interaction_counter += 1
-        self.session.log("⌨️", f"command invoked: /{name}", kind="event",
-                         details={"operation": "interaction.command", "command": name,
-                                  "arguments": args, "actor": self.session.active_user.name,
-                                  "status": "dispatched"})
-        self._send({"type": "interaction", "interaction_id": str(self._interaction_counter),
-                    "command_name": name, "options": {k: str(v) for k, v in (args or {}).items()},
-                    "user": self._member_payload_for(self.session.active_user),
-                    "channel_id": str(self.session.channel.id)})
-        await self._settle()
+        channel = self.session.channels.get(str(channel_id or ""), self.session.channel)
+        allowed, reason = channel.permission_check(self.session.active_user, "view_channel")
+        if not allowed:
+            self.session.log("🚫", f"command blocked: missing view_channel permission ({reason})", "warn",
+                             kind="event", details={"operation": "interaction.command", "command": name,
+                                                      "status": "denied", "permission": "view_channel",
+                                                      "reason": reason})
+            return
+        self._refresh_guild_cache()
+        interaction_id, event = self._begin_interaction("interaction.command", "⌨️",
+                                                        f"command invoked: /{name}",
+                                                        {"command": name, "arguments": args,
+                                                         "actor": self.session.active_user.name,
+                                                         "channel": channel.name})
+        self._interaction_users[interaction_id] = self.session.active_user.id
+        self._interaction_channels[interaction_id] = str(channel.id)
+        payload = self._command_payload(command, args, channel)
+        payload["interaction_id"] = interaction_id
+        self._send(payload)
+        await self._settle_interaction(interaction_id, event, f"/{name}")
 
     async def dispatch_message(self, content: str, channel_id: str | None = None) -> None:
         session = self.session
@@ -1778,23 +2463,174 @@ class NodeProjectRuntime:
                                                "status": "denied"})
             return
         stored = session.add_message(channel_id=channel.id, content=content, author=session.active_user)
+        self._refresh_guild_cache()
+        self._begin_interaction("message.send", "💬", f"message received from {session.active_user.name}",
+                                {"interaction": "message_create", "message_id": stored["id"],
+                                 "channel": channel.name, "actor": session.active_user.name,
+                                 "content": content})
         self._send({"type": "message", "message_id": _wire_message_id(stored["id"]),
-                    "content": content, "channel_id": str(channel.id),
-                    "author": self._member_payload_for(session.active_user)})
+                    "content": content, "channel_id": str(channel.id), "guild_id": str(GUILD_ID),
+                    "author": self._member_payload_for(session.active_user),
+                    "member": self._member_payload(session.active_user)})
         await self._settle()
 
     async def dispatch_click(self, message_id: str, custom_id: str, values: list) -> None:
-        self.session.log("⚠️", "this Node bot registers no component handlers", "warn", kind="event",
-                         details={"operation": "interaction.component", "custom_id": custom_id,
-                                  "status": "missing_handler"})
+        message = self.session.messages.get(message_id) or {}
+        details = {"operation": "interaction.component", "custom_id": custom_id,
+                   "message_id": message_id, "actor": self.session.active_user.name}
+        if message.get("deleted"):
+            self.session.log("⚠️", "component message is no longer available", "warn", kind="event",
+                             details={**details, "status": "invalid_message"})
+            return
+        if message.get("ephemeral") and message.get("ephemeral_user_id") != str(self.session.active_user.id):
+            self.session.log("🚫", "ephemeral message is only visible to its interaction user", "warn",
+                             kind="event", details={**details, "status": "denied"})
+            return
+        channel = self.session.channels.get(str(message.get("channel") or ""), self.session.channel)
+        allowed, reason = channel.permission_check(self.session.active_user, "view_channel")
+        if not allowed:
+            self.session.log("🚫", f"component use blocked: missing view_channel permission ({reason})", "warn",
+                             kind="event", details={**details, "status": "denied", "permission": "view_channel",
+                                                     "reason": reason})
+            return
+        component = pg._find_component(message.get("components") or [], message.get("v2") or [], custom_id)
+        if component is None or component.get("disabled") or component.get("url"):
+            self.session.log("⚠️", f"component {custom_id!r} is not available on this message", "warn",
+                             kind="event", details={**details, "status": "invalid_component"})
+            return
+        self._refresh_guild_cache()
+        interaction_id, event = self._begin_interaction("interaction.component", "🖱️",
+                                                        f"component used: {custom_id!r}",
+                                                        {**details, "channel": channel.name})
+        self._interaction_users[interaction_id] = self.session.active_user.id
+        self._interaction_channels[interaction_id] = str(channel.id)
+        self._interaction_source_messages[interaction_id] = message_id
+        item_type = self._component_type(message, custom_id)
+        self._send({"type": "component", "interaction_id": interaction_id,
+                    "custom_id": custom_id, "component_type": item_type,
+                    "values": values or [], "channel_id": str(channel.id),
+                    "channel": self._channel_payload(channel),
+                    "guild_id": str(GUILD_ID), "guild": {"id": str(GUILD_ID), "name": self.session.guild.name},
+                    "user": self._member_payload_for(self.session.active_user),
+                    "member": self._member_payload(self.session.active_user),
+                    "permissions": str(channel.permissions_for(self.session.active_user).value),
+                    "app_permissions": str(channel.permissions_for(self.session.guild.me).value),
+                    "message": self._message_event_payload(message_id, message)})
+        await self._settle_interaction(interaction_id, event, f"component {custom_id!r}")
+
+    @staticmethod
+    def _component_type(message: dict, custom_id: str) -> int:
+        item = NodeProjectRuntime._find_component(message, custom_id)
+        if item is None:
+            return 2
+        return {"button": 2, "select": 3, "user_select": 5, "role_select": 6,
+                "mentionable_select": 7, "channel_select": 8}.get((item or {}).get("kind"), 2)
+
+    @staticmethod
+    def _find_component(message: dict, custom_id: str) -> dict | None:
+        for item in message.get("components") or []:
+            if item.get("custom_id") == custom_id:
+                return item
+            for child in item.get("components") or []:
+                if child.get("custom_id") == custom_id:
+                    return child
+        stack = list(message.get("v2") or [])
+        while stack:
+            item = stack.pop()
+            if item.get("custom_id") == custom_id:
+                return item
+            stack.extend(item.get("children") or [])
+            if item.get("accessory"):
+                stack.append(item["accessory"])
+        return None
 
     async def dispatch_submit(self, message_id: str | None, custom_id: str, values: dict) -> None:
-        self.session.log("⚠️", "this Node bot registers no modal handlers", "warn", kind="event",
+        modal = next((item for item in self.session.modals
+                      if item.get("id") == message_id or item.get("custom_id") == custom_id), None)
+        if modal is None:
+            self.session.log("⚠️", "modal is no longer open", "warn", kind="event",
+                             details={"operation": "interaction.modal_submit", "custom_id": custom_id,
+                                      "status": "missing_modal"})
+            return
+        channel = self.session.channels.get(modal.get("channel_id", ""), self.session.channel)
+        self._interaction_counter += 1
+        interaction_id = str(self._interaction_counter)
+        self._interaction_users[interaction_id] = self.session.active_user.id
+        self._interaction_channels[interaction_id] = str(channel.id)
+        self.session.modals.remove(modal)
+        self.session._touch()
+        self.session.log("📝", f"modal submitted: {custom_id!r}", kind="event",
                          details={"operation": "interaction.modal_submit", "custom_id": custom_id,
-                                  "status": "missing_handler"})
+                                  "modal_id": modal["id"], "status": "dispatched"})
+        source = modal.get("source")
+        source_message = self.session.messages.get(source or "")
+        self._send({"type": "modal_submit", "interaction_id": interaction_id,
+                    "custom_id": custom_id, "values": values or {},
+                    "source": source,
+                    "message": self._message_event_payload(source, source_message)
+                    if source and source_message else None,
+                    "channel_id": str(channel.id), "channel": self._channel_payload(channel),
+                    "guild_id": str(GUILD_ID), "guild": {"id": str(GUILD_ID), "name": self.session.guild.name},
+                    "user": self._member_payload_for(self.session.active_user),
+                    "member": self._member_payload(self.session.active_user),
+                    "permissions": str(channel.permissions_for(self.session.active_user).value),
+                    "app_permissions": str(channel.permissions_for(self.session.guild.me).value)})
+        await self._settle()
 
-    async def dispatch_pending_modal(self, values: dict) -> bool:
-        return False
+    async def dispatch_pending_modal(self, values: dict, modal_id: str | None = None) -> bool:
+        if self._pending_modal is None:
+            return False
+        custom_id, source, expected_id = self._pending_modal
+        if modal_id and modal_id != expected_id:
+            return False
+        modal = next((item for item in self.session.modals if item.get("id") == expected_id), None)
+        if modal is None:
+            self._pending_modal = None
+            return False
+        details = {"operation": "interaction.modal_submit", "modal_id": expected_id,
+                   "custom_id": custom_id, "actor": self.session.active_user.name}
+        if modal.get("user_id") != str(self.session.active_user.id):
+            self.session.log("🚫", "modal is only visible to the user who opened it", "warn", kind="event",
+                             details={**details, "status": "denied"})
+            return True
+        if not isinstance(values, dict) or any(
+            (item.get("required") and not pg._modal_value(values, item).strip())
+            or len(pg._modal_value(values, item)) < (item.get("min_length") or 0)
+            or len(pg._modal_value(values, item)) > (item.get("max_length") or 4000)
+            for item in modal.get("items", [])
+        ):
+            self.session.log("⚠️", "modal submission contains an invalid field", "warn", kind="event",
+                             details={**details, "status": "invalid_form"})
+            return True
+        channel = self.session.channels.get(modal.get("channel_id") or "", self.session.channel)
+        self._refresh_guild_cache()
+        interaction_id, event = self._begin_interaction("interaction.modal_submit", "📝",
+                                                        f"modal submitted: {custom_id!r}",
+                                                        {**details, "channel": channel.name})
+        self._interaction_users[interaction_id] = self.session.active_user.id
+        self._interaction_channels[interaction_id] = str(channel.id)
+        self._pending_modal = None
+        self.session.modals.remove(modal)
+        self.session._touch()
+        source_message = self.session.messages.get(source or "")
+        self._send({"type": "modal_submit", "interaction_id": interaction_id,
+                    "custom_id": custom_id, "values": values or {}, "source": source,
+                    "message": self._message_event_payload(source, source_message)
+                    if source and source_message else None,
+                    "channel_id": str(channel.id), "channel": self._channel_payload(channel),
+                    "guild_id": str(GUILD_ID), "guild": {"id": str(GUILD_ID), "name": self.session.guild.name},
+                    "user": self._member_payload_for(self.session.active_user),
+                    "member": self._member_payload(self.session.active_user),
+                    "permissions": str(channel.permissions_for(self.session.active_user).value),
+                    "app_permissions": str(channel.permissions_for(self.session.guild.me).value)})
+        await self._settle_interaction(interaction_id, event, f"modal {custom_id!r}")
+        return True
+
+    def dismiss_modal(self, modal_id: str) -> bool:
+        result = self.session.dismiss_modal(modal_id, self.session.active_user.id)
+        if self._pending_modal and self._pending_modal[2] == modal_id:
+            self._pending_modal = None
+        return result
 
     # ------------------------------------------------ shutdown
 

@@ -75,7 +75,6 @@ def test_e_xpv6_boots_with_cogs_and_syncs():
             assert status["ready"] is True
             assert set(status["cogs"]) >= {"XP", "Admin", "Economy"}
             assert "wizard" in status["commands"]
-            # user message flows into on_message listeners
             await runtime.dispatch_message("hello bot")
             assert any(m["author"]["name"] == "You" for m in session.messages.values())
         finally:
@@ -131,39 +130,31 @@ def test_wire_id_roundtrip():
 
 
 def test_asyncio_run_patch_scoped_to_boot_and_restored_everywhere():
-    """The asyncio.run redirect is installed only during a boot and restored on
-    every exit path: clean boot, boot failure, and shutdown — with an
-    identity guard so a stale runtime's shutdown cannot clobber the real one."""
+    """The asyncio.run redirect is scoped to boot and has an identity-guarded restore."""
     real = bot_runtime._ORIGINAL_ASYNCIO_RUN
-    assert bot_runtime.asyncio.run is real  # untouched at import
-
-    # Install/restore pair is idempotent and identity-guarded.
+    assert bot_runtime.asyncio.run is real
     bot_runtime._install_asyncio_run_patch()
     try:
         assert bot_runtime.asyncio.run is bot_runtime._runtime_asyncio_run_shim
-        bot_runtime._install_asyncio_run_patch()  # double install: no-op
+        bot_runtime._install_asyncio_run_patch()
         assert bot_runtime.asyncio.run is bot_runtime._runtime_asyncio_run_shim
     finally:
         bot_runtime._restore_asyncio_run_patch()
     assert bot_runtime.asyncio.run is real
 
-    # A restore when the shim is NOT active must not clobber a foreign value
-    # (simulates out-of-order shutdown from a stale runtime).
     def foreign():  # pragma: no cover - never called
         raise AssertionError
 
     bot_runtime.asyncio.run = foreign
     try:
         bot_runtime._restore_asyncio_run_patch()
-        assert bot_runtime.asyncio.run is foreign, "stale restore clobbered a foreign patch"
+        assert bot_runtime.asyncio.run is foreign
     finally:
         bot_runtime.asyncio.run = real
-    assert bot_runtime.asyncio.run is real
 
 
 @pytest.mark.timeout(120)
 def test_asyncio_run_restored_after_boot_failure():
-    """A project that raises during boot leaves the real asyncio.run in place."""
     async def run():
         session = _session()
         project = Path(bot_runtime._SANDBOX_ROOT) / "pytest-boot-fail"
@@ -174,6 +165,118 @@ def test_asyncio_run_restored_after_boot_failure():
                 await asyncio.wait_for(bot_runtime.run_project(session, project), timeout=60)
             assert bot_runtime.asyncio.run is bot_runtime._ORIGINAL_ASYNCIO_RUN
         finally:
+            session.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.timeout(120)
+def test_hosted_python_boot_cancellation_is_not_recorded_as_error():
+    async def run():
+        session = _session()
+        project = Path(bot_runtime._SANDBOX_ROOT) / "pytest-boot-cancel"
+        project.mkdir(parents=True, exist_ok=True)
+        (project / "main.py").write_text(
+            "import asyncio\n"
+            "from pathlib import Path\n"
+            "async def main():\n"
+            "    Path('main-started').touch()\n"
+            "    await asyncio.Event().wait()\n",
+            encoding="utf-8",
+        )
+        tag = f"cancel-{id(session):x}"
+        sandbox = Path(bot_runtime._SANDBOX_ROOT) / f"{project.name}-{tag}"
+        errors = []
+        try:
+            boot = asyncio.create_task(bot_runtime.run_project(
+                session, project, tag=tag, on_exception=lambda: errors.append(True)
+            ))
+            async with asyncio.timeout(5):
+                while not (sandbox / "main-started").exists():
+                    if boot.done():
+                        await boot
+                    await asyncio.sleep(0.005)
+            boot.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await boot
+            assert session.last_run is None and errors == []
+            assert not any(event.get("cls") == "error" for event in session.events)
+            assert not sandbox.exists() and str(sandbox) not in bot_runtime.sys.path
+            assert bot_runtime.asyncio.run is bot_runtime._ORIGINAL_ASYNCIO_RUN
+        finally:
+            if not boot.done():
+                boot.cancel()
+            try:
+                await boot
+            except asyncio.CancelledError:
+                pass
+            session.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.timeout(120)
+def test_hosted_python_system_exit_is_reported_and_sandbox_cleaned():
+    async def run():
+        session = _session()
+        project = Path(bot_runtime._SANDBOX_ROOT) / "pytest-system-exit"
+        project.mkdir(parents=True, exist_ok=True)
+        (project / "main.py").write_text("raise SystemExit(7)\n", encoding="utf-8")
+        tag = f"exit-{id(session):x}"
+        sandbox = Path(bot_runtime._SANDBOX_ROOT) / f"{project.name}-{tag}"
+        try:
+            with pytest.raises(RuntimeError, match="SystemExit: 7"):
+                await bot_runtime.run_project(session, project, tag=tag)
+            assert session.last_run["exception"]["type"] == "SystemExit"
+            assert session.last_run["exception"]["file"] == "main.py"
+            assert session.last_run["exception"]["line"] == 1
+            assert not sandbox.exists()
+            assert str(sandbox) not in bot_runtime.sys.path
+            assert bot_runtime.asyncio.run is bot_runtime._ORIGINAL_ASYNCIO_RUN
+        finally:
+            session.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.timeout(120)
+def test_hosted_callback_error_log_uses_sanitized_workspace_traceback(caplog):
+    async def run():
+        session = _session()
+        project = Path(bot_runtime._SANDBOX_ROOT) / f"pytest-callback-log-{id(session):x}"
+        project.mkdir(parents=True, exist_ok=True)
+        (project / "main.py").write_text(
+            "import discord\n"
+            "from discord.ext import commands\n"
+            "bot = commands.Bot(command_prefix='!', intents=discord.Intents.default())\n"
+            "@bot.tree.command(name='fail')\n"
+            "async def fail(interaction):\n"
+            "    raise RuntimeError('callback log failure')\n"
+            "async def main():\n"
+            "    async with bot:\n"
+            "        await bot.start('offline-simulated-token')\n",
+            encoding="utf-8",
+        )
+        sandbox = None
+        runtime = None
+        try:
+            runtime = await asyncio.wait_for(bot_runtime.run_project(session, project), timeout=60)
+            sandbox = runtime.sandbox
+            before = len(caplog.records)
+            await runtime.dispatch_command("fail", {})
+            error = session.last_run["error"]
+            rendered = "\n".join(record.getMessage() for record in caplog.records[before:]) + "\n".join(
+                record.exc_text or "" for record in caplog.records[before:]
+            )
+            assert "callback log failure" in error
+            assert "callback log failure" in rendered
+            assert f"{project.name}/main.py" in error
+            assert str(sandbox) not in error
+            assert str(sandbox) not in rendered
+            assert not any(str(sandbox) in str(event) for event in session.events)
+        finally:
+            if runtime is not None:
+                await runtime.shutdown()
             session.close()
 
     asyncio.run(run())
@@ -229,7 +332,6 @@ def _write_node_project(target: "Path", body: str) -> None:
 
 @pytest.mark.timeout(120)
 def test_node_events_constants_and_options_reach_handlers():
-    """Bots written with Events.* constants + option getters dispatch correctly."""
     async def run():
         session = _session()
         project = Path(bot_runtime._SANDBOX_ROOT) / "pytest-node-events"

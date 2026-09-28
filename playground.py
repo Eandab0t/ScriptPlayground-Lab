@@ -35,7 +35,8 @@ import sys
 import threading
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 
 import discord
 from discord import app_commands
@@ -49,6 +50,7 @@ BOT_ID = 987654321098765432
 GUILD_ID = 900000000000000001
 CHANNEL_ID = 900000000000000002
 MEMBER_IDS = {"Alice": 111111111111111111, "Bob": 222222222222222222, "Carol": 333333333333333333}
+CUSTOM_USER_ID = 444444444444444444
 ROLE_NAMES = ["Members", "Moderators", "Admins"]
 
 
@@ -87,12 +89,19 @@ class MockMember:
         self.display_name = name
         self.global_name = name
         self.bot = bot
+        self.custom = False
+        self.bio = ""
+        self.avatar_url = None
+        self.banner_url = None
+        self.accent_color = None
         self.guild = guild
         self.roles = [guild.roles[0]]
         self.joined_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
         self.status = discord.Status.online
         self.avatar = None
         self.permission_override: discord.Permissions | None = None
+        self.banned = False
+        self.timeout_until: datetime | None = None
 
     @property
     def mention(self) -> str:
@@ -107,7 +116,8 @@ class MockMember:
         if self.bot:
             return discord.Permissions.all()
         permissions = discord.Permissions(view_channel=True, send_messages=True,
-                                          embed_links=True, manage_channels=True)
+                                          embed_links=True, manage_channels=True,
+                                          add_reactions=True)
         for role in self.roles:
             permissions |= role.permissions
         return permissions
@@ -171,12 +181,46 @@ class _FakeResponse:
 _NOT_FOUND = _FakeResponse()
 
 
+_VOICE_ACTIONS = {
+    "join": ("🔊 joined the voice channel", "join"),
+    "leave": ("👋 left the voice channel", None),
+    "mute": ("🔇 muted (simulated)", None),
+    "unmute": ("🎙 unmuted (simulated)", None),
+    "deafen": ("🔇 deafened (simulated)", None),
+    "undeafen": ("🎧 undeafened (simulated)", None),
+}
+
+
 class _ForbiddenResponse(_FakeResponse):
     status = 403
     reason = "Forbidden"
 
 
+class _BadRequestResponse(_FakeResponse):
+    status = 400
+    reason = "Bad Request"
+
+    def json(self):
+        return {"message": "Invalid Form Body", "code": 50035}
+
+
 _FORBIDDEN = _ForbiddenResponse()
+_BAD_REQUEST = _BadRequestResponse()
+
+
+class _MockHTTPException(discord.HTTPException):
+    """Real discord.HTTPException (catchable by bot code) with a mock response."""
+
+    def __init__(self, detail: str):
+        # discord.py renders str(error) from the dict's "message" value and
+        # reads .code from it, mirroring the real API's error JSON where the
+        # "errors" details are flattened into "In <field>: <why>" lines.
+        super().__init__(_BAD_REQUEST, {"message": "Invalid Form Body\n" + detail, "code": 50035})
+
+
+def _invalid_form_body(errors: list[str]) -> discord.HTTPException:
+    """The 400 the real API returns when a payload breaks its limits (code 50035)."""
+    return _MockHTTPException("In " + "\nIn ".join(errors))
 
 
 class MockMessage:
@@ -200,6 +244,11 @@ class MockMessage:
     def embeds(self) -> list[discord.Embed]:
         return [discord.Embed.from_dict(e) for e in (self._session.messages.get(self.id) or {}).get("embeds", [])]
 
+    @property
+    def attachments(self) -> list[dict]:
+        """Uploaded files on this message (name + optional inline data_uri)."""
+        return [dict(f) for f in (self._session.messages.get(self.id) or {}).get("files", [])]
+
     async def edit(self, **kwargs):
         self._session.update_message(self.id, **kwargs)
         return self
@@ -220,8 +269,24 @@ class MockMessage:
         return await self.channel.send(content, **kwargs)
 
     async def add_reaction(self, emoji) -> None:
-        self._session.log("➕", f"reacted {emoji} to message #{self.id}", kind="action",
-                          details={"operation": "message.add_reaction", "message_id": self.id, "emoji": str(emoji)})
+        self._session.toggle_reaction(self.id, str(emoji), user_id=self._session.guild.me.id, actor="bot")
+
+    async def remove_reaction(self, emoji, member=None) -> None:
+        stored = self._session.messages.get(self.id) or {}
+        user_id = member.id if member is not None else self._session.guild.me.id
+        entry = next((r for r in stored.get("reactions", []) if r["emoji"] == str(emoji)), None)
+        if entry is None or str(user_id) not in entry["users"]:
+            self._session.log("⚠️", "remove_reaction targeted a reaction that is not present", "warn", kind="action",
+                              details={"operation": "message.remove_reaction", "message_id": self.id,
+                                       "emoji": str(emoji), "status": "missing_reaction"})
+            return
+        self._session.toggle_reaction(self.id, str(emoji), user_id=user_id, actor="bot")
+
+    async def clear_reactions(self) -> None:
+        stored = self._session.messages.get(self.id) or {}
+        for reaction in list(stored.get("reactions", [])):
+            for user_id in list(reaction["users"]):
+                self._session.toggle_reaction(self.id, reaction["emoji"], user_id=user_id, actor="bot")
 
     async def pin(self, **kwargs) -> None:
         self._session.log("📌", f"message #{self.id} pinned", kind="action",
@@ -379,6 +444,7 @@ class MockResponse:
     def __init__(self, interaction: MockInteraction):
         self._interaction = interaction
         self._done = False
+        self._ephemeral_message_id: str | None = None
 
     @property
     def is_done(self) -> bool:
@@ -392,25 +458,47 @@ class MockResponse:
             raise RuntimeError("This interaction has already been responded to.")
         session = self._interaction._session
         kwargs["author"] = session.guild.me
+        if kwargs.get("ephemeral"):
+            kwargs["ephemeral_user_id"] = self._interaction.user.id
+        else:
+            kwargs.pop("ephemeral_user_id", None)
         msg = await self._interaction.channel.send(content, **kwargs)
         self._done = True
         self._interaction._last = msg.id
+        self._interaction._original_response_id = msg.id
+        if msg._session.messages[msg.id].get("ephemeral"):
+            self._ephemeral_message_id = msg.id
         return msg
 
     async def defer(self, thinking: bool = False, ephemeral: bool = False, **kwargs) -> None:
+        interaction = self._interaction
         self._done = True
-        self._interaction._ephemeral_followups = ephemeral
-        self._interaction._session.log("💭", "interaction deferred (thinking)" if thinking else "interaction deferred")
+        interaction._ephemeral_followups = ephemeral
+        if interaction.message is not None and not thinking:
+            interaction._original_response_id = interaction.message.id
+        else:
+            placeholder = await interaction.channel.send(
+                "Thinking…", ephemeral=ephemeral, author=interaction._session.guild.me,
+                **({"ephemeral_user_id": interaction.user.id} if ephemeral else {}),
+            )
+            interaction._original_response_id = placeholder.id
+            interaction._last = placeholder.id
+        interaction._session.log("💭", "interaction deferred (thinking)" if thinking else "interaction deferred")
 
     async def edit_message(self, content=None, **kwargs) -> MockMessage:
         self._done = True
         session = self._interaction._session
-        session.update_message(self._interaction._last, content=content, **kwargs)
-        return MockMessage(session, self._interaction._last)
+        target = self._interaction.message.id if self._interaction.message else self._interaction._last
+        session.update_message(target, content=content, **kwargs)
+        self._interaction._original_response_id = target
+        return MockMessage(session, target)
 
     async def send_modal(self, modal: discord.ui.Modal) -> None:
         self._done = True
-        self._interaction._session.open_modal(modal, self._interaction._last)
+        self._interaction._session.open_modal(
+            modal, self._interaction._last, channel_id=self._interaction.channel.id,
+            user_id=self._interaction.user.id,
+        )
 
     async def pong(self) -> None:
         self._done = True
@@ -425,14 +513,24 @@ class MockFollowup:
         if "ephemeral" not in kwargs and self._interaction._ephemeral_followups:
             kwargs["ephemeral"] = True
         kwargs["author"] = session.guild.me
+        if kwargs.get("ephemeral"):
+            kwargs["ephemeral_user_id"] = self._interaction.user.id
+        else:
+            kwargs.pop("ephemeral_user_id", None)
         msg = await self._interaction.channel.send(content, **kwargs)
+        if msg._session.messages[msg.id].get("ephemeral"):
+            self._interaction._ephemeral_message_ids.add(msg.id)
         self._interaction._last = msg.id
         return msg
 
     async def edit_message(self, content=None, **kwargs) -> MockMessage:
         session = self._interaction._session
-        session.update_message(self._interaction._last, content=content, **kwargs)
-        return MockMessage(session, self._interaction._last)
+        target = self._interaction._last
+        message = session.messages.get(target or "")
+        if message and message.get("ephemeral") and message.get("ephemeral_user_id") != str(self._interaction.user.id):
+            raise RuntimeError("ephemeral message is only visible to its interaction user")
+        session.update_message(target, content=content, **kwargs)
+        return MockMessage(session, target)
 
 
 class MockInteraction:
@@ -440,7 +538,8 @@ class MockInteraction:
 
     def __init__(self, session: Session, source_message_id: str | None = None,
                  custom_id: str | None = None, values: list | None = None,
-                 interaction_type: discord.InteractionType = discord.InteractionType.application_command):
+                 interaction_type: discord.InteractionType = discord.InteractionType.application_command,
+                 channel_id=None):
         self._session = session
         self._interaction_type = interaction_type
         guild = session.guild
@@ -452,9 +551,9 @@ class MockInteraction:
         self.channel_id = session.channel.id
         self.client = session.client
         self.message = MockMessage(session, source_message_id) if source_message_id else None
-        # an interaction happens in the channel its message lives in
+        # An interaction happens in the channel its message or invocation lives in.
         src = session.messages.get(source_message_id or "") or {}
-        self.channel = session.channels.get(src.get("channel") or "", session.channel)
+        self.channel = session.channels.get(str(src.get("channel") or channel_id or ""), session.channel)
         self.channel_id = self.channel.id
         self.permissions = self.channel.permissions_for(self.user)
         self.app_permissions = self.channel.permissions_for(guild.me)
@@ -464,8 +563,10 @@ class MockInteraction:
         self.token = "mock-token"
         self.application_id = BOT_ID
         self.locale = "en-US"
-        self._last = source_message_id or (session.order[-1] if session.order else None)
+        self._last = source_message_id
+        self._original_response_id: str | None = None
         self._ephemeral_followups = False
+        self._ephemeral_message_ids: set[str] = set()
         self.response = MockResponse(self)
         self.followup = MockFollowup(self)
 
@@ -477,14 +578,29 @@ class MockInteraction:
         return self.response.is_done
 
     async def delete_original_response(self) -> None:
-        self._session.delete_message(self._last)
+        target = self._original_response_id
+        if target is None:
+            raise RuntimeError("This interaction has no original response.")
+        self._session.delete_message(target, actor_id=self.user.id)
 
     async def edit_original_response(self, content=None, **kwargs) -> MockMessage:
-        self._session.update_message(self._last, content=content, **kwargs)
-        return MockMessage(self._session, self._last)
+        target = self._original_response_id
+        if target is None:
+            raise RuntimeError("This interaction has no original response.")
+        msg = self._session.messages.get(target)
+        if msg and msg.get("ephemeral") and msg.get("ephemeral_user_id") != str(self.user.id):
+            raise RuntimeError("ephemeral message is only visible to its interaction user")
+        self._session.update_message(target, content=content, **kwargs)
+        return MockMessage(self._session, target)
 
     async def original_response(self) -> MockMessage:
-        return MockMessage(self._session, self._last)
+        target = self._original_response_id
+        if target is None:
+            raise RuntimeError("This interaction has no original response.")
+        msg = self._session.messages.get(target)
+        if msg and msg.get("ephemeral") and msg.get("ephemeral_user_id") != str(self.user.id):
+            raise RuntimeError("ephemeral message is only visible to its interaction user")
+        return MockMessage(self._session, target)
 
 
 class _CommandRef:
@@ -520,10 +636,15 @@ def _stash_view(view) -> tuple[list[dict] | None, list[dict] | None]:
     (Components V2 — not a View subclass) -> the recursive v2 tree.
     """
     if isinstance(view, discord.ui.View):
-        return [_item_to_json(child) for child in view.children], None
-    if isinstance(view, discord.ui.LayoutView):
-        return None, [_v2_item_to_json(child) for child in view.children]
-    return None, None
+        classic, v2 = [_item_to_json(child) for child in view.children], None
+    elif isinstance(view, discord.ui.LayoutView):
+        classic, v2 = None, [_v2_item_to_json(child) for child in view.children]
+    else:
+        return None, None
+    errors = _component_errors(classic, v2)
+    if errors:
+        raise _invalid_form_body(errors)
+    return classic, v2
 
 
 def _emoji(value) -> str | None:
@@ -601,6 +722,8 @@ _MAX_EVENTS = 1_000
 def _file_info(f) -> dict:
     """Serialize a discord.File: name plus an inline data URI for small images
     (so the UI can show real thumbnails). The stream is restored after reading."""
+    if isinstance(f, dict):  # pre-serialized upload from the browser composer
+        return f
     name = getattr(f, "filename", "file")
     info = {"name": name}
     ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
@@ -681,6 +804,79 @@ def _v2_item_to_json(item) -> dict:
     return {"v2": "unknown", "label": _label_of(item) or name}
 
 
+# Discord payload limits (developers/resources/message#embed-object-embed-limits
+# and developers/components/reference in discord-api-docs). The mock rejects
+# payloads the real API would reject with 400 Invalid Form Body (code 50035).
+_EMBED_LIMITS = {
+    "title": 256,
+    "description": 4096,
+    "footer.text": 2048,
+    "author.name": 256,
+    "field.name": 256,
+    "field.value": 1024,
+}
+_EMBED_TOTAL_LIMIT = 6000
+_EMBED_FIELD_LIMIT = 25
+_CONTENT_LIMIT = 2000
+_BUTTON_LABEL_LIMIT = 80
+_SELECT_PLACEHOLDER_LIMIT = 150
+_SELECT_OPTION_LIMIT = 25
+_V2_COMPONENT_LIMIT = 40
+
+
+def _flatten_v2(items: list[dict]):
+    """Every node of a serialized V2 tree (children + section accessories)."""
+    for item in items:
+        yield item
+        yield from _flatten_v2(item.get("children") or [])
+        yield from _flatten_v2([item["accessory"]]) if item.get("accessory") else ()
+
+
+def _component_errors(classic: list[dict] | None, v2: list[dict] | None) -> list[str]:
+    errors: list[str] = []
+    buttons: dict[int, int] = {}
+    for item in classic or []:
+        if item.get("kind") == "button":
+            if len(item.get("label") or "") > _BUTTON_LABEL_LIMIT:
+                errors.append(f"components: button {item.get('custom_id')!r} label: Must be {_BUTTON_LABEL_LIMIT} or fewer in length")
+            buttons[item.get("row", 0)] = buttons.get(item.get("row", 0), 0) + 1
+        elif item.get("options") is not None:
+            if len(item["options"]) > _SELECT_OPTION_LIMIT:
+                errors.append(f"components: select {item.get('custom_id')!r} options: Must be {_SELECT_OPTION_LIMIT} or fewer in length")
+            if len(item.get("placeholder") or "") > _SELECT_PLACEHOLDER_LIMIT:
+                errors.append(f"components: select {item.get('custom_id')!r} placeholder: Must be {_SELECT_PLACEHOLDER_LIMIT} or fewer in length")
+    errors += [f"components[{row}]: buttons: Must be 5 or fewer in length"
+               for row, count in buttons.items() if count > 5]
+    if v2:
+        flat = list(_flatten_v2(v2))
+        if len(flat) > _V2_COMPONENT_LIMIT:
+            errors.append(f"components: Must be {_V2_COMPONENT_LIMIT} or fewer in length")
+        for item in flat:
+            if item.get("kind") == "button" and len(item.get("label") or "") > _BUTTON_LABEL_LIMIT:
+                errors.append(f"components: button {item.get('custom_id')!r} label: Must be {_BUTTON_LABEL_LIMIT} or fewer in length")
+    return errors
+
+
+def _check_embed(data: dict, index: int) -> None:
+    """Raise the real-API 400 when an embed breaks per-field or 6000-char limits."""
+    checks = [(f"embeds.{index}.{key}", data.get(key.split(".")[0]) if "." not in key
+               else (data.get(key.split(".")[0]) or {}).get(key.split(".")[1]), limit)
+              for key, limit in _EMBED_LIMITS.items()
+              if not key.startswith("field.")]
+    fields = data.get("fields") or []
+    if len(fields) > _EMBED_FIELD_LIMIT:
+        raise _invalid_form_body([f"embeds.{index}.fields: Must be between 0 and {_EMBED_FIELD_LIMIT} in length"])
+    for i, field in enumerate(fields):
+        checks.append((f"embeds.{index}.fields[{i}].name", field.get("name"), 256))
+        checks.append((f"embeds.{index}.fields[{i}].value", field.get("value"), 1024))
+    errors = [f"{key}: Must be {limit} or fewer in length"
+              for key, value, limit in checks if len(value or "") > limit]
+    if sum(len(value or "") for _, value, _ in checks) > _EMBED_TOTAL_LIMIT:
+        errors.append(f"embeds: total content length: Must be {_EMBED_TOTAL_LIMIT} or fewer in length")
+    if errors:
+        raise _invalid_form_body(errors)
+
+
 def _embeds_to_json(kwargs: dict) -> list[dict]:
     if kwargs.get("embeds") is not None:
         raw = list(kwargs["embeds"])
@@ -694,6 +890,7 @@ def _embeds_to_json(kwargs: dict) -> list[dict]:
         data.setdefault("type", "rich")
         for field in data.get("fields", []):
             field.setdefault("inline", False)
+        _check_embed(data, len(out))
         out.append(data)
     return out
 
@@ -769,14 +966,23 @@ def _coerce_arg(session: Session, param: dict, raw):
     return raw
 
 
-async def _do_command(session: Session, name: str, args: dict) -> None:
+async def _do_command(session: Session, name: str, args: dict, channel_id=None) -> None:
     env = session.env
     if not env:
         raise RuntimeError("Nothing is running yet — press Run first.")
+    channel = session.channels.get(str(channel_id or ""), session.channel)
+    if name in session.cmd_objects:
+        allowed, reason = channel.permission_check(session.active_user, "view_channel")
+        if not allowed:
+            session.log("🚫", f"command blocked: missing view_channel permission ({reason})", "warn",
+                        kind="event", details={"operation": "interaction.command", "command": name,
+                                                 "status": "denied", "permission": "view_channel",
+                                                 "reason": reason})
+            return
     command_details = {"operation": "interaction.command", "command": name, "arguments": args}
     event = session.log("⌨️", f"command invoked: /{name}", kind="event",
                         details={**command_details, "interaction": "application_command",
-                                 "actor": session.active_user.name, "channel": session.channel.name,
+                                 "actor": session.active_user.name, "channel": channel.name,
                                  "status": "attempted"})
     event_token = _ACTIVE_EVENT.set(event["id"])
     try:
@@ -801,13 +1007,12 @@ async def _do_command(session: Session, name: str, args: dict) -> None:
         try:
             session.log("⚡", f"interaction.command → /{name}", kind="action",
                         details={**command_details, "actor": session.active_user.name,
-                                 "channel": session.channel.name, "status": "dispatched"})
+                                 "channel": channel.name, "status": "dispatched"})
             interaction = session.build_interaction(
                 source_message_id=None,
                 interaction_type=discord.InteractionType.application_command,
+                channel_id=channel.id,
             )
-            interaction.channel = session.channel
-            interaction.channel_id = session.channel.id
             interaction.command = _CommandRef(name)
             result = cmd._callback(cmd, interaction, **kwargs) if inspect.ismethod(cmd._callback) else cmd._callback(interaction, **kwargs)
             if inspect.isawaitable(result):
@@ -889,7 +1094,14 @@ class Session:
         self.channel = self.make_channel("playground")
         self.client = MockClient(self)
         self.user_id = USER_ID
+        self.voice_channel: str | None = None   # MockChannel.id of the joined voice room
+        self.voice_self_mute = False
+        self.voice_self_deaf = False
+        self.voice_speaking: set[int] = set()   # member ids currently "speaking"
+        self.uploads: list[dict] = []
+        self.banned: dict[int, str] = {}        # banned member ids -> names (absent from the guild)
         self.user_name = USER_NAME
+        self.next_custom_user_id = CUSTOM_USER_ID
         self.events: list[dict] = []
         self.messages: dict[str, dict] = {}
         self.order: list[str] = []
@@ -938,6 +1150,8 @@ class Session:
         return event
 
     def add_message(self, content=None, **kwargs) -> dict:
+        if content is not None and len(str(content)) > _CONTENT_LIMIT:
+            raise _invalid_form_body([f"content: Must be {_CONTENT_LIMIT} or fewer in length"])
         mid = f"m{self.next_index}"
         self.next_index += 1
         files = kwargs.get("files") or ([kwargs["file"]] if kwargs.get("file") else [])
@@ -949,7 +1163,10 @@ class Session:
         msg = {
             "id": mid,
             "index": len(self.order) + 1,
-            "author": {"id": author.id, "name": author.name, "bot": author.bot},
+            "author": {"id": author.id, "name": author.display_name, "display_name": author.display_name,
+                       "username": author.name, "avatar_url": author.avatar_url,
+                       "banner_url": author.banner_url, "bio": author.bio,
+                       "accent_color": author.accent_color, "bot": author.bot},
             "channel": channel_key,
             "command": command_chip,
             "content": content if content is not None else "",
@@ -957,6 +1174,9 @@ class Session:
             "components": classic,
             "v2": v2,
             "ephemeral": bool(kwargs.get("ephemeral")),
+            "ephemeral_user_id": str(kwargs["ephemeral_user_id"])
+            if kwargs.get("ephemeral") and kwargs.get("ephemeral_user_id") is not None else None,
+            "banner_url": author.banner_url, "bio": author.bio,
             "files": [_file_info(f) for f in files],
             "revision": 0,
             "deleted": False,
@@ -977,9 +1197,11 @@ class Session:
             self.log("⚠️", "edit_message targeted a missing message; ignored", "warn", kind="action",
                      details={"operation": "message.edit", "message_id": message_id, "status": "missing_message"})
             return
-        if content is not None and not isinstance(content, str):
-            content = str(content)
-        msg["content"] = content or ""
+        if content is not None:
+            text = content if isinstance(content, str) else str(content)
+            if len(text) > _CONTENT_LIMIT:
+                raise _invalid_form_body([f"content: Must be {_CONTENT_LIMIT} or fewer in length"])
+            msg["content"] = text
         embeds = _embeds_to_json(kwargs)
         if kwargs.get("embed") is not None or kwargs.get("embeds") is not None:
             msg["embeds"] = embeds
@@ -992,11 +1214,230 @@ class Session:
                  details={"operation": "message.edit", "message_id": msg["id"],
                           "content": msg["content"]})
 
-    def delete_message(self, message_id: str | None) -> None:
+    # -- reactions ---------------------------------------------------------
+
+    def toggle_reaction(self, message_id: str, emoji: str, *, user_id: int, actor: str = "user") -> bool:
+        """Toggle one user's reaction on a message; returns True if it was added.
+
+        Raises KeyError when the message is missing or deleted, ValueError when
+        the emoji is malformed, and discord.Forbidden when the actor lacks the
+        add_reactions permission.
+        """
+        msg = self.messages.get(message_id or "")
+        if msg is None or msg["deleted"]:
+            raise KeyError(message_id)
+        emoji = str(emoji or "").strip()
+        if not emoji or len(emoji) > 32:
+            raise ValueError("invalid emoji")
+        member = self.guild.get_member(int(user_id))
+        if member is not None:
+            channel = self.channels.get(msg.get("channel") or "", self.channel)
+            allowed, reason = channel.permission_check(member, "add_reactions")
+            if not allowed:
+                if actor == "user":
+                    self.log("🚫", f"reaction {emoji} blocked: missing add_reactions permission ({reason})",
+                             "warn", kind="action",
+                             details={"operation": "message.toggle_reaction", "emoji": emoji,
+                                      "message_id": message_id, "status": "denied",
+                                      "permission": "add_reactions", "reason": reason,
+                                      "actor": member.name})
+                    raise discord.Forbidden(_FORBIDDEN,
+                                            f"missing add_reactions permission ({reason})")
+                return False
+        reactions = msg.setdefault("reactions", [])
+        for reaction in reactions:
+            if reaction["emoji"] == emoji:
+                if str(user_id) in reaction["users"]:
+                    reaction["users"].remove(str(user_id))
+                    if not reaction["users"]:
+                        reactions.remove(reaction)
+                    added = False
+                else:
+                    reaction["users"].append(str(user_id))
+                    added = True
+                break
+        else:
+            reactions.append({"emoji": emoji, "users": [str(user_id)]})
+            added = True
+        msg["revision"] += 1
+        self._touch()
+        self.log("➕" if added else "➖", f"reaction {emoji} on message #{msg['index']}", kind="action",
+                 details={"operation": "message.toggle_reaction", "emoji": emoji, "message_id": message_id,
+                          "user_id": str(user_id), "status": "success"})
+        return added
+
+    # -- voice (pure simulation; no audio is captured or transmitted) --------
+
+    def voice_action(self, action: str, *, channel_id: str | None = None) -> dict:
+        """Simulated voice state change for the active user; returns the new state."""
+        if action not in _VOICE_ACTIONS:
+            raise ValueError(f"unknown voice action {action!r}")
+        user = self.active_user
+        if user.bot:
+            raise ValueError("the bot cannot join a voice channel")
+        if action == "join":
+            channel = self.channels.get(str(channel_id or ""))
+            if channel is None:
+                raise ValueError("unknown voice channel")
+            self.voice_channel = channel.id
+        elif action == "leave":
+            self.voice_channel = None
+            self.voice_speaking.clear()
+        elif action == "mute":
+            self.voice_self_mute = True
+            self.voice_speaking.discard(user.id)
+        elif action == "unmute":
+            self.voice_self_mute = False
+            self.voice_speaking.add(user.id)  # unmuted = talking, in simulation
+        elif action == "deafen":
+            self.voice_self_deaf = True
+            self.voice_self_mute = True
+            self.voice_speaking.clear()
+        elif action == "undeafen":
+            self.voice_self_deaf = False
+            self.voice_self_mute = False
+        text, sound = _VOICE_ACTIONS[action]
+        self.log("🎧", text, kind="event",
+                 details={"operation": "voice.simulate", "action": action,
+                          "actor": user.name, "channel":
+                          (self.channels.get(str(self.voice_channel)).name
+                           if self.voice_channel is not None else None),
+                          "status": "success"})
+        self._touch()
+        return {"action": action, "sound": sound}
+
+    # -- uploads (local pass-through; data stays in the session) -------------
+
+    def add_upload(self, name: str, size: int, content_type: str, data_uri: str | None) -> dict:
+        """Register a browser-side upload; small images are inlined as data URIs."""
+        clean = re.sub(r"[^A-Za-z0-9_. ()-]", "_", (name or "file").strip())[:80] or "file"
+        entry = {"name": clean, "size": int(size), "content_type": content_type or "",
+                 "data_uri": data_uri, "timestamp": _now()}
+        self.uploads.append(entry)
+        if len(self.uploads) > 25:
+            del self.uploads[:-25]
+        image = data_uri is not None and content_type.startswith("image/")
+        self.log("📎", f"uploaded {clean} ({int(size) / 1024:.1f} KiB)", kind="action",
+                 details={"operation": "message.attachment", "file": clean,
+                          "size": int(size), "inlined": bool(image), "status": "success"})
+        self._touch()
+        return entry
+
+    def delete_upload(self, index: int) -> None:
+        if not 0 <= index < len(self.uploads):
+            raise KeyError(index)
+        removed = self.uploads.pop(index)
+        self.log("🗑", f"removed upload {removed['name']}", kind="action",
+                 details={"operation": "message.attachment", "file": removed["name"],
+                          "status": "deleted"})
+        self._touch()
+
+    # -- moderation (kick / ban / timeout) -----------------------------------
+
+    def _moderator_check(self, permission: str) -> MockMember:
+        actor = self.active_user
+        allowed, reason = self.channel.permission_check(actor, permission)
+        if not allowed:
+            self.log("🚫", f"moderation blocked: missing {permission} permission ({reason})", "warn",
+                     kind="event", details={"operation": "member.moderate", "permission": permission,
+                                              "actor": actor.name, "status": "denied"})
+            raise discord.Forbidden(_FORBIDDEN, f"missing {permission} permission ({reason})")
+        return actor
+
+    def kick_member(self, user_id: int) -> None:
+        """Remove a simulated member; add_member recreates them from scratch."""
+        actor = self._moderator_check("kick_members")
+        member = self.guild.get_member(int(user_id))
+        if member is None or member.bot:
+            raise ValueError("unknown simulated user")
+        if member.id == USER_ID:
+            raise ValueError("the server owner cannot be kicked")
+        member.banned = False
+        self.guild.members.remove(member)
+        self.log("👢", f"{member.name} was kicked by {actor.name}", kind="event",
+                 details={"operation": "member.kick", "actor": actor.name,
+                          "target": member.name, "status": "success"})
+        self._touch()
+
+    def ban_member(self, user_id: int) -> None:
+        actor = self._moderator_check("ban_members")
+        member = self.guild.get_member(int(user_id))
+        if member is None or member.bot:
+            raise ValueError("unknown simulated user")
+        if member.id == USER_ID:
+            raise ValueError("the server owner cannot be banned")
+        member.banned = True
+        member.timeout_until = None
+        self.banned[int(user_id)] = member.name
+        self.guild.members.remove(member)
+        self.log("🔨", f"{member.name} was banned by {actor.name}", kind="event",
+                 details={"operation": "member.ban", "actor": actor.name,
+                          "target": member.name, "status": "success"})
+        self._touch()
+
+    def timeout_member(self, user_id: int, minutes: int) -> None:
+        actor = self._moderator_check("moderate_members")
+        member = self.guild.get_member(int(user_id))
+        if member is None or member.bot:
+            raise ValueError("unknown simulated user")
+        minutes = int(minutes or 0)
+        if minutes <= 0:  # clearing an existing timeout
+            member.timeout_until = None
+            self.log("⏳", f"{member.name}'s timeout was removed by {actor.name}", kind="event",
+                     details={"operation": "member.timeout", "actor": actor.name, "target": member.name,
+                              "minutes": 0, "status": "success"})
+            self._touch()
+            return
+        minutes = min(minutes, 40320)  # real API caps at 28 days
+        member.timeout_until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+        self.log("⏳", f"{member.name} was timed out for {minutes} min by {actor.name}", kind="event",
+                 details={"operation": "member.timeout", "actor": actor.name, "target": member.name,
+                          "minutes": minutes, "status": "success"})
+        self._touch()
+
+    def unban_member(self, user_id: int) -> None:
+        """Remove a ban; absent members are recreated fresh (custom profiles reset)."""
+        actor = self._moderator_check("ban_members")
+        member = self.guild.get_member(int(user_id))
+        if member is not None:
+            member.banned = False
+            member.timeout_until = None
+            target, name = member, member.name
+        else:
+            name = self.banned.pop(int(user_id), None)
+            if name is None:
+                raise ValueError("that user is not banned")
+            target = self.guild._member(int(user_id), name)
+            self.guild.members.append(target)
+        target.banned = False
+        target.timeout_until = None
+        self.log("🕊", f"{name} was unbanned by {actor.name}", kind="event",
+                 details={"operation": "member.unban", "actor": actor.name,
+                          "target": name, "status": "success"})
+        self._touch()
+
+    def create_text_channel_ui(self, name: str, topic: str | None = None) -> MockChannel:
+        """User-driven channel creation (same normalization as bot-side make_channel)."""
+        actor = self._moderator_check("manage_channels")
+        channel = self.make_channel(name)
+        channel.topic = (topic or "").strip()[:1024] or None
+        self.log("📋", f"#{channel.name} was created by {actor.name}", kind="event",
+                 details={"operation": "channel.create", "actor": actor.name,
+                          "channel": channel.name, "status": "success"})
+        self._touch()
+        return channel
+
+    def delete_message(self, message_id: str | None, *, actor_id: int | None = None) -> None:
         msg = self.messages.get(message_id or "")
         if msg is None or msg["deleted"]:
             self.log("⚠️", "delete_message targeted a missing message; ignored", "warn", kind="action",
                      details={"operation": "message.delete", "message_id": message_id, "status": "missing_message"})
+            return
+        if msg.get("ephemeral") and actor_id is not None \
+                and msg.get("ephemeral_user_id") != str(actor_id):
+            self.log("🚫", "ephemeral message is only visible to its interaction user", "warn",
+                     kind="action", details={"operation": "message.delete", "message_id": message_id,
+                                              "status": "denied", "permission": "ephemeral_owner_only"})
             return
         msg["deleted"] = True
         if message_id in self.order:
@@ -1005,21 +1446,49 @@ class Session:
         self.log("🗑️", f"message #{msg['index']} deleted", kind="action",
                  details={"operation": "message.delete", "message_id": message_id})
 
-    def open_modal(self, modal: discord.ui.Modal, source_message_id: str | None) -> None:
+    def open_modal(self, modal: discord.ui.Modal, source_message_id: str | None,
+                   channel_id=None, user_id=None, custom_id=None) -> dict:
         title = modal.title if isinstance(modal.title, str) else "Modal"
-        self.modals.append(
-            {
-                "id": f"mo{self.next_modal_id}",
-                "title": title,
-                "items": [_item_to_json(child) for child in modal.children],
-                "source": source_message_id,
-            }
+        items = [_item_to_json(child) for child in modal.children]
+        return self.open_modal_payload(
+            title, items, source_message_id, channel_id=channel_id, user_id=user_id,
+            custom_id=custom_id or getattr(modal, "custom_id", None),
         )
+
+    def open_modal_payload(self, title: str, items: list[dict], source_message_id: str | None,
+                           *, channel_id=None, custom_id=None, user_id=None) -> dict:
+        modal = {
+            "id": f"mo{self.next_modal_id}", "title": title,
+            "items": items, "source": source_message_id,
+            "channel_id": str(channel_id or (self.messages.get(source_message_id or "") or {}).get("channel")
+                               or self.channel.id),
+            "user_id": str(self.active_user.id if user_id is None else user_id),
+        }
+        if custom_id:
+            modal["custom_id"] = str(custom_id)
+        self.modals.append(modal)
         self.next_modal_id += 1
         self._touch()
         self.log("📋", f"modal opened: {title!r}", kind="action",
                  details={"operation": "interaction.response.send_modal", "title": title,
                           "source_message_id": source_message_id})
+        return modal
+
+    def dismiss_modal(self, modal_id: str, user_id: int) -> bool:
+        modal = next((item for item in self.modals if item["id"] == str(modal_id)), None)
+        if modal is None:
+            return False
+        if modal.get("user_id") not in (None, str(user_id)):
+            raise ValueError("modal is only visible to the user who opened it")
+        self.modals.remove(modal)
+        self._touch()
+        return True
+
+    def visible_messages(self, user_id: int) -> list[dict]:
+        return [self.messages[mid] for mid in self.order if mid in self.messages
+                and not self.messages[mid].get("deleted")
+                and (not self.messages[mid].get("ephemeral")
+                     or self.messages[mid].get("ephemeral_user_id") == str(user_id))]
 
     def clear_timeline(self) -> None:
         self.messages.clear()
@@ -1090,10 +1559,105 @@ class Session:
         self.user_name = self.active_user.name
         self._touch()
 
+    def add_member(self, username: str, profile: dict | None = None) -> MockMember:
+        username = username.strip() if isinstance(username, str) else ""
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,32}", username):
+            raise ValueError("username must be 1–32 letters, numbers, dots, dashes, or underscores")
+        if any(not member.bot and member.name.casefold() == username.casefold()
+               for member in self.guild.members):
+            raise ValueError("that username already exists")
+        if sum(member.custom for member in self.guild.members) >= 20:
+            raise ValueError("a simulation can have at most 20 added users")
+        member = self.guild._member(self.next_custom_user_id, username)
+        member.custom = True
+        self.guild.members.append(member)
+        try:
+            if profile:
+                self.update_member_profile(member.id, {**profile, "username": username})
+        except (TypeError, ValueError):
+            self.guild.members.remove(member)
+            raise
+        self.next_custom_user_id += 1
+        self._touch()
+        self.log("➕", f"simulated user added: {username}", details={"user_id": str(member.id)})
+        return member
+
+    def update_member_profile(self, user_id: int, profile: dict) -> None:
+        member = self.guild.get_member(user_id)
+        if member is None or member.bot:
+            raise ValueError("unknown simulated user")
+        if not isinstance(profile, dict):
+            raise TypeError("profile must be an object")
+        allowed = {"user_id", "username", "display_name", "bio", "avatar_url",
+                   "banner_url", "accent_color", "status"}
+        if set(profile) - allowed:
+            raise ValueError("profile contains an unsupported field")
+
+        def text_field(key: str, default: str, maximum: int) -> str:
+            value = profile.get(key, default)
+            if not isinstance(value, str):
+                raise TypeError(f"{key} must be text")
+            value = value.strip()
+            if len(value) > maximum:
+                raise ValueError(f"{key} must be at most {maximum} characters")
+            return value
+
+        username = text_field("username", member.name, 32)
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,32}", username):
+            raise ValueError("username must be 1–32 letters, numbers, dots, dashes, or underscores")
+        if any(other is not member and not other.bot and other.name.casefold() == username.casefold()
+               for other in self.guild.members):
+            raise ValueError("that username already exists")
+        display_name = text_field("display_name", member.display_name, 32) or username
+        bio = text_field("bio", member.bio, 190)
+
+        def image_url(key: str) -> str | None:
+            value = profile.get(key, getattr(member, key))
+            if value is None or value == "":
+                return None
+            if not isinstance(value, str) or len(value) > 1000:
+                raise ValueError(f"{key} must be an http(s) image URL under 1000 characters")
+            try:
+                parsed = urlsplit(value.strip())
+            except ValueError as error:
+                raise ValueError(f"{key} must be an http(s) image URL") from error
+            if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                raise ValueError(f"{key} must be an http(s) image URL")
+            return value.strip()
+
+        avatar_url = image_url("avatar_url")
+        banner_url = image_url("banner_url")
+        accent_color = profile.get("accent_color", member.accent_color)
+        if accent_color in (None, ""):
+            accent_color = None
+        elif not isinstance(accent_color, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", accent_color):
+            raise ValueError("accent_color must be a six-digit hex color")
+        else:
+            accent_color = accent_color.lower()
+        status = profile.get("status", getattr(member.status, "name", "online"))
+        if not isinstance(status, str) or status.lower() not in {
+            "online", "idle", "dnd", "invisible", "offline",
+        }:
+            raise ValueError("status must be online, idle, dnd, invisible, or offline")
+
+        member.name = username
+        member.global_name = display_name
+        member.display_name = display_name
+        member.bio = bio
+        member.avatar_url = avatar_url
+        member.banner_url = banner_url
+        member.accent_color = accent_color
+        member.status = getattr(discord.Status, status.lower())
+        if self.user_id == member.id:
+            self.user_name = username
+        self._touch()
+        self.log("🪪", f"profile updated for {username}", details={"user_id": str(member.id)})
+
     def build_interaction(self, source_message_id: str | None = None,
                           custom_id: str | None = None, values: list | None = None,
-                          interaction_type: discord.InteractionType = discord.InteractionType.application_command) -> MockInteraction:
-        return MockInteraction(self, source_message_id, custom_id, values, interaction_type)
+                          interaction_type: discord.InteractionType = discord.InteractionType.application_command,
+                          channel_id=None) -> MockInteraction:
+        return MockInteraction(self, source_message_id, custom_id, values, interaction_type, channel_id)
 
     def restart(self) -> None:
         """Boot a fresh runtime (fresh thread + loop); the timeline is cleared."""
@@ -1262,18 +1826,49 @@ async def _run_main(main_fn, session: Session, started: asyncio.Event) -> None:
         session.last_run = {"ok": False, "error": tb, "exception": _script_error_details(error), "ms": 0.0}
 
 
+def _find_component(components: list[dict], v2: list[dict], custom_id: str) -> dict | None:
+    for item in components:
+        if item.get("custom_id") == custom_id:
+            return item
+    stack = list(v2)
+    while stack:
+        item = stack.pop()
+        if item.get("custom_id") == custom_id:
+            return item
+        stack.extend(item.get("children") or [])
+        if item.get("accessory"):
+            stack.append(item["accessory"])
+    return None
+
+
 async def _do_click(session: Session, message_id: str, custom_id: str, values: list) -> None:
     env = session.env
     if not env:
         raise RuntimeError("Nothing is running yet — press Run first.")
-    handler = env.get("on_click")
     message = session.messages.get(message_id) or {}
-    channel = session.channels.get(message.get("channel") or "", session.channel)
+    if message.get("ephemeral") and message.get("ephemeral_user_id") != str(session.active_user.id):
+        session.log("🚫", "ephemeral message is only visible to its interaction user", "warn", kind="event",
+                    details={"operation": "interaction.component", "message_id": message_id,
+                             "actor": session.active_user.name, "status": "denied"})
+        return
+    handler = env.get("on_click")
+    channel = session.channels.get(str(message.get("channel") or ""), session.channel)
     click_details = {"interaction": "component", "custom_id": custom_id,
                      "message_id": message_id, "values": values,
                      "actor": session.active_user.name, "channel": channel.name}
     event = session.log("🖱️", f"component used: {custom_id!r}", kind="event",
                         details={**click_details, "status": "attempted"})
+    allowed, reason = channel.permission_check(session.active_user, "view_channel")
+    if not allowed:
+        session.log("🚫", f"component use blocked: missing view_channel permission ({reason})", "warn",
+                    kind="event", details={**click_details, "status": "denied", "permission": "view_channel",
+                                           "reason": reason})
+        return
+    component = _find_component(message.get("components") or [], message.get("v2") or [], custom_id)
+    if not component or component.get("disabled") or message.get("deleted"):
+        session.log("⚠️", f"component {custom_id!r} is not available on this message", "warn", kind="event",
+                    details={**click_details, "status": "invalid_component"})
+        return
     if not callable(handler):
         session.log("⚠️", f"clicked {custom_id!r} but no `on_click` handler is defined", "warn",
                     kind="event", details={**click_details, "status": "missing_handler"})
@@ -1299,29 +1894,67 @@ async def _do_click(session: Session, message_id: str, custom_id: str, values: l
         _ACTIVE_EVENT.reset(event_token)
 
 
+def _modal_value(values: dict, item: dict) -> str:
+    """Read a field by its Discord custom ID, with a label alias for older clients."""
+    custom_id = item.get("custom_id")
+    if custom_id in values:
+        return str(values[custom_id] or "")
+    label = item.get("label")
+    if isinstance(label, str):
+        key = re.sub(r"[^a-z0-9]+", "", label.casefold())
+        for name, value in values.items():
+            if re.sub(r"[^a-z0-9]+", "", str(name).casefold()) == key:
+                return str(value or "")
+    return ""
+
+
 async def _do_submit(session: Session, modal_id: str, values: dict) -> None:
     env = session.env
     if not env:
         raise RuntimeError("Nothing is running yet — press Run first.")
     handler = env.get("on_submit")
     modal = next((m for m in session.modals if m["id"] == modal_id), None)
+    if modal is None:
+        session.log("⚠️", f"modal {modal_id!r} is no longer open", "warn", kind="event",
+                    details={"operation": "interaction.modal_submit", "modal_id": modal_id,
+                             "status": "missing_modal"})
+        return
+    if modal.get("user_id") not in (None, str(session.active_user.id)):
+        session.log("🚫", "modal is only visible to the user who opened it", "warn", kind="event",
+                    details={"operation": "interaction.modal_submit", "modal_id": modal_id,
+                             "actor": session.active_user.name, "status": "denied"})
+        return
+    for item in modal.get("items", []):
+        value = _modal_value(values, item)
+        if item.get("required") and not value.strip():
+            session.log("⚠️", f"modal field {item.get('label') or item.get('custom_id')!r} is required", "warn",
+                        kind="event", details={"operation": "interaction.modal_submit", "modal_id": modal_id,
+                                                 "status": "invalid_form"})
+            return
+        if len(value) < (item.get("min_length") or 0) or len(value) > (item.get("max_length") or 4000):
+            session.log("⚠️", f"modal field {item.get('label') or item.get('custom_id')!r} has invalid length", "warn",
+                        kind="event", details={"operation": "interaction.modal_submit", "modal_id": modal_id,
+                                                 "status": "invalid_form"})
+            return
     source = session.messages.get((modal or {}).get("source") or "") or {}
-    channel = session.channels.get(source.get("channel") or "", session.channel)
+    channel = session.channels.get(
+        (modal or {}).get("channel_id") or source.get("channel") or "", session.channel
+    )
     submit_details = {"interaction": "modal_submit", "modal_id": modal_id, "values": values,
                       "actor": session.active_user.name, "channel": channel.name}
     event = session.log("📝", f"modal submitted: {modal_id!r}", kind="event",
                         details={**submit_details, "status": "attempted"})
+    session.modals.remove(modal)
+    session._touch()
     if not callable(handler):
         session.log("⚠️", f"modal {modal_id} submitted but no `on_submit` handler is defined", "warn",
                     kind="event", details={**submit_details, "status": "missing_handler"})
         return
-    if modal is not None:
-        session.modals.remove(modal)
     event_token = _ACTIVE_EVENT.set(event["id"])
     try:
         interaction = session.build_interaction(
-            modal["source"] if modal else None,
-            interaction_type=discord.InteractionType.modal_submit,
+            modal["source"], interaction_type=discord.InteractionType.modal_submit,
+            channel_id=channel.id,
         )
         result = _call(handler, interaction, values, modal_id)
         if inspect.isawaitable(result):
@@ -1339,7 +1972,8 @@ async def _do_submit(session: Session, modal_id: str, values: dict) -> None:
         _ACTIVE_EVENT.reset(event_token)
 
 
-async def _do_message(session: Session, content: str, channel_id=None) -> None:
+async def _do_message(session: Session, content: str, channel_id=None,
+                      files: list[dict] | None = None) -> None:
     """The composer sent a chat message; hand it to on_message if defined."""
     env = session.env
     if not env:
@@ -1352,13 +1986,15 @@ async def _do_message(session: Session, content: str, channel_id=None) -> None:
                                            "channel": channel.name, "actor": session.active_user.name,
                                            "permission": "send_messages", "reason": reason, "status": "denied"})
         return
-    msg = session.add_message(channel_id=channel_id, content=content,
-                              author=session.active_user)
+    msg = session.add_message(channel_id=channel.id, content=content,
+                              author=session.active_user, files=files or None)
     handle = MockMessage(session, msg["id"], msg.get("author_obj"))
     handler = env.get("on_message")
     message_details = {"interaction": "message_create", "operation": "message.send",
                        "message_id": msg["id"],        "channel": channel.name, "channel_id": str(channel.id), "actor": session.active_user.name,
                        "content": content, "status": "dispatched" if callable(handler) else "missing_handler"}
+    if files:
+        message_details["files"] = [f.get("name") for f in files]
 
     event = session.log("💬", f"message received from {session.active_user.name}",
                         None if callable(handler) else "warn", kind="event", details=message_details)
@@ -1430,20 +2066,20 @@ async def dispatch_submit(session: Session, modal_id: str, values: dict,
 
 
 async def dispatch_message(session: Session, content: str, channel_id=None,
-                           timeout: float = 10.0) -> dict:
-    return await _dispatch(session, lambda: _do_message(session, content, channel_id), timeout)
+                           timeout: float = 10.0, files: list[dict] | None = None) -> dict:
+    return await _dispatch(session, lambda: _do_message(session, content, channel_id, files), timeout)
 
 
-async def dispatch_command(session: Session, name: str, args: dict,
+async def dispatch_command(session: Session, name: str, args: dict, channel_id=None,
                            timeout: float = 10.0) -> dict:
-    return await _dispatch(session, lambda: _do_command(session, name, args), timeout)
+    return await _dispatch(session, lambda: _do_command(session, name, args, channel_id), timeout)
 
 
 # --------------------------------------------------------------- state
 
 
 def _members_json(session: Session) -> dict:
-    names = {str(m.id): m.name for m in session.guild.members}
+    names = {str(m.id): m.display_name for m in session.guild.members}
     names.update({f"&{r.id}": r.name for r in session.guild.roles})
     names.update({f"#{c.id}": c.name for c in session.channels.values()})
     return names
@@ -1457,9 +2093,18 @@ def _member_details_json(session: Session) -> list[dict]:
         status = getattr(member.status, "name", str(member.status))
         details.append({
             "id": str(member.id),
-            "name": member.name,
+            "name": member.display_name,
+            "username": member.name,
+            "display_name": member.display_name,
+            "bio": member.bio,
+            "avatar_url": member.avatar_url,
+            "banner_url": member.banner_url,
+            "accent_color": member.accent_color,
+            "custom": member.custom,
             "bot": member.bot,
             "status": status,
+            "banned": member.banned,
+            "timed_out": bool(member.timeout_until and member.timeout_until > datetime.now(timezone.utc)),
             "role": role.name if role else None,
             "role_color": f"#{color:06x}" if color is not None else None,
         })
@@ -1484,8 +2129,10 @@ def state(session: Session) -> dict:
     return {
         "ok": True,
         "sid": session.sid,
-        "user": {"id": str(session.user_id), "name": session.user_name},
-        "users": [{"id": str(member.id), "name": member.name}
+        "user": {"id": str(session.user_id), "name": session.active_user.display_name},
+        "users": [{"id": str(member.id), "name": member.display_name,
+                   "display_name": member.display_name, "username": member.name,
+                   "custom": member.custom}
                   for member in session.guild.members if not member.bot],
         "guild": {"id": session.guild.id, "name": session.guild.name},
         "channel": {"id": str(session.channel.id), "name": session.channel.name,
@@ -1498,29 +2145,50 @@ def state(session: Session) -> dict:
         "permissions": permissions,
         "members": _members_json(session),
         "member_details": _member_details_json(session),
-        "messages": msgs,
-        "modals": session.modals,
+        "messages": [msg for msg in msgs if not msg.get("ephemeral")
+                     or msg.get("ephemeral_user_id") == str(session.active_user.id)],
+        "modals": [modal for modal in session.modals
+                   if modal.get("user_id") in (None, str(session.active_user.id))],
         "commands": session.commands,
         "events": events,
         "last_run": session.last_run,
         "running": session.env is not None,
+        "voice": {"channel": str(session.voice_channel) if session.voice_channel is not None else None,
+                  "name": (session.channels.get(str(session.voice_channel)).name
+                           if session.voice_channel is not None else None),
+                  "self_mute": session.voice_self_mute,
+                  "self_deaf": session.voice_self_deaf,
+                  "speaking": [str(member_id) for member_id in session.voice_speaking]},
+        "uploads": session.uploads,
+        "banned": [{"id": str(member_id), "name": name} for member_id, name in session.banned.items()],
     }
 
 
+_SCENARIO_PROFILE_FIELDS = {
+    "username", "display_name", "bio", "avatar_url", "banner_url", "accent_color", "status",
+}
+_SCENARIO_PERMISSION_FIELDS = frozenset(discord.Permissions.VALID_FLAGS)
 _SCENARIO_ACTIONS = {
     "message": {"action", "content", "as", "channel"},
     "click": {"action", "message_id", "custom_id", "values", "as"},
     "submit": {"action", "modal_id", "values", "as"},
     "command": {"action", "name", "args", "channel", "as"},
+    "profile": {"action", "user", "profile"},
+    "roles": {"action", "user", "add", "remove"},
+    "permissions": {"action", "channel", "target", "overwrites"},
 }
+
+
 _SCENARIO_ASSERTIONS = {
     "message_exists": {"assert", "message_id", "content", "channel"},
     "content": {"assert", "message_id", "equals"},
     "embed_field": {"assert", "message_id", "embed", "name", "value"},
+    "embed_description": {"assert", "message_id", "embed", "description"},
     "component_exists": {"assert", "message_id", "custom_id"},
+    "member_profile": {"assert", "user", *_SCENARIO_PROFILE_FIELDS},
     "channel_exists": {"assert", "name"},
     "channel_missing": {"assert", "name"},
-    "event_occurred": {"assert", "text", "interaction", "operation", "custom_id", "status"},
+    "event_occurred": {"assert", "text", "interaction", "operation", "custom_id", "actor", "status"},
 }
 
 
@@ -1551,6 +2219,8 @@ def validate_scenario(scenario: dict) -> dict:
             required = {
                 "message": ("content",), "click": ("message_id", "custom_id"),
                 "submit": ("modal_id",), "command": ("name",),
+                "profile": ("user", "profile"), "roles": ("user",),
+                "permissions": ("channel", "target", "overwrites"),
             }[discriminator]
             if any(key not in raw for key in required):
                 raise ValueError(f"step {index}: {discriminator} requires {', '.join(required)}")
@@ -1563,9 +2233,42 @@ def validate_scenario(scenario: dict) -> dict:
                 raise ValueError(f"step {index}: submit values must be an object")
             if "args" in raw and not isinstance(raw["args"], dict):
                 raise ValueError(f"step {index}: args must be an object")
-            for key in ("as", "channel"):
-                if key in raw and (isinstance(raw[key], bool) or not isinstance(raw[key], (str, int))):
-                    raise ValueError(f"step {index}: {key} must be a user/channel name or ID")
+            if "channel" in raw and discriminator in {"message", "command", "permissions"} \
+                    and (not isinstance(raw["channel"], str) or not raw["channel"].strip()):
+                raise ValueError(f"step {index}: channel must be a channel name or ID")
+            if discriminator == "roles":
+                if not any(raw.get(key) for key in ("add", "remove")):
+                    raise ValueError(f"step {index}: roles needs a non-empty add or remove list")
+                for key in ("add", "remove"):
+                    if key in raw and (not isinstance(raw[key], list) or any(
+                        isinstance(role, bool) or not isinstance(role, (str, int))
+                        or isinstance(role, str) and not role.strip() for role in raw[key]
+                    )):
+                        raise ValueError(f"step {index}: roles.{key} must be an array of role names or IDs")
+            if discriminator == "permissions":
+                overwrites = raw["overwrites"]
+                if not isinstance(overwrites, dict):
+                    raise ValueError(f"step {index}: overwrites must be an object")
+                if set(overwrites) - _SCENARIO_PERMISSION_FIELDS:
+                    raise ValueError(f"step {index}: overwrites contains an unknown permission")
+                if any(value is not None and type(value) is not bool for value in overwrites.values()):
+                    raise ValueError(f"step {index}: overwrite values must be true, false, or null")
+            if discriminator == "profile":
+                profile = raw["profile"]
+                if not isinstance(profile, dict) or not profile:
+                    raise ValueError(f"step {index}: profile must be a non-empty object")
+                if set(profile) - _SCENARIO_PROFILE_FIELDS:
+                    raise ValueError(f"step {index}: profile contains unsupported fields")
+                for key, value in profile.items():
+                    if value is None and key in {"avatar_url", "banner_url", "accent_color"}:
+                        continue
+                    if not isinstance(value, str):
+                        # ValueError by contract: the HTTP layer maps it to a 400.
+                        raise ValueError(f"step {index}: profile.{key} must be text")  # noqa: TRY004
+            for key in ("as", "channel", "user", "target"):
+                if key in raw and (isinstance(raw[key], bool) or not isinstance(raw[key], (str, int))
+                                   or isinstance(raw[key], str) and not raw[key].strip()):
+                    raise ValueError(f"step {index}: {key} must be a user, role, or channel name or ID")
             if any(key in raw for key in ("message_id", "modal_id")):
                 reference = raw.get("message_id", raw.get("modal_id"))
                 if not isinstance(reference, str) or not reference.strip():
@@ -1580,6 +2283,7 @@ def validate_scenario(scenario: dict) -> dict:
                 raise ValueError(f"step {index}: unknown assertion fields: {', '.join(sorted(set(raw) - allowed))}")
             required = {
                 "message_exists": (), "content": ("equals",), "embed_field": ("name", "value"),
+                "embed_description": ("description",), "member_profile": ("user",),
                 "component_exists": ("custom_id",), "channel_exists": ("name",),
                 "channel_missing": ("name",), "event_occurred": (),
             }[assertion]
@@ -1589,16 +2293,36 @@ def validate_scenario(scenario: dict) -> dict:
                 raw.get(key) not in (None, "") for key in ("text", "interaction", "operation", "custom_id")
             ):
                 raise ValueError(f"step {index}: event_occurred needs text, interaction, operation, or custom_id")
+            if "user" in raw and (isinstance(raw["user"], bool) or not isinstance(raw["user"], (str, int))
+                                   or isinstance(raw["user"], str) and not raw["user"].strip()):
+                raise ValueError(f"step {index}: user must be a simulated user name or ID")
+            if assertion == "event_occurred" and "actor" in raw and (
+                isinstance(raw["actor"], bool) or not isinstance(raw["actor"], (str, int))
+                or isinstance(raw["actor"], str) and not raw["actor"].strip()
+            ):
+                raise ValueError(f"step {index}: actor must be a simulated user name or ID")
+            if assertion == "member_profile":
+                fields = set(raw) & _SCENARIO_PROFILE_FIELDS
+                if not fields:
+                    raise ValueError(f"step {index}: member_profile needs at least one profile field")
             if "message_id" in raw and not isinstance(raw["message_id"], str):
                 raise TypeError(f"step {index}: message_id must be a string")
             if "message_id" in raw and (not isinstance(raw["message_id"], str) or not raw["message_id"].strip()):
                 raise ValueError(f"step {index}: message_id must be 'latest' or an ID")
             if "channel" in raw and (not isinstance(raw["channel"], str) or not raw["channel"].strip()):
                 raise ValueError(f"step {index}: channel must be a channel name or ID")
-            for key in ("message_id", "content", "equals", "name", "value", "custom_id", "text", "interaction", "operation", "status"):
+            for key in ("message_id", "content", "equals", "name", "value", "custom_id", "text", "interaction", "operation", "status", "description"):
                 if key in raw and not isinstance(raw[key], str):
                     raise ValueError(f"step {index}: {key} must be a string")
+            if assertion == "member_profile":
+                for key in set(raw) & _SCENARIO_PROFILE_FIELDS:
+                    if raw[key] is None and key in {"avatar_url", "banner_url", "accent_color"}:
+                        continue
+                    if not isinstance(raw[key], str):
+                        # ValueError by contract: the HTTP layer maps it to a 400.
+                        raise ValueError(f"step {index}: {key} must be text")  # noqa: TRY004
             if "embed" in raw and (type(raw["embed"]) is not int or raw["embed"] < 0):
+                # ValueError by contract: the HTTP layer maps it to a 400.
                 raise ValueError(f"step {index}: embed must be a zero-based non-negative index")
             step = dict(raw)
             step["assert"] = assertion
@@ -1617,17 +2341,46 @@ def _scenario_channel(session: Session, reference):
     return channel
 
 
-def _scenario_user(session: Session, reference) -> None:
-    if reference is None:
-        return
+def _scenario_member(session: Session, reference, *, allow_bot: bool = False) -> MockMember:
     if isinstance(reference, int) or str(reference).isdigit():
         user = session.guild.get_member(int(reference))
     else:
-        user = next((member for member in session.guild.members
-                     if member.name.casefold() == str(reference).casefold()), None)
-    if user is None or user.bot:
+        name = str(reference).casefold()
+        user = next((member for member in session.guild.members if member.name.casefold() == name), None)
+        if user is None:
+            user = next((member for member in session.guild.members
+                         if member.display_name.casefold() == name), None)
+    if user is None or user.bot and not allow_bot:
         raise ValueError(f"simulated user {reference!r} does not exist")
-    session.set_user(user.id)
+    return user
+
+
+def _scenario_role(session: Session, reference) -> MockRole:
+    if isinstance(reference, int) or str(reference).isdigit():
+        role = session.guild.get_role(int(reference))
+    else:
+        name = str(reference).casefold()
+        role = next((item for item in session.guild.roles if item.name.casefold() == name), None)
+    if role is None:
+        raise ValueError(f"simulated role {reference!r} does not exist")
+    return role
+
+
+def _scenario_permission_target(session: Session, reference) -> tuple[int, str, str]:
+    if isinstance(reference, int) or str(reference).isdigit():
+        role = session.guild.get_role(int(reference))
+    else:
+        name = str(reference).casefold()
+        role = next((item for item in session.guild.roles if item.name.casefold() == name), None)
+    if role is not None:
+        return role.id, role.name, "role"
+    member = _scenario_member(session, reference, allow_bot=True)
+    return member.id, member.display_name, "member"
+
+
+def _scenario_user(session: Session, reference) -> None:
+    if reference is not None:
+        session.set_user(_scenario_member(session, reference).id)
 
 
 def _scenario_message(session: Session, reference="latest") -> dict | None:
@@ -1663,6 +2416,21 @@ def _scenario_component(tree, custom_id: str) -> dict | None:
     return None
 
 
+def _scenario_event_value(event: dict, key: str):
+    details = event.get("details") or {}
+    if key in details:
+        return details[key]
+    interaction = details.get("interaction")
+    operation = details.get("operation")
+    if key == "interaction":
+        return {"interaction.component": "component", "interaction.command": "application_command",
+                "interaction.modal_submit": "modal_submit", "message.send": "message_create"}.get(operation)
+    if key == "operation":
+        return {"component": "interaction.component", "application_command": "interaction.command",
+                "modal_submit": "interaction.modal_submit", "message_create": "message.send"}.get(interaction)
+    return None
+
+
 def _scenario_assertion(session: Session, step: dict) -> tuple[bool, str, str]:
     assertion = step["assert"]
     message = _scenario_message(session, step.get("message_id", "latest"))
@@ -1690,6 +2458,24 @@ def _scenario_assertion(session: Session, step: dict) -> tuple[bool, str, str]:
         found = next((field for field in fields if field.get("name") == step["name"]), None)
         actual = found.get("value") if found else "field not found"
         return bool(found and actual == step["value"]), f"embed[{index}] field {step['name']!r} equals {step['value']!r}", repr(actual)
+    if assertion == "embed_description":
+        index = step.get("embed", 0)
+        embeds = message.get("embeds", []) if message else []
+        actual = embeds[index].get("description") if index < len(embeds) else None
+        return actual == step["description"], f"embed[{index}] description equals {step['description']!r}", repr(actual)
+    if assertion == "member_profile":
+        member = _scenario_member(session, step["user"])
+        actual = {"username": member.name, "display_name": member.display_name,
+                  "bio": member.bio, "avatar_url": member.avatar_url, "banner_url": member.banner_url,
+                  "accent_color": member.accent_color, "status": getattr(member.status, "name", str(member.status))}
+        expected = {key: step[key] for key in _SCENARIO_PROFILE_FIELDS if key in step}
+        matched = all(
+            actual[key].casefold() == value.casefold()
+            if key in {"status", "accent_color"} and isinstance(actual[key], str) and isinstance(value, str)
+            else actual[key] == value
+            for key, value in expected.items()
+        )
+        return matched, f"{step['user']!r} profile matches {expected!r}", repr({key: actual[key] for key in expected})
     if assertion == "component_exists":
         present = bool(message and step["custom_id"] in list(_scenario_component_ids(
             [message.get("components"), message.get("v2")]
@@ -1703,11 +2489,22 @@ def _scenario_assertion(session: Session, step: dict) -> tuple[bool, str, str]:
         expected = assertion == "channel_exists"
         return exists is expected, f"channel {step['name']!r} {'exists' if expected else 'is missing'}", \
             "present" if exists else "missing"
-    criteria = {key: step[key] for key in ("text", "interaction", "operation", "custom_id", "status") if key in step}
+    criteria = {key: step[key] for key in ("text", "interaction", "operation", "custom_id", "actor", "status") if key in step}
+    actor_names = set()
+    if "actor" in criteria:
+        actor = _scenario_member(session, criteria["actor"])
+        actor_names = {actor.name.casefold(), actor.display_name.casefold()}
+
+    def matches_criterion(event: dict, key: str) -> bool:
+        value = _scenario_event_value(event, key)
+        if key == "text":
+            return criteria[key].casefold() in event.get("text", "").casefold()
+        if key == "actor":
+            return isinstance(value, str) and value.casefold() in actor_names
+        return criteria[key] == value
+
     matched = next((event for event in reversed(session.events) if event.get("kind") == "event" and all(
-        (criteria[key].casefold() in event.get("text", "").casefold() if key == "text"
-         else criteria[key] == event.get("details", {}).get(key))
-        for key in criteria
+        matches_criterion(event, key) for key in criteria
     )), None)
     return bool(matched), f"event occurred matching {criteria!r}", \
         f"{matched.get('id')}: {matched.get('text')}" if matched else "no matching event"
@@ -1716,6 +2513,7 @@ def _scenario_assertion(session: Session, step: dict) -> tuple[bool, str, str]:
 def _scenario_runtime_state(session: Session) -> dict:
     return {
         "active_user": session.active_user.name,
+        "profiles": _member_details_json(session),
         "channels": [{"id": str(channel.id), "name": channel.name} for channel in session.channels.values()],
         "messages": [{"id": mid, "channel": session.messages[mid].get("channel"),
                       "author": session.messages[mid].get("author", {}).get("name"),
@@ -1727,8 +2525,8 @@ def _scenario_runtime_state(session: Session) -> dict:
     }
 
 
-async def run_scenario(session: Session, scenario: dict) -> dict:
-    """Replay a validated sequence through the existing session dispatch paths."""
+async def run_scenario(session: Session, scenario: dict, runtime=None) -> dict:
+    """Replay a validated sequence through the script or hosted-project runtime."""
     definition = validate_scenario(scenario)
     results = []
     for index, step in enumerate(definition["steps"], 1):
@@ -1740,13 +2538,70 @@ async def run_scenario(session: Session, scenario: dict) -> dict:
                 result = {"step": index, "kind": kind, "label": label,
                           "passed": passed, "expected": expected, "actual": actual}
             else:
-                _scenario_user(session, step.get("as"))
-                channel = _scenario_channel(session, step["channel"]) if "channel" in step else session.channel
-                event_count = len(session.events)
                 extra = {}
+                event_count = len(session.events)
+                if label == "profile":
+                    member = _scenario_member(session, step["user"])
+                    session.update_member_profile(member.id, step["profile"])
+                    extra["user"] = member.name
+                elif label == "roles":
+                    member = _scenario_member(session, step["user"], allow_bot=True)
+                    added = {role.id: role for role in
+                             (_scenario_role(session, reference) for reference in step.get("add", []))}
+                    removed = {role.id: role for role in
+                               (_scenario_role(session, reference) for reference in step.get("remove", []))}
+                    if session.guild.id in added or session.guild.id in removed:
+                        raise ValueError("@everyone is assigned automatically and cannot be changed")
+                    if added.keys() & removed.keys():
+                        raise ValueError("the same role cannot be both added and removed")
+                    roles = {role.id: role for role in member.roles if role.id != session.guild.id}
+                    roles.update(added)
+                    for role_id in removed:
+                        roles.pop(role_id, None)
+                    member.roles = [session.guild.roles[0], *sorted(roles.values(), key=lambda role: role.position)]
+                    extra.update(user=member.name, added_roles=[role.name for role in added.values()],
+                                 removed_roles=[role.name for role in removed.values()])
+                    session._touch()
+                    session.log("🎭", f"roles updated for {member.display_name}", kind="action",
+                                details={"operation": "member.roles.update", "member": member.name,
+                                         "added": extra["added_roles"], "removed": extra["removed_roles"],
+                                         "status": "success"})
+                elif label == "permissions":
+                    channel = _scenario_channel(session, step["channel"])
+                    target_id, target_name, target_type = _scenario_permission_target(session, step["target"])
+                    changes = step["overwrites"]
+                    if not changes:
+                        channel.overwrites.pop(target_id, None)
+                    else:
+                        current = channel.overwrites.get(target_id)
+                        overwrite = discord.PermissionOverwrite.from_pair(*current.pair()) \
+                            if current is not None else discord.PermissionOverwrite()
+                        for permission, value in changes.items():
+                            setattr(overwrite, permission, value)
+                        if overwrite.is_empty():
+                            channel.overwrites.pop(target_id, None)
+                        else:
+                            channel.overwrites[target_id] = overwrite
+                    session._touch()
+                    session.log("🔐", f"permissions updated for {target_name} in #{channel.name}", kind="action",
+                                details={"operation": "channel.permissions.update", "channel": channel.name,
+                                         "target": target_name, "target_type": target_type,
+                                         "overwrites": changes, "status": "success"})
+                    extra.update(channel=channel.name, target=target_name)
+                else:
+                    _scenario_user(session, step.get("as"))
+                    channel = _scenario_channel(session, step["channel"]) if "channel" in step else session.channel
+                    if label == "submit" and step["modal_id"] == "latest":
+                        matching = [modal for modal in session.modals
+                                    if modal.get("user_id") == str(session.active_user.id)]
+                        if not matching:
+                            raise ValueError("no modal is open for the active simulated user")
                 if label == "message":
                     message_count = len(session.order)
-                    await dispatch_message(session, step["content"], channel_id=channel.id)
+                    if runtime is None:
+                        await dispatch_message(session, step["content"], channel_id=channel.id)
+                    else:
+                        await runtime.dispatch_message(step["content"], channel_id=channel.id)
                     user_message = next((event.get("details", {}).get("message_id")
                                          for event in session.events[event_count:]
                                          if event.get("details", {}).get("interaction") == "message_create"
@@ -1775,27 +2630,53 @@ async def run_scenario(session: Session, scenario: dict) -> dict:
                         raise ValueError(f"component {step['custom_id']!r} is not on message {message_id!r}")
                     if component.get("disabled"):
                         raise ValueError(f"component {step['custom_id']!r} is disabled")
-                    await dispatch_click(session, str(message_id), step["custom_id"], step.get("values", []))
+                    if runtime is None:
+                        await dispatch_click(session, str(message_id), step["custom_id"], step.get("values", []))
+                    else:
+                        await runtime.dispatch_click(str(message_id), step["custom_id"], step.get("values", []))
                     extra["message_id"] = str(message_id)
                 elif label == "submit":
-                    modal_id = session.modals[-1]["id"] if step["modal_id"] == "latest" and session.modals else step["modal_id"]
-                    if not any(modal["id"] == modal_id for modal in session.modals):
+                    modal = matching[-1] if step["modal_id"] == "latest" else next(
+                        (item for item in session.modals if item["id"] == step["modal_id"]), None
+                    )
+                    if modal is None:
                         raise ValueError(f"modal {step['modal_id']!r} is not open")
-                    await dispatch_submit(session, str(modal_id), step.get("values", {}))
-                else:
-                    if label == "command":
+                    modal_id = modal["id"]
+                    if runtime is None:
+                        await dispatch_submit(session, str(modal_id), step.get("values", {}))
+                    elif not await runtime.dispatch_pending_modal(step.get("values", {}), str(modal_id)):
+                        raise ValueError(f"modal {step['modal_id']!r} is not pending in the hosted bot")
+                    extra["modal_id"] = str(modal_id)
+                elif label == "command":
+                    if runtime is None:
                         session.channel = channel
                         await dispatch_command(session, step["name"], step.get("args", {}))
+                    else:
+                        await runtime.dispatch_command(step["name"], step.get("args", {}), channel_id=channel.id)
 
                 failures = [event for event in session.events[event_count:]
                             if event.get("details", {}).get("status") in {
-                                "denied", "missing_handler", "missing_command", "missing_arguments",
-                                "unanswered", "missing_channel", "blocked_last_channel", "script_error",
+                                "denied", "ephemeral_owner_only", "missing_handler", "missing_command",
+                                "missing_arguments", "invalid_component", "invalid_message", "invalid_form",
+                                "invalid_modal", "missing_message", "missing_modal", "unanswered",
+                                "missing_channel", "blocked_last_channel", "transport_gap", "script_error",
                             }]
                 passed = not failures
-                actual = failures[-1]["text"] if failures else f"dispatched {label}"
+                actual = failures[-1]["text"] if failures else (
+                    f"updated profile for {extra['user']}" if label == "profile" else
+                    f"updated roles for {extra['user']}" if label == "roles" else
+                    f"updated permissions for {extra['target']} in #{extra['channel']}"
+                    if label == "permissions" else f"dispatched {label}"
+                )
+                if runtime is not None and label in {"profile", "roles", "permissions"}:
+                    refresh = getattr(runtime, "refresh_guild_state", None)
+                    if not callable(refresh) and label == "profile":
+                        refresh = getattr(runtime, "refresh_member_profile", None)
+                    if callable(refresh):
+                        refresh()
                 result = {"step": index, "kind": kind, "label": label, "passed": passed,
-                          "expected": "dispatch completes without a simulator denial, missing handler, or script error",
+                          "expected": "scenario state update succeeds" if label in {"profile", "roles", "permissions"} else
+                          "dispatch completes without permission denial, invalid input/target, missing handler, or script/runtime error",
                           "actual": actual, **extra}
         except Exception as error:  # noqa: BLE001 - scenario output needs a failing step, not a 500
             result = {"step": index, "kind": kind, "label": label, "passed": False,

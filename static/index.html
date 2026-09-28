@@ -1,6 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
+<html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" type="image/png" href="/static/icon.png">
@@ -8,7 +7,7 @@
 <style>
   :root {
     --background-primary: #313338; --background-secondary: #2b2d31; --background-secondary-alt: #383a40; --background-tertiary: #1e1f22;
-    --background-floating: #111214; --background-input: #232428; --background-modifier-hover: #3a3c43; --background-modifier-selected: #404249;
+    --background-floating: #111214; --background-input: #232428; --background-modifier-hover: rgba(78, 80, 88, 0.3); --background-modifier-selected: rgba(78, 80, 88, 0.6);
     --text-normal: #dbdee1; --text-muted: #949ba4; --text-heading: #f2f3f5; --text-code: #e3e5e8; --text-link: #00a8fc;
     --interactive-normal: #b5bac1; --interactive-hover: #dbdee1; --interactive-active: #fff;
     --brand-primary: #5865f2; --brand-primary-hover: #4752c4; --status-success: #23a559; --status-success-hover: #1a6334;
@@ -20,72 +19,209 @@
     --link: var(--text-link); --border: var(--border-subtle);
     --motion-fast: 100ms; --motion-normal: 150ms; --motion-slow: 250ms;
     --ease-standard: cubic-bezier(0.4, 0, 0.2, 1); --ease-decelerate: cubic-bezier(0.2, 0, 0, 1);
+    --channel-default: #80848e; --channels-default: #80848e;
+    --header-primary: #f2f3f5; --channelarea-bg: #2b2d31; --channel-unread: #fff;
+    --mention-boost: rgba(88, 101, 242, 0.1); --hover-gutter: #f2f3f5;
+    --sound-message: 200; --sound-connect: 180; --sound-join: 160; --sound-click: 120; --sound-success: 140;
   }
   * { box-sizing: border-box; margin: 0; }
   html, body { height: 100%; }
   body {
     background: var(--bg0); color: var(--txt);
-    font: 15px/1.45 var(--font-ui);
+    font: 16px/1.375 var(--font-ui);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
     color-scheme: dark;
     overflow: hidden;
+    user-select: none;
   }
+  #timeline .msg-body, .embed-inner, .inspect-detail, #inspect-json, .console-line { user-select: text; }
   button, input, select, textarea { font-family: var(--font-ui); }
-  #app { display: grid; grid-template-columns: 72px 280px 1fr 460px; height: 100vh; }
+  #app { display: grid; grid-template-columns: 72px 300px 1fr 480px; height: 100vh; }
   button, a, .channel-row, .server-icon, .inspect-tab, .inspect-entry { transition: background-color var(--motion-fast) var(--ease-standard), border-color var(--motion-fast) var(--ease-standard), border-radius var(--motion-fast) var(--ease-standard), transform var(--motion-fast) var(--ease-standard), opacity var(--motion-fast) var(--ease-standard); }
 
-  /* ---------- server rail ---------- */
-  #server-rail { background: var(--background-tertiary); display: flex; flex-direction: column; align-items: center; gap: 8px; padding-top: 12px; border-right: 1px solid var(--border); }
-  .server-icon { width: 44px; height: 44px; border-radius: 22px; background: var(--background-primary); color: var(--text-normal); display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; letter-spacing: .02em; position: relative; }
-  .server-icon::before { content: ""; position: absolute; left: -14px; width: 4px; height: 8px; border-radius: 0 4px 4px 0; background: var(--text-normal); transform: scaleY(0); transition: transform var(--motion-normal) var(--ease-standard); }
-  .server-icon:hover { border-radius: 14px; background: var(--background-modifier-hover); }
-  .server-icon:hover::before { transform: scaleY(1); }
-  .server-icon.active { border-radius: 14px; background: var(--brand-primary); color: #fff; }
-  .server-icon.active::before { height: 32px; transform: scaleY(1); }
-  .server-separator { width: 32px; height: 1px; background: var(--border); margin: 2px 0; }
+  /* Discord-style slim scrollbars */
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; border-radius: 4px; }
+  ::-webkit-scrollbar-thumb { background: var(--background-tertiary); border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: #202225; }
+  #timeline::-webkit-scrollbar, .member-list-scroll::-webkit-scrollbar { width: 16px; }
+  #timeline::-webkit-scrollbar-thumb, .member-list-scroll::-webkit-scrollbar-thumb { background: #202225; border: 4px solid transparent; background-clip: padding-box; border-radius: 8px; }
+  #timeline::-webkit-scrollbar-thumb:hover { background: #2f3136; background-clip: padding-box; }
+  #code::-webkit-scrollbar-thumb { background: #1a1b1e; background-clip: padding-box; }
+
+  /* ---------- server rail (pill indicator + squircle hover) ---------- */
+  #server-rail { background: var(--background-tertiary); display: flex; flex-direction: column; align-items: center; gap: 8px; padding-top: 12px; overflow-y: auto; scrollbar-width: none; }
+  #server-rail::-webkit-scrollbar { display: none; }
+  .server-icon { width: 48px; height: 48px; border-radius: 24px; background: var(--background-primary); color: var(--text-normal); display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; letter-spacing: .02em; position: relative; cursor: pointer; flex: none; transition: border-radius var(--motion-normal) var(--ease-standard), background-color var(--motion-normal) var(--ease-standard), color var(--motion-normal) var(--ease-standard); }
+  .server-icon::before { content: ""; position: absolute; left: -14px; width: 4px; height: 8px; border-radius: 0 4px 4px 0; background: var(--text-normal); transform: scaleY(0); transition: transform var(--motion-normal) var(--ease-standard), height var(--motion-normal) var(--ease-standard); }
+  .server-icon:hover { border-radius: 16px; background: var(--brand-primary); color: #fff; }
+  .server-icon:hover::before { transform: scaleY(1); height: 20px; }
+  .server-icon.active { border-radius: 16px; background: var(--brand-primary); color: #fff; }
+  .server-icon.active::before { height: 40px; transform: scaleY(1); }
+  .server-separator { width: 32px; height: 2px; border-radius: 1px; background: var(--border); margin: 2px 0; }
+  #rail-search { background: transparent; border: none; color: var(--interactive-normal); cursor: pointer; width: 48px; height: 48px; border-radius: 24px; display: flex; align-items: center; justify-content: center; font-size: 18px; position: relative; }
+  #rail-search:hover { border-radius: 16px; background: var(--brand-primary); color: #fff; }
+  #rail-search::before { content: ""; position: absolute; left: -14px; width: 4px; height: 8px; border-radius: 0 4px 4px 0; background: var(--text-normal); transform: scaleY(0); transition: transform var(--motion-normal) var(--ease-standard); }
+  #rail-search:hover::before { transform: scaleY(1); height: 20px; }
 
   /* ---------- channel sidebar ---------- */
   #sidebar { background: var(--bg1); display: flex; flex-direction: column; border-right: 1px solid var(--border); }
-  .guild-head { padding: 10px 16px; font-weight: 700; color: var(--txt-head); font-size: 15px;
-                border-bottom: 1px solid var(--border); box-shadow: 0 1px 0 rgba(0,0,0,.2); }
+  #channel-list { flex: 1; min-height: 0; overflow-y: auto; padding-bottom: 10px; }
+  .guild-head { height: 48px; flex: none; padding: 0 16px; font-weight: 700; color: var(--txt-head); font-size: 15px;
+                display: flex; align-items: center; justify-content: space-between; cursor: pointer;
+                box-shadow: 0 1px 0 rgba(0,0,0,.2), 0 1.5px 0 rgba(0,0,0,.1); }
+  .guild-head:hover { background: var(--background-modifier-hover); }
+  .guild-head .guild-chev { color: var(--txt-dim); font-size: 12px; }
   .local-label { color: var(--text-muted); font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
-  .channel-row { padding: 8px 16px; color: var(--txt-dim); cursor: pointer; display: flex; gap: 6px; align-items: center; border-radius: 4px; }
-  .channel-row.active { background: var(--bg3); color: var(--txt-head); margin: 0 8px; padding: 8px 8px; }
+  .channel-row { display: flex; align-items: center; gap: 6px; margin: 1px 8px; padding: 6px 8px; color: var(--channel-default); cursor: pointer; border-radius: 4px; font-size: 15px; font-weight: 500; }
+  .channel-hash { font-size: 18px; color: var(--channel-default); flex: none; line-height: 1; }
+  .channel-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .channel-row.active { background: var(--background-modifier-selected); color: var(--txt-head); }
+  .channel-row.active .channel-hash { color: var(--txt-head); }
   .channel-row:hover { color: var(--txt-head); background: var(--background-modifier-hover); }
+  .channel-row:hover .channel-hash { color: var(--txt-head); }
   .channel-row .unread { margin-left: auto; background: var(--red); color: #fff; font-size: 11px; font-weight: 700;
                           border-radius: 8px; padding: 0 6px; min-width: 10px; text-align: center; }
   .channel-row .unread.new { animation: unread-in var(--motion-normal) var(--ease-decelerate); }
-  .channel-cat { padding: 14px 16px 4px; font-size: 11px; font-weight: 700; letter-spacing: .05em;
-                 color: var(--txt-dim); text-transform: uppercase; cursor: pointer; display: flex; align-items: center; gap: 4px; }
-  .channel-chevron { display: inline-block; transform: rotate(0deg); transition: transform var(--motion-fast) var(--ease-standard); }
+  .channel-cat { display: flex; align-items: center; gap: 2px; margin: 18px 8px 0; padding: 6px 4px; font-size: 12px; font-weight: 700; letter-spacing: .02em;
+                 color: var(--channel-default); text-transform: uppercase; cursor: pointer; border-radius: 4px; }
+  .channel-cat:hover { color: var(--txt-head); }
+  .channel-chevron { display: inline-block; transform: rotate(0deg); transition: transform var(--motion-fast) var(--ease-standard); font-size: 10px; }
   .channel-chevron.closed { transform: rotate(-90deg); }
   .channel-items.collapsed { display: none; }
-  .sidebar-foot { margin-top: auto; padding: 10px; background: var(--background-tertiary); display: flex; align-items: center; gap: 10px; border-top: 1px solid var(--border); }
+  .sidebar-foot { height: 53px; flex: none; padding: 0 4px 0 8px; background: var(--background-tertiary); display: flex; align-items: center; gap: 8px; box-shadow: 0 -1px 0 rgba(0,0,0,.24); }
+  .sidebar-foot:hover { background: #232428; }
+  .foot-name { flex: 1; min-width: 0; }
+  .foot-icons { display: flex; align-items: center; }
+  .foot-icon { width: 32px; height: 32px; border: none; border-radius: 50%; background: transparent; color: var(--interactive-normal); cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 16px; flex: none; }
+  .foot-icon:hover { background: var(--background-modifier-hover); color: var(--interactive-hover); }
+  .foot-icon[aria-pressed="true"] { color: var(--interactive-active); }
+  .foot-icon.off { color: var(--status-danger); }
   .avatar.status-ring { border: 2px solid var(--status-success); box-shadow: 0 0 0 2px var(--background-tertiary); }
+  .avatar.status-ring[data-status="idle"] { border-color: var(--status-warning); }
+  .avatar.status-ring[data-status="dnd"], .avatar.status-ring[data-status="offline"], .avatar.status-ring[data-status="invisible"] { border-color: var(--text-muted); }
   .avatar { width: 34px; height: 34px; border-radius: 50%; flex: none; background: var(--brand-primary);
-            display: flex; align-items: center; justify-content: center; font-weight: 700; color: #fff; font-size: 14px; }
+            display: flex; align-items: center; justify-content: center; font-weight: 700; color: #fff; font-size: 14px; object-fit: cover; }
+  .avatar.image, .member-avatar.image { color: transparent; }
+  .member-avatar { object-fit: cover; }
+  .member-profile, .msg-author-button { cursor: pointer; border: 0; background: none; color: inherit; font: inherit; text-align: left; padding: 0; }
+  .member-profile:hover, .msg-author-button:hover { text-decoration: underline; }
+  .member-row { cursor: pointer; }
+  .user-stamp { font-size: 10px; color: var(--txt-dim); margin-left: 5px; }
+  .msg-avatar { cursor: pointer; }
+  .msg-accent { border-left: 2px solid transparent; }
+  #member-tools { padding: 6px 8px; display: grid; gap: 2px; }
+  #member-tools button { width: 100%; }
+  #account-row { margin: 0 8px 6px; padding: 6px 8px; border-radius: 4px; background: var(--background-modifier-selected); color: var(--txt-head); cursor: pointer; display: flex; align-items: center; gap: 8px; font-size: 12.5px; font-weight: 600; text-decoration: none; }
+  #account-row:hover { background: #4e5058; }
+  #account-row .acct-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--text-muted); }
+  #account-row.authed .acct-dot { background: var(--status-success); }
+  #account-row .acct-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #profile-card { position: fixed; z-index: 60; display: none; width: 300px; max-width: calc(100vw - 24px); background: var(--background-floating); border: none; border-radius: 8px; box-shadow: 0 8px 16px rgba(0,0,0,.24); overflow: hidden; }
+  #profile-card.open { display: block; animation: content-in var(--motion-fast) var(--ease-decelerate); }
+  #profile-banner { height: 60px; background: var(--brand-primary); overflow: hidden; }
+  #profile-banner-image { display: none; width: 100%; height: 100%; object-fit: cover; }
+  #profile-banner-image.loaded { display: block; }
+  #profile-card-body { position: relative; padding: 50px 16px 16px; }
+  #profile-avatar { position: absolute; top: -40px; left: 16px; width: 80px; height: 80px; border: 6px solid var(--background-floating); border-radius: 50%; font-size: 26px; background: var(--background-floating); }
+  #profile-name { font-size: 20px; font-weight: 700; color: var(--txt-head); line-height: 1.25; }
+  #profile-user { font-size: 13px; color: var(--txt-dim); }
+  #profile-status { display: inline-block; margin: 10px 0; padding: 3px 8px; border-radius: 12px; background: var(--bg3); color: var(--txt); font-size: 11px; text-transform: capitalize; }
+  #profile-bio { border-top: 1px solid var(--border); padding-top: 10px; margin-top: 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  #profile-controls { display: flex; gap: 8px; margin-top: 12px; }
+  #profile-controls button { flex: 1; }
+  #settings-overlay { position: fixed; inset: 0; z-index: 70; display: none; background: rgba(0,0,0,.7); }
+  #settings-overlay.open { display: block; }
+  #profile-settings { position: absolute; top: 0; right: 0; bottom: 0; width: 440px; max-width: 94vw; overflow: auto; background: var(--bg1); border-radius: 8px 0 0 8px; box-shadow: -8px 0 24px rgba(0,0,0,.45); animation: settings-slide var(--motion-normal) var(--ease-decelerate); }
+  @keyframes settings-slide { from { transform: translateX(24px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+  #settings-head { padding: 20px 18px 12px; color: var(--txt-head); font-weight: 700; font-size: 19px; }
+  #settings-form { padding: 0 18px 12px; display: grid; gap: 13px; }
+  #settings-form label { display: grid; gap: 6px; color: var(--txt-head); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .02em; }
+  #settings-form input, #settings-form textarea, #settings-form select { width: 100%; background: var(--background-tertiary); border: none; border-radius: 3px; color: var(--txt); font: inherit; padding: 10px; }
+  #settings-form input:focus, #settings-form textarea:focus, #settings-form select:focus { outline: none; box-shadow: 0 0 0 1px var(--blurple); }
+  #settings-form textarea { min-height: 68px; resize: vertical; }
+  #settings-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 14px 18px 18px; background: var(--bg2); }
+  #toast-stack { position: fixed; z-index: 100; left: 22px; bottom: 22px; display: grid; gap: 8px; pointer-events: none; }
+  .toast { min-width: 190px; max-width: 360px; padding: 12px 16px; border-radius: 8px; background: var(--background-floating); color: var(--txt-head); box-shadow: 0 8px 16px rgba(0,0,0,.24); animation: content-in var(--motion-normal) var(--ease-decelerate); border-left: 3px solid var(--brand-primary); }
+  .toast.error { border-left-color: var(--status-danger); }
+  .toast.success { border-left-color: var(--status-success); }
+  #sound-toggle { cursor: pointer; }
+
+  /* ---------- user settings overlay (Discord-style) ---------- */
+  #user-settings-overlay { position: fixed; inset: 0; z-index: 80; display: none; background: rgba(0,0,0,.7); }
+  #user-settings-overlay.open { display: block; }
+  #user-settings { position: absolute; top: 0; right: 0; bottom: 0; width: 820px; max-width: 96vw; display: grid; grid-template-columns: 218px 1fr;
+                   background: var(--bg1); border-radius: 8px 0 0 8px; box-shadow: -8px 0 24px rgba(0,0,0,.45); overflow: hidden;
+                   animation: settings-slide var(--motion-normal) var(--ease-decelerate); }
+  #settings-nav { background: var(--bg2); padding: 56px 6px 20px 20px; overflow-y: auto; }
+  #settings-nav h2 { color: var(--txt-head); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .02em; margin: 0 8px 8px; }
+  .settings-nav-item { display: block; width: 100%; text-align: left; border: 0; background: transparent; color: var(--txt-dim); font: inherit;
+                       font-size: 15px; font-weight: 500; padding: 6px 10px; border-radius: 4px; cursor: pointer; margin-bottom: 2px; }
+  .settings-nav-item:hover { background: var(--background-modifier-hover); color: var(--txt-head); }
+  .settings-nav-item.active { background: var(--background-modifier-selected); color: var(--txt-head); }
+  #user-settings-body { position: relative; padding: 56px 40px 40px; overflow-y: auto; }
+  .settings-pane { display: none; }
+  .settings-pane.active { display: block; }
+  .settings-title { color: #fff; font-size: 20px; font-weight: 700; margin-bottom: 20px; }
+  .settings-section { margin-bottom: 28px; }
+  .settings-section-title { color: var(--txt-head); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .02em; margin-bottom: 8px; }
+  .settings-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; background: var(--bg2); border-radius: 8px;
+                  padding: 14px 16px; margin-bottom: 12px; }
+  .settings-row-copy { min-width: 0; }
+  .settings-row-copy .name { color: var(--txt-head); font-weight: 600; font-size: 15px; }
+  .settings-row-copy .desc { color: var(--txt-dim); font-size: 13px; margin-top: 2px; }
+  .switch { position: relative; width: 40px; height: 24px; flex: none; border: 0; border-radius: 12px; background: #80848e; cursor: pointer;
+            transition: background var(--motion-fast) var(--ease-standard); }
+  .switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: #fff;
+                   transition: left var(--motion-fast) var(--ease-standard); }
+  .switch[aria-checked="true"] { background: var(--status-success); }
+  .switch[aria-checked="true"]::after { left: 19px; }
+  .settings-select { background: var(--background-tertiary); border: none; border-radius: 3px; color: var(--txt); font: inherit; font-size: 14px; padding: 10px; }
+  .settings-select:focus { outline: none; box-shadow: 0 0 0 1px var(--blurple); }
+  .volume-slider { width: 180px; accent-color: var(--brand-primary); }
+  #settings-close { position: absolute; top: 12px; right: 14px; width: 32px; height: 32px; border: 0; border-radius: 50%; background: transparent;
+                    color: var(--txt-dim); font-size: 16px; cursor: pointer; }
+  #settings-close:hover { background: var(--background-modifier-hover); color: var(--txt-head); }
+  .account-card { background: var(--bg2); border-radius: 8px; overflow: hidden; margin-bottom: 24px; }
+  .account-banner { height: 60px; background: var(--blurple); }
+  .account-body { display: flex; align-items: flex-end; gap: 12px; padding: 0 16px 14px; margin-top: -30px; }
+  .account-avatar { width: 68px; height: 68px; border-radius: 50%; border: 6px solid var(--bg2); font-size: 24px; }
+  .account-names { flex: 1; padding-bottom: 4px; }
+  .account-names .name { color: var(--txt-head); font-weight: 700; font-size: 18px; }
+  .account-names .sub { color: var(--txt-dim); font-size: 12px; }
+  .account-facts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 0 16px 16px; }
+  .account-fact { background: var(--bg1); border-radius: 6px; padding: 10px 12px; }
+  .account-fact .k { color: var(--txt-dim); font-size: 10px; font-weight: 700; text-transform: uppercase; }
+  .account-fact .v { color: var(--txt-head); font-size: 14px; font-weight: 600; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .msg { border-left: 2px solid transparent; }
+  .msg.msg-mention { background: var(--mention-boost); box-shadow: inset 2px 0 0 var(--brand-primary); }
+  .msg.msg-mention:hover { background: color-mix(in srgb, var(--mention-boost) 60%, var(--background-modifier-hover)); }
   .me-context { color: var(--text-muted); font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
-  .me-name { font-size: 13px; font-weight: 600; color: var(--txt-head); }
-  .me-tag { font-size: 11px; color: var(--txt-dim); }
-  #act-as { width: 112px; margin-left: auto; background: var(--bg0); color: var(--txt); border: 1px solid var(--border);
+  .me-name { font-size: 14px; font-weight: 600; color: var(--txt-head); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .me-tag { font-size: 11px; color: var(--txt-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #act-as { max-width: 118px; background: var(--background-tertiary); color: var(--txt); border: none;
              border-radius: 4px; padding: 4px 6px; font: inherit; font-size: 11px; }
   .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
 
   /* ---------- chat ---------- */
   #chat-pane { display: flex; flex-direction: column; background: var(--bg2); min-width: 0; }
-  #chat-head { padding: 10px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 10px;
-               color: var(--txt-head); font-weight: 700; box-shadow: 0 1px 0 rgba(0,0,0,.2); }
+  #chat-head { height: 48px; flex: none; padding: 0 16px; display: flex; align-items: center; gap: 10px;
+               color: var(--txt-head); font-weight: 700; box-shadow: 0 1px 0 rgba(0,0,0,.2), 0 1.5px 0 rgba(0,0,0,.1); }
   #chat-title { min-width: 0; display: flex; flex-direction: column; }
   #chat-head-name { line-height: 1.2; }
   #head-topic { color: var(--txt-dim); font-size: 11px; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #chat-head .desc { color: var(--txt-dim); font-weight: 400; font-size: 13px; border-left: 1px solid var(--border); padding-left: 10px;
                      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .sim-badge { margin-left: auto; color: var(--text-muted); font-size: 10px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; white-space: nowrap; }
-  #chat-content { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 180px; position: relative; }
+  #chat-content { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 240px; position: relative; }
   #timeline { min-width: 0; overflow-y: auto; padding: 16px 0 8px; }
-  #member-list { overflow-y: auto; padding: 16px 10px; background: var(--bg1); border-left: 1px solid var(--border); }
+  #member-list { overflow-y: auto; padding: 6px 8px; background: var(--bg1); }
   .member-group { color: var(--txt-dim); font-size: 10px; font-weight: 700; letter-spacing: .06em; margin: 0 6px 6px; text-transform: uppercase; }
   .member-row { display: flex; align-items: center; gap: 8px; padding: 5px 6px; color: var(--txt-dim); border-radius: 4px; }
-  .member-row:hover { background: var(--background-modifier-hover); color: var(--txt-head); }
+  .member-row:hover, .member-row.active { background: var(--background-modifier-hover); color: var(--txt-head); }
+  .member-row:focus-visible { outline: 2px solid var(--brand-primary); outline-offset: -2px; }
+  .member-bot-tag { margin-left: auto; flex: none; color: var(--brand-primary); font-size: 9px; font-weight: 700; }
   .member-avatar { width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; color: #fff; font-size: 11px; font-weight: 700; flex: none; position: relative; }
   .member-avatar::after { content: ""; position: absolute; right: -1px; bottom: -1px; width: 8px; height: 8px; border-radius: 50%; background: var(--status-success); border: 2px solid var(--bg1); }
   .member-avatar[data-status="idle"]::after { background: var(--status-warning); }
@@ -96,25 +232,57 @@
   .day-divider.entering { animation: content-in var(--motion-normal) var(--ease-decelerate); }
   .day-divider::before, .day-divider::after { content: ""; flex: 1; height: 1px; background: var(--border); }
   .msg { display: flex; gap: 12px; padding: 4px 16px; position: relative; border-radius: 2px; }
-  .msg:hover { background: rgba(0,0,0,.06); }
+  .msg:hover { background: var(--background-modifier-hover); }
+  .msg.msg-mention:hover { background: color-mix(in srgb, var(--mention-boost) 60%, var(--background-modifier-hover)); }
   .msg.entering { animation: content-in var(--motion-normal) var(--ease-decelerate); }
   .msg.grouped { padding-top: 1px; padding-bottom: 1px; }
   .msg.grouped > .avatar { visibility: hidden; }
   .msg.grouped .msg-author, .msg.grouped .msg-time { display: none; }
-  .msg-actions { position: absolute; top: -10px; right: 16px; display: flex; gap: 2px; padding: 2px; background: var(--background-floating); border: 1px solid var(--border); border-radius: 5px; opacity: 0; transform: translateY(4px); pointer-events: none; }
-  .msg:hover .msg-actions, .msg:focus-within .msg-actions { opacity: 1; transform: translateY(0); pointer-events: auto; }
+  .msg-actions { position: absolute; top: -10px; right: 16px; display: flex; gap: 2px; padding: 2px; background: var(--background-floating); border: 1px solid var(--border); border-radius: 5px; opacity: 0; transform: translateY(4px); }
+  /* The hidden bar stays hoverable: as a .msg descendant it keeps :hover alive
+     while the pointer sits on it, so it never flickers in and out. */
+  .msg:hover .msg-actions, .msg:focus-within .msg-actions { opacity: 1; transform: translateY(0); }
   .msg-action { border: 0; background: transparent; color: var(--interactive-normal); border-radius: 3px; padding: 3px 5px; cursor: pointer; font-size: 11px; }
   .msg-action:hover { background: var(--background-modifier-hover); color: var(--interactive-hover); }
   .msg .avatar { margin-top: 2px; }
-  .msg-author { font-weight: 600; color: var(--txt-head); font-size: 15px; }
-  .bot-tag { background: var(--blurple); color: #fff; font-size: 10px; font-weight: 700; padding: 1px 5px; border-radius: 4px;
+  .msg-author { font-weight: 600; color: var(--txt-head); font-size: 15px; text-decoration: none; }
+  .msg-author:hover { text-decoration: underline; }
+  .bot-tag { background: var(--blurple); color: #fff; font-size: 10px; font-weight: 700; letter-spacing: .03em; padding: 1px 5px; border-radius: 4px;
              vertical-align: 2px; margin-left: 4px; }
   .msg-time { color: var(--txt-dim); font-size: 11px; margin-left: 6px; }
   .msg-body { min-width: 0; flex: 1; }
   .msg-content { white-space: pre-wrap; word-wrap: break-word; }
-  .msg-content .mention { background: rgba(88,101,242,.3); color: #c9cdfb; border-radius: 3px; padding: 0 2px; font-weight: 500; }
+  .msg-content .mention { background: rgba(88,101,242,.3); color: #dee0fc; border-radius: 3px; padding: 0 2px; font-weight: 500; cursor: pointer; }
+  .msg-content .mention:hover { background: var(--brand-primary); color: #fff; }
+  .typing-row { display: flex; align-items: center; gap: 8px; height: 24px; padding: 0 18px 2px; color: var(--txt-dim); font-size: 12px; }
+  .typing-dots { display: inline-flex; gap: 2px; }
+  .typing-dots i { width: 5px; height: 5px; border-radius: 50%; background: var(--txt-dim); animation: typing-bounce 1s infinite var(--ease-standard); }
+  .typing-dots i:nth-child(2) { animation-delay: .15s; }
+  .typing-dots i:nth-child(3) { animation-delay: .3s; }
+  @keyframes typing-bounce { 0%, 60%, 100% { transform: translateY(0); opacity: .5; } 30% { transform: translateY(-3px); opacity: 1; } }
+  .typing-row[hidden] { display: none; }
+  .hover-time { position: absolute; left: 0; width: 78px; text-align: right; top: 6px; font-size: 10px; color: var(--hover-gutter); opacity: 0; pointer-events: none; user-select: none; }
+  .msg:hover .hover-time { opacity: 1; }
+  .msg.grouped .hover-time { top: 2px; }
+  body[data-message-display="compact"] .hover-time { width: 66px; }
   .ephemeral-note { color: var(--txt-dim); font-size: 11px; font-style: italic; margin-top: 2px; }
   .edited-note { color: var(--txt-dim); font-size: 10px; margin-left: 6px; }
+
+  /* reactions */
+  .reaction-bar { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+  .reaction { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; background: var(--bg3);
+              border: 1px solid transparent; border-radius: 8px; font-size: 14px; line-height: 1.375; cursor: pointer;
+              color: var(--txt-dim); user-select: none; transition: background-color var(--motion-fast) var(--ease-standard), border-color var(--motion-fast) var(--ease-standard); }
+  .reaction:hover { border-color: var(--txt-dim); background: var(--background-modifier-hover); }
+  .reaction.me { background: rgba(88, 101, 242, .16); border-color: var(--brand-primary); }
+  .reaction.me .reaction-count { color: #c9cdfb; }
+  .reaction-count { font-size: 12px; font-weight: 600; color: var(--txt-dim); }
+  #emoji-picker { position: fixed; z-index: 65; display: none; grid-template-columns: repeat(6, 1fr); gap: 2px; width: 238px;
+                  padding: 10px; background: var(--background-floating); border: 1px solid var(--border); border-radius: 10px;
+                  box-shadow: 0 14px 38px rgba(0,0,0,.5); }
+  #emoji-picker.open { display: grid; animation: content-in var(--motion-fast) var(--ease-decelerate); }
+  .emoji-cell { border: 0; background: transparent; font-size: 20px; padding: 4px; border-radius: 5px; cursor: pointer; }
+  .emoji-cell:hover { background: var(--background-modifier-hover); }
   .attachment { margin-top: 6px; color: var(--txt-dim); font-size: 13px; background: var(--bg1); border: 1px solid var(--border);
                 border-radius: 6px; padding: 6px 10px; display: inline-block; }
   .attach-thumb { max-width: 280px; max-height: 180px; border-radius: 6px; display: block; margin-top: 6px; }
@@ -166,8 +334,10 @@
   .sel.picker option::before { margin-right: 4px; }
 
   /* composer */
-  #composer { padding: 0 16px 20px; position: relative; }
-  #composer-box { display: flex; align-items: center; gap: 10px; background: var(--bg3); border-radius: 8px; padding: 10px 14px; }
+  #composer { padding: 0 16px 24px; position: relative; }
+  #composer-box { display: flex; align-items: center; gap: 12px; background: var(--bg3); border-radius: 8px; padding: 11px 16px; }
+  #composer-box .comp-plus, #composer-box .comp-emoji { font-size: 20px; color: var(--txt-dim); cursor: pointer; line-height: 1; }
+  #composer-box .comp-plus:hover, #composer-box .comp-emoji:hover { color: var(--txt-head); }
   #composer input { flex: 1; background: transparent; border: none; outline: none; color: var(--txt); font: inherit; }
   #composer input::placeholder { color: var(--txt-dim); }
   #palette { position: absolute; bottom: calc(100% - 10px); left: 16px; right: 16px; background: var(--bg1);
@@ -225,6 +395,28 @@
   #workspace-bar { display: flex; gap: 6px; align-items: center; padding: 7px 14px; border-bottom: 1px solid var(--border); }
   #workspace-bar label { color: var(--txt-dim); font-size: 11px; font-weight: 700; text-transform: uppercase; }
   #workspace-select { flex: 1; min-width: 0; background: var(--bg0); color: var(--txt); border: 1px solid var(--background-input); border-radius: 6px; padding: 5px; }
+  #workspace-files { display: flex; gap: 6px; align-items: center; padding: 6px 14px; border-bottom: 1px solid var(--border); }
+  #workspace-files[hidden] { display: none; }
+  #workspace-note[hidden] { display: none; }
+  #workspace-files label { color: var(--txt-dim); font-size: 11px; font-weight: 700; text-transform: uppercase; }
+  #workspace-file-select { flex: 1; min-width: 0; background: var(--bg0); color: var(--txt); border: 1px solid var(--background-input); border-radius: 6px; padding: 5px; }
+  #workspace-file-select:disabled, #btn-open-file:disabled, #btn-run-file:disabled { opacity: .5; cursor: default; }
+  #workspace-note { padding: 4px 14px; color: var(--txt-dim); font-size: 11px; border-bottom: 1px solid var(--border); }
+  #workspace-note[hidden] { display: none; }
+  #legacy-draft-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 14px; color: var(--txt); font-size: 12px; border-bottom: 1px solid var(--orange); }
+  #legacy-draft-notice[hidden] { display: none; }
+  #legacy-draft-message { flex: 1 1 260px; line-height: 1.4; }
+  #workspace-dirty { color: var(--orange); font-weight: 700; }
+  #workspace-dirty[hidden] { display: none; }
+  #btn-run-file { background: var(--bg3); border: 1px solid var(--border); color: var(--txt-head); font-weight: 700; border-radius: 6px; padding: 8px 12px; font-size: 13px; cursor: pointer; font-family: inherit; }
+  #btn-run-file:hover { border-color: var(--txt-dim); }
+  #btn-run-file:disabled { opacity: .5; cursor: default; }
+  #run-actions { display: flex; align-items: center; gap: 6px; }
+  #run-actions[hidden] { display: none; }
+  @media (max-width: 1050px) {
+    #workspace-bar, #workspace-files { flex-wrap: wrap; }
+    #workspace-select, #workspace-file-select { flex: 1 1 45%; }
+  }
   #block-panel { display: none; position: absolute; inset: 84px 14px 14px; z-index: 4; background: var(--bg1); border: 1px solid var(--border); border-radius: 8px; padding: 12px; overflow: auto; box-shadow: 0 8px 30px rgba(0,0,0,.45); }
   #block-panel.open { display: block; }
   #editor-pane { position: relative; }
@@ -315,15 +507,19 @@
   .console-line { white-space: pre-wrap; word-break: break-word; color: var(--txt-dim); }
   .console-line.error { color: #f2777a; }
   .run-stats { color: var(--txt-dim); font-size: 11px; padding: 4px 0; }
-  #run-error { display: none; margin: 0 10px 8px; padding: 9px 10px; border: 1px solid var(--status-danger); border-radius: 5px; background: color-mix(in srgb, var(--status-danger) 12%, var(--bg1)); }
-  #run-error.open { display: block; }
-  .run-error-title { color: var(--status-danger); font-weight: 700; font-size: 12px; }
-  .run-error-location { color: var(--txt-dim); font: 11px/1.4 "Cascadia Code", Consolas, monospace; }
-  .run-error-message { color: var(--txt); font-size: 12px; overflow-wrap: anywhere; margin: 3px 0 7px; }
-  .run-error-trace { margin-top: 5px; color: var(--txt-dim); font-size: 11px; }
-  .run-error-trace summary { cursor: pointer; }
-  .run-error-trace pre { max-height: 150px; overflow: auto; margin: 5px 0 0; white-space: pre-wrap; word-break: break-word; font: 10px/1.4 "Cascadia Code", Consolas, monospace; }
-  .run-error-actions, .inspect-links { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+  #problems { display: none; flex: 1; overflow-y: auto; padding: 10px 14px 12px; }
+  #problems.open { display: block; }
+  .problem-heading { color: var(--txt-dim); font-size: 11px; font-weight: 700; text-transform: uppercase; margin-bottom: 6px; }
+  .problem-entry { display: grid; grid-template-columns: auto minmax(0,1fr); gap: 8px; width: 100%; text-align: left; background: transparent; border: 0; border-radius: 4px; color: var(--txt); padding: 6px 8px; cursor: pointer; font: inherit; }
+  .problem-entry:hover { background: var(--background-modifier-hover); }
+  .problem-icon { color: var(--status-danger); font-weight: 700; }
+  .problem-copy { min-width: 0; }
+  .problem-message { display: block; color: var(--txt-head); overflow-wrap: anywhere; }
+  .problem-location { display: block; color: var(--txt-dim); font: 10px/1.4 "Cascadia Code", Consolas, monospace; }
+  .problem-trace { grid-column: 2; margin: 0 0 5px; color: var(--txt-dim); font-size: 10px; }
+  .problem-trace summary { cursor: pointer; }
+  .problem-trace pre { max-height: 180px; overflow: auto; margin: 5px 0 0; padding: 7px 9px; background: var(--bg0); border-left: 2px solid var(--status-danger); white-space: pre-wrap; word-break: break-word; font: 10px/1.45 "Cascadia Code", Consolas, monospace; }
+  .inspect-links { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
   .tool-link { border: 1px solid var(--border); border-radius: 4px; background: var(--bg3); color: var(--txt); padding: 4px 7px; font: inherit; font-size: 10px; cursor: pointer; }
   .tool-link:hover { border-color: var(--blurple); color: var(--txt-head); }
   .inspect-detail pre { margin: 0; font: inherit; white-space: pre-wrap; word-break: break-word; }
@@ -342,7 +538,7 @@
   .scenario-result.failed { border-color: var(--status-danger); color: var(--status-danger); }
   .scenario-runtime { margin: 4px 0; color: var(--txt-dim); }
   .scenario-runtime pre { max-height: 100px; overflow: auto; margin-top: 3px; padding: 5px; background: var(--bg0); white-space: pre-wrap; word-break: break-word; font: 10px/1.4 "Cascadia Code", Consolas, monospace; }
-  #jump-present { position: absolute; left: calc((100% - 180px) / 2 - 90px); bottom: 10px; transform: translateY(8px); opacity: 0; visibility: hidden; pointer-events: none; background: var(--brand-primary); color: #fff; border: 0; border-radius: 16px; padding: 7px 14px; font: inherit; font-size: 12px; font-weight: 700; z-index: 10; transition: opacity var(--motion-normal) var(--ease-decelerate), transform var(--motion-normal) var(--ease-decelerate); }
+  #jump-present { position: absolute; left: calc((100% - 240px) / 2 - 90px); bottom: 10px; transform: translateY(8px); opacity: 0; visibility: hidden; pointer-events: none; background: var(--brand-primary); color: #fff; border: 0; border-radius: 16px; padding: 7px 14px; font: inherit; font-size: 12px; font-weight: 700; z-index: 10; transition: opacity var(--motion-normal) var(--ease-decelerate), transform var(--motion-normal) var(--ease-decelerate); }
   #jump-present.open { opacity: 1; transform: translateY(0); visibility: visible; pointer-events: auto; }
 
   /* ---------- modal dialog ---------- */
@@ -361,9 +557,10 @@
   .modal-field { margin-bottom: 14px; }
   .modal-field label { display: block; font-size: 12.5px; font-weight: 700; color: var(--txt-head); margin-bottom: 6px; }
   .modal-field .req { color: var(--red); }
-  .modal-field input { width: 100%; background: var(--bg0); border: 1px solid var(--background-input); border-radius: 4px; color: var(--txt);
+  .modal-field input, .modal-field textarea { width: 100%; background: var(--bg0); border: 1px solid var(--background-input); border-radius: 4px; color: var(--txt);
                        padding: 9px 10px; font: inherit; outline: none; }
-  .modal-field input:focus { border-color: var(--blurple); }
+  .modal-field textarea { min-height: 96px; resize: vertical; }
+  .modal-field input:focus, .modal-field textarea:focus { border-color: var(--blurple); }
   .modal-hint { font-size: 11.5px; color: var(--txt-dim); margin-top: 4px; }
   #modal-foot { background: var(--bg2); padding: 12px 16px; display: flex; justify-content: flex-end; gap: 10px;
                 border-radius: 0 0 6px 6px; }
@@ -371,6 +568,81 @@
   #modal-ok { background: var(--blurple); color: #fff; border: none; border-radius: 4px; padding: 9px 24px;
               font: inherit; font-weight: 700; cursor: pointer; }
   #modal-ok:hover { background: var(--brand-primary-hover); }
+
+  /* voice simulation */
+  #voice-panel { border-top: 1px solid var(--bg3); padding: 6px 8px 4px; }
+  .voice-cat { font-size: 11px; letter-spacing: .04em; color: var(--txt-dim); font-weight: 700; padding: 4px 4px 2px; }
+  .voice-row { display: flex; align-items: center; gap: 6px; color: var(--txt-dim); font-size: 13px; font-weight: 600;
+               padding: 5px 8px; border-radius: 4px; cursor: pointer; }
+  .voice-row:hover { background: var(--background-modifier-hover); color: var(--txt); }
+  .voice-row .bolt { color: #23a559; }
+  .voice-members { margin: 0 0 4px 18px; display: flex; flex-direction: column; gap: 2px; }
+  .voice-member { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--txt-dim); }
+  .voice-member img { width: 22px; height: 22px; border-radius: 50%; }
+  .voice-member.speaking img { box-shadow: 0 0 0 2px #23a559; }
+  .voice-member .vm-flag { font-size: 11px; }
+  .voice-foot { display: flex; gap: 6px; padding: 2px 4px 6px; }
+  .voice-foot[hidden] { display: none; }
+  .voice-foot button { flex: 1; background: var(--bg2); border: 1px solid var(--bg3); color: var(--txt-dim);
+                       border-radius: 4px; padding: 5px 0; cursor: pointer; font: inherit; }
+  .voice-foot button:hover { color: var(--txt); border-color: var(--txt-dim); }
+  .voice-foot button.lit { color: #ed4245; border-color: #ed4245; }
+  #voice-hud { color: #23a559; font-weight: 700; }
+  #voice-hud[hidden] { display: none; }
+
+  /* uploads */
+  #upload-tray { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 16px 6px; }
+  #upload-tray:empty { display: none; }
+  .upload-chip { display: inline-flex; align-items: center; gap: 6px; background: var(--bg2); border: 1px solid var(--bg3);
+                 border-radius: 12px; padding: 3px 10px; font-size: 12px; color: var(--txt-dim); }
+  .upload-chip .up-del { cursor: pointer; border: 0; background: none; color: var(--txt-dim); font: inherit; }
+  .upload-chip .up-del:hover { color: #ed4245; }
+  .composer-box.dragover { outline: 2px dashed var(--blurple); outline-offset: -2px; }
+  #attach-btn { cursor: pointer; }
+
+  /* quick switcher (Ctrl+K) */
+  #quick-switcher { position: fixed; inset: 0; z-index: 90; display: none; background: rgba(0,0,0,.65); }
+  #quick-switcher.open { display: block; }
+  #qs-box { position: absolute; top: 15%; left: 50%; transform: translateX(-50%); width: 440px; max-width: 90vw;
+            background: var(--bg2); border-radius: 8px; box-shadow: 0 8px 28px rgba(0,0,0,.5); overflow: hidden; }
+  #qs-input { width: 100%; box-sizing: border-box; background: var(--bg3); border: none; color: var(--txt); font: inherit;
+              padding: 12px 14px; outline: none; }
+  #qs-list { max-height: 320px; overflow: auto; padding: 6px; }
+  .qs-item { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 4px; cursor: pointer;
+             color: var(--txt-dim); font-size: 14px; }
+  .qs-item:hover, .qs-item.selected { background: var(--background-modifier-selected); color: var(--txt-head); }
+  .qs-item .qs-kind { font-size: 11px; color: var(--txt-dim); margin-left: auto; }
+
+  /* context + moderation menus */
+  #ctx-menu { position: fixed; z-index: 95; display: none; background: var(--bg2); border: 1px solid var(--bg3);
+              border-radius: 6px; box-shadow: 0 8px 24px rgba(0,0,0,.5); min-width: 180px; padding: 6px; }
+  #ctx-menu.open { display: block; }
+  .ctx-item { display: block; width: 100%; text-align: left; border: 0; background: transparent; color: var(--txt);
+              font: inherit; font-size: 13px; padding: 7px 10px; border-radius: 4px; cursor: pointer; }
+  .ctx-item:hover { background: var(--background-modifier-hover); }
+  .ctx-item.danger { color: #ed4245; }
+  .ctx-sep { border-top: 1px solid var(--bg3); margin: 4px 6px; }
+  .member-mod { margin-left: auto; display: none; gap: 2px; }
+  .member-row:hover .member-mod { display: inline-flex; }
+  .member-mod button { border: 0; background: transparent; cursor: pointer; font-size: 12px; padding: 2px;
+                       color: var(--txt-dim); }
+  .member-mod button:hover { color: #ed4245; }
+  .member-name.banned-name { text-decoration: line-through; color: var(--txt-dim); }
+  .new-channel-btn { margin-left: auto; border: 0; background: transparent; color: var(--txt-dim); cursor: pointer;
+                     font: inherit; padding: 0 4px; }
+  .new-channel-btn:hover { color: var(--txt-head); }
+
+  /* new-channel mini dialog */
+  #new-channel-overlay { position: fixed; inset: 0; z-index: 88; display: none; background: rgba(0,0,0,.7); }
+  #new-channel-overlay.open { display: flex; align-items: center; justify-content: center; }
+  #new-channel { width: 380px; max-width: 90vw; background: var(--bg2); border-radius: 8px; padding: 16px;
+                 box-shadow: 0 8px 28px rgba(0,0,0,.5); }
+  #new-channel h2 { margin: 0 0 10px; font-size: 16px; color: var(--txt-head); }
+  #new-channel label { display: block; font-size: 12px; font-weight: 700; color: var(--txt-dim); margin: 8px 0 4px;
+                       text-transform: uppercase; letter-spacing: .02em; }
+  #new-channel input { width: 100%; box-sizing: border-box; background: var(--bg3); border: 1px solid var(--bg3);
+                       border-radius: 4px; color: var(--txt); font: inherit; padding: 9px 10px; }
+  #new-channel-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 14px; }
 
   /* Keep the desktop shell primary while collapsing secondary surfaces on small screens. */
   @media (max-width: 1200px) {
@@ -392,44 +664,64 @@
   }
 </style>
 </head>
-<body>
+<body data-density="comfortable" data-message-display="cozy" data-running="false">
 <div id="app">
   <nav id="server-rail" aria-label="Servers">
     <div class="server-icon active" title="ScriptPlayground local server" aria-label="ScriptPlayground local server">SP</div>
     <div class="server-separator"></div>
     <div class="server-icon" title="Offline local simulation" aria-label="Offline local simulation">⌘</div>
+    <button id="rail-search" type="button" title="Search (decorative)">🔍</button>
   </nav>
   <nav id="sidebar">
-    <div class="guild-head"><div class="local-label">Local simulation</div><div id="guild-name">Playground Server</div></div>
-    <div id="channel-list"></div>
+    <div class="guild-head"><div class="guild-head-names"><div class="local-label">Local simulation</div><div id="guild-name">Playground Server</div></div><span class="guild-chev">⌄</span></div>
+    <div id="channel-list"><div class="channel-cat"><span class="channel-chevron">▾</span>TEXT CHANNELS<button type="button" class="new-channel-btn" title="Create channel">＋</button></div><div class="channel-items"><div class="channel-row active"><span>#</span><span>playground</span></div></div></div>
+    <div id="voice-panel">
+      <div class="voice-cat">VOICE — SIMULATED</div>
+      <div class="voice-row" id="voice-join-row" role="button" tabindex="0"><span class="bolt">⚡</span><span id="voice-join-label">Join voice (simulated)</span></div>
+      <div class="voice-members" id="voice-members" hidden=""></div>
+      <div class="voice-foot" id="voice-controls" hidden="">
+        <button id="voice-mute" type="button" title="Simulate mute / unmute (unmuted shows your speaking ring)">🎙</button>
+        <button id="voice-deafen" type="button" title="Simulate deafen">🎧</button>
+        <button id="voice-leave" type="button" title="Leave simulated voice">⏏</button>
+      </div>
+    </div>
+    <div id="member-tools"><button id="add-user" class="lib-btn" type="button">＋ Add user</button><button id="edit-profile" class="lib-btn" type="button" disabled="" title="Add a user to create an editable profile">✎ Edit profile</button></div>
+    <a id="account-row" href="/auth/discord/login" title="Connect your Discord account"><span class="acct-dot"></span><span class="acct-label" id="account-row-label">Offline mode</span></a>
     <div class="sidebar-foot">
-      <div class="avatar status-ring" id="me-avatar">Y</div>
-      <div><div class="me-context">Acting as</div><div class="me-name" id="me-name">You</div><div class="me-tag" id="me-sub">connected locally</div></div>
-      <label><span class="sr-only">Act as user</span><select id="act-as" title="Act as user"></select></label>
+      <img class="avatar status-ring image" id="me-avatar" alt="You" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAAAAXNSR0IArs4c6QAABIBJREFUeF7tm22IVUUcxp+7e9/OWlEWYiEUVlhooR8MTLCIgoWwMBJWkUyypDZSXCIiPxYhsqKRRSIYYSWkSUmwYIgWGiJhpJVRCIKgWVb4svf9HpkLC6vOvefMeu4+c+HZr3tm/jO/3zxnZs6yqb4Xz4fQD41ASgJo7BuFJYDLXwLI/CVAAtgEyPW1B0gAmQC5vBIgAWQC5PJKgASQCZDLKwESQCZALq8ESACZALm8EiABZALk8kqABJAJkMsrARJAJkAurwRIAJkAubwSIAFkAuTySoAEkAmQy1MTcO/Ubry6PI9Jt3VZMdTrwLf7K9j6eXFMmB6encayxXncMCFlbX/mbB2Dmwo4dbo+pv6TaEQVYCbw7PwcnurNIpOxT+e//0Ns/qSIn45VneYb5FN447UA0+7ptrYrV4Avd5fw1VDZqd+kH6YLMKAGXgkw/T47qDAEjvxcxbpNBae5P92bxTPzc8haxJo+j/5Wxbsb3Pp0GkDMh+kCzDijXhWlUojtu8oY2htvtU65vQsD/QEmT7K/2saaqphMnR7zQoAZ8Yqlecybk0GXnRlOnKzh7cECCsXof2dYtiiPxx+x91WroSFy2xclJ1DtetgbAWbVrlwRYModdgNxwc2elcbyJXncdKN943UR2S7oo/v1RoAZVO9jWfQtyCKXs8M7+08d728p4o8TtaZsXu8PMOvBNFKWLoaHQ3y6s4S931fGg22sGl4JMCNuBdBsnod+rGLjZvvm2UpgVNtYtNrwkHcCzGno5ecD3DrRnoJLw2Hj/b3vwJWr2Jym1gwEmHqn/TQVJz1t4BvZpXcCzIj7FuTw5BNZpNP28f/+Zw1r37tyQ16yMNd4hXVb+FcqwNdDZezY7cfG6+0eMDKwqEvU1UCjbtS/HK9h8IN4J6jIJZvwA14mIM7dYPRnhP4X8pj7UMa68Z6/EGLLtiIOH3G7SSfMuWl33gqIuhuY70Tf/VDB0V+rTb/3XO+3pPGQ4LWAqLuBWd1/n6vj7rvsG+/JU3Vs/KiA03/xPrZFSfRaQJy7QbMJun6+iALVrt97L8BM/M1VAR643365soEZ6we8dkFu1W9HCJg5I42Xnsvjlpvtd4OrJ3ju3xAfflyAOf34/tMRAgzEVuf80ZCrVeCbPWVs3+Xfmd+2GDpGQNRNd2RytkuazynoGAEG4qNzM40kTOixv4ouXgqx9bMiDh7288zf0QkYGfyagR5Mn2Y/dh47XsM764d9XvDXjK2jEmBG/9bqHsxo8udLCRiHtScB4wC5VQkJkIBECWgPSBSne2cS4M4s0RYSkChO984kwJ1Zoi0kIFGc7p1JgDuzRFtIQKI43TuTAHdmibaQgERxuncmAe7MEm3RcQISnb0HnUkAWYIESACZALm8EiABZALk8kqABJAJkMsrARJAJkAurwRIAJkAubwSIAFkAuTySoAEkAmQyysBEkAmQC6vBEgAmQC5vBIgAWQC5PJKgASQCZDLKwESQCZALq8ESACZALm8EiABZALk8kqABJAJkMsrAWQBlwF0YXy/kGaqsQAAAABJRU5ErkJggg==" data-status="online" style="background-color: rgb(88, 101, 242);">
+      <div class="foot-name"><div class="me-context">Acting as</div><div class="me-name" id="me-name">You</div><div class="me-tag" id="me-sub">not running — press Run</div></div>
+      <label><span class="sr-only">Act as user</span><select id="act-as" title="Act as user"><option value="123456789012345678">You</option><option value="111111111111111111">Alice</option><option value="222222222222222222">Bob</option><option value="333333333333333333">Carol</option></select></label>
+      <div class="foot-icons">
+        <button class="foot-icon" id="sound-toggle" type="button" aria-pressed="true" title="Sound effects are on">🔊</button>
+        <button class="foot-icon" id="open-user-settings" type="button" title="User Settings">⚙️</button>
+        <a class="foot-icon" id="account-foot" href="/auth/discord/login" title="Connect Discord account" style="text-decoration:none">🔗</a>
+      </div>
     </div>
   </nav>
 
   <main id="chat-pane">
   <header id="chat-head">
-    <div id="chat-title"><span id="chat-head-name"># playground</span><span id="head-topic" hidden></span></div>
+    <div id="chat-title"><span id="chat-head-name"># playground</span><span id="head-topic" hidden=""></span></div>
     <span class="desc" id="head-desc">Everything your script sends shows up here — live.</span>
     <span class="sim-badge" id="sim-context">LOCAL · ACTING AS YOU</span>
     <a class="head-link" href="/embeder" target="_blank" title="Open the Components V2 builder">✦ Embeder</a>
-    <a class="head-link" id="account-link" href="/auth/discord/login" title="Optional Discord identity sign-in">Sign in</a>
+    <a class="head-link" id="account-link" href="#" title="Discord sign-in is optional and not configured">Offline mode</a>
   </header>
   <div id="chat-content">
-    <div id="timeline"></div>
+    <div id="timeline"><div class="day-divider">#playground — no messages here yet</div></div>
     <button id="jump-present" type="button">Jump to present</button>
-    <aside id="member-list" aria-label="Members"></aside>
+    <aside id="member-list" aria-label="Members"><div class="member-group">ONLINE — 5</div><div class="member-row active" tabindex="0" role="button" title="View @You's profile"><img class="member-avatar image" data-status="online" alt="" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAAAAXNSR0IArs4c6QAABIBJREFUeF7tm22IVUUcxp+7e9/OWlEWYiEUVlhooR8MTLCIgoWwMBJWkUyypDZSXCIiPxYhsqKRRSIYYSWkSUmwYIgWGiJhpJVRCIKgWVb4svf9HpkLC6vOvefMeu4+c+HZr3tm/jO/3zxnZs6yqb4Xz4fQD41ASgJo7BuFJYDLXwLI/CVAAtgEyPW1B0gAmQC5vBIgAWQC5PJKgASQCZDLKwESQCZALq8ESACZALm8EiABZALk8kqABJAJkMsrARJAJkAurwRIAJkAubwSIAFkAuTySoAEkAmQy1MTcO/Ubry6PI9Jt3VZMdTrwLf7K9j6eXFMmB6encayxXncMCFlbX/mbB2Dmwo4dbo+pv6TaEQVYCbw7PwcnurNIpOxT+e//0Ns/qSIn45VneYb5FN447UA0+7ptrYrV4Avd5fw1VDZqd+kH6YLMKAGXgkw/T47qDAEjvxcxbpNBae5P92bxTPzc8haxJo+j/5Wxbsb3Pp0GkDMh+kCzDijXhWlUojtu8oY2htvtU65vQsD/QEmT7K/2saaqphMnR7zQoAZ8Yqlecybk0GXnRlOnKzh7cECCsXof2dYtiiPxx+x91WroSFy2xclJ1DtetgbAWbVrlwRYModdgNxwc2elcbyJXncdKN943UR2S7oo/v1RoAZVO9jWfQtyCKXs8M7+08d728p4o8TtaZsXu8PMOvBNFKWLoaHQ3y6s4S931fGg22sGl4JMCNuBdBsnod+rGLjZvvm2UpgVNtYtNrwkHcCzGno5ecD3DrRnoJLw2Hj/b3vwJWr2Jym1gwEmHqn/TQVJz1t4BvZpXcCzIj7FuTw5BNZpNP28f/+Zw1r37tyQ16yMNd4hXVb+FcqwNdDZezY7cfG6+0eMDKwqEvU1UCjbtS/HK9h8IN4J6jIJZvwA14mIM7dYPRnhP4X8pj7UMa68Z6/EGLLtiIOH3G7SSfMuWl33gqIuhuY70Tf/VDB0V+rTb/3XO+3pPGQ4LWAqLuBWd1/n6vj7rvsG+/JU3Vs/KiA03/xPrZFSfRaQJy7QbMJun6+iALVrt97L8BM/M1VAR643365soEZ6we8dkFu1W9HCJg5I42Xnsvjlpvtd4OrJ3ju3xAfflyAOf34/tMRAgzEVuf80ZCrVeCbPWVs3+Xfmd+2GDpGQNRNd2RytkuazynoGAEG4qNzM40kTOixv4ouXgqx9bMiDh7288zf0QkYGfyagR5Mn2Y/dh47XsM764d9XvDXjK2jEmBG/9bqHsxo8udLCRiHtScB4wC5VQkJkIBECWgPSBSne2cS4M4s0RYSkChO984kwJ1Zoi0kIFGc7p1JgDuzRFtIQKI43TuTAHdmibaQgERxuncmAe7MEm3RcQISnb0HnUkAWYIESACZALm8EiABZALk8kqABJAJkMsrARJAJkAurwRIAJkAubwSIAFkAuTySoAEkAmQyysBEkAmQC6vBEgAmQC5vBIgAWQC5PJKgASQCZDLKwESQCZALq8ESACZALm8EiABZALk8kqABJAJkMsrAWQBlwF0YXy/kGaqsQAAAABJRU5ErkJggg==" style="background-color: rgb(88, 101, 242);"><span class="member-name">You</span><span class="member-mod"><button type="button" title="Kick (simulated)">👢</button><button type="button" title="Ban (simulated)">🔨</button></span></div><div class="member-row" tabindex="0" role="button" title="View @Playground Bot's profile"><img class="member-avatar image" data-status="online" alt="" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAAAAXNSR0IArs4c6QAAA4hJREFUeF7tmcFLFHEcxZ8HwSRESVIWhdAOmVCWWFJh0bl/IUSia0VRSR28RGUnhagsqIMUpEGCUIYoVFoKKVkp0iZmRVqJSdiirrsbIx2EdmVG59cbZ5/n737f/j6feTM4m7L37uEY9EcjkCIBNPaLwRLA5S8BZP4SIAFsAuR8PQMkgEyAHK8GSACZADleDZAAMgFyvBogAWQC5Hg1QALIBMjxaoAEkAmQ49UACSATIMerARJAJkCOVwMkgEyAHK8GSACZADleDZAAMgFyvKcaUH/wLEpzi1eMZC4yj0g0itnIHCZ+T6JvYggPgx34Hppa8U7TH/SVgHiwZsIhtI124+ZAM0LhWdM8He/3vQCLSAyxxTZc7LnluTYkhYClEs49r/dUE5JGgCVhIRrBg/ftuNp/z/GtwtQHkkqABdF6ONd0X8Pg5AdTTB3tXTMC+iYGcbyzNu7hijYUoCAzD2W5xSgPbMf61PSEEKwW3B9+jOuvmxyBMjXsCwFL4RRnb8aZXVUozMxPyGw5maZAJ9rrOwHWQcsD21C9+wiy12XFPffYr3EcfVLjiYexLwVY1C9XnMC+vJ1xBfwI/cSFlw3o+zb0vy/4f/J8K8BqwKHC/RLg5BJb7lWE0/u2BDgh/3fWTQFXDpzEnkCJGuDEg1sCKvJLcbqsCllpGXHjR6Y/o/LReSdfzdis754BO3KKcKqsEpsyAgmhdX3pR/WzOmNQnSz2hQDrVpOfkYvSnK0o2bgF6alpCRnMR8K4864FjYOtTjgZm10zAtwiMDw1imMdlzzxP4B1pqQSMDMfwo2BJrQEO93yueo9SSMgHF1A22gXantvrxqamwuSQoD1U2XryFPUvWp0k50ru3wtwPolLDg1hoaBZvSOv3UFmNtLfCMgGovCutKt183Wu57g9Ce0f3yBnq9v3Gbm6r41I8DpqwhXKRlcJgEG4dpZLQF2KBmckQCDcO2slgA7lAzOSIBBuHZWS4AdSgZnJMAgXDurJcAOJYMzEmAQrp3VEmCHksEZCTAI185qCbBDyeCMpwQYPKdnV0sAWY0ESACZADleDZAAMgFyvBogAWQC5Hg1QALIBMjxaoAEkAmQ49UACSATIMerARJAJkCOVwMkgEyAHK8GSACZADleDZAAMgFyvBogAWQC5Hg1QALIBMjxaoAEkAmQ49UACSATIMerARJAJkCOVwPIAv4Ardw+/zbmxOcAAAAASUVORK5CYII=" style="background-color: rgb(59, 165, 93);"><span class="member-name bot">Playground Bot</span><span class="member-bot-tag">APP</span><span class="member-mod"><button type="button" title="Kick (simulated)">👢</button><button type="button" title="Ban (simulated)">🔨</button></span></div><div class="member-row" tabindex="0" role="button" title="View @Alice's profile"><img class="member-avatar image" data-status="online" alt="" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAAAAXNSR0IArs4c6QAABORJREFUeF7tm1+IFWUYxp/v+ybbWhetFG3LUrMskjLZFEsjVosuIimhLgJTuugfBWUXkeCFYBT9g0Kqi7A/BBpU2KXlEmiJFmZliJUu/dPESmRbM52ZL86yK7hn5puZ9Xie98B7buc98zDPb573zLzfd8zxdZ0e+qE5YBQAzfsBYQXA9V8BkP1XAAqA7QBZX38DFADZAbK8JkABkB0gy2sCFADZAbK8JkABkB0gy2sCFADZAbK8JkABkB0gy2sCFADZAbK8JkABkB0gy2sCFADZAbK8JkABkB0gy2sCFADZAbJ8yyTATrodrus5YNTYoGW+by+SzUvh+/aRrS0n3zIAXNezsFPvBYwNX1l8FMm3zyD9cW05B8hVrQEgGo2o+wOY82aUsiv9fSOSLctK1bKLWgKAnXI33HWrgLM6Svnl+39DsvUh+L92lKpnFrUEADd3Dewli2qbuct5lfyH5PuXke5+tVw9sUo8ANMxFW7+WzAdl1WyyR/cgvizeyp9h1EsHoC9fBncNU8D0bl1/vijB2BGjck8hmOHEG9/Av5AD8PX0priAbh5a2EvurX+gnyKtHcdzPg52elIY6R73hh4IpL8EQ3AnD8T7obXYdon1Xt4/AiSHStgOhfm/j74w98h3nibZP9l/0HDXvUo3NWPA+7s+vZzeBfinsWwkxfDXbsCiNpzIaU/fyQWgugERPPfgelckN1+9r2H5KunEPyRrrWpwTqpBMQCMBNuhJvzCsw5Ewvv7NBjqj+yB/GndwDxPyIZiAVQe/Kx0x8AbJTbfoZMtdPuy29DcT+Sb1Yj/eltBVDFgaj7w4EnnIz+g7R3PZLty08eCr8reKS/bECy9ZEq8k2rFZkA23kL3PUvAG3j6o040Yfk65VIe98/5ViwDfX/iuSLB+H/3tk0Y8sKiQTgZq2GnbYkc/KZ19ODbUjwaEIegODk09e1n6E7rWhk4fdvQrx5Sdkbs2l14gDYS+9ELQGojRiGf3Laz1BZsA39+weSbY/BH/y8aeaWERIHILTwUvRIGWxDQkcTsgDU2s/Cj2HGTC/19DO8qLANHdqGuOeuMjdm02pEAQjewQXt52Qbmv0i7JTaGDpj7eDYn0i+fBLp/k+aZnCRkCgAlRdeiq5u+HGBowkxAAbax03vwoyeXNXWSvV+cIgnZTQhBoC98mG4GcsB11bJ0MrFJVtZ5fOO8AtiAOROPkd4YflfkzWaEAHAXDALbu5rMO0XN9zurBNK2rwlAkBo4eWMEBG0eUsEgOjm9TAT5mV6XfTylQcoONADIGU0QQdgLuxGNPsloG38iF6+QgmJFmyAGdeVDVbI5i06gNDCC07zicXNXAl7xf2AqV/UQXoC6e41SHY9f0a6XNmT0gEE79LTXE4MpwvwAkYTVADhLef5o+eyd1etLn9lDZCweYsKILjlvEFrucEW52OkP7yJZOeqKkwbWssDULDlvFHP6oVtiLx5iwYgvOW8sW+rwTY0uMOOtXmLBqChOW7hkykAMjwFoADIDpDlNQEKgOwAWV4ToADIDpDlNQEKgOwAWV4ToADIDpDlNQEKgOwAWV4ToADIDpDlNQEKgOwAWV4ToADIDpDlNQEKgOwAWV4ToADIDpDlNQEKgOwAWV4ToADIDpDlNQEKgOwAWV4ToADIDpDlNQFkAP8DX6e4n/BCxBsAAAAASUVORK5CYII=" style="background-color: rgb(250, 168, 26);"><span class="member-name">Alice</span><span class="member-mod"><button type="button" title="Kick (simulated)">👢</button><button type="button" title="Ban (simulated)">🔨</button></span></div><div class="member-row" tabindex="0" role="button" title="View @Bob's profile"><img class="member-avatar image" data-status="online" alt="" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAAAAXNSR0IArs4c6QAABKlJREFUeF7tm1tsFHUUxr9td9ruUvSl8sojQSQpBm9EfDCSaCImXgIxaqJojA/KmyHGQDEIkYttvdU0BLQ2ptZEBRNTtfAmBm+swQuRF0JCCND61N2d2c7sjJmVJuBOmvb0jP/pzLfPe76z8/vN+c9tJ/f3vRsC8GOMQI4CjLFvNKYAs/wpwDB/CqAA0wQM9+cxgAIMEzDcnhNAAYYJGG7PCaAAwwQMt+cEUIBhAobbcwIowDABw+05ARRgmIDh9pwACjBMwHB7TgAFGCZguD0ngAIMEzDcnhNAAYYJGG7PCaAAwwQMt0/MBNx4+CBaly9fGA7fR1CrAdPTqF+6BO9UCbXx46ifP7+w3Bir0yUgAlQoxP3uBCr9byGo2jGilEWnXkADSxDA++ssKvsOJG4asiHgqgS3VEK557VETUJ2BIQSPA/OkaOovj8oWy9iqMqWAAD+5csov74H3p9nYsA5/8hFIaA29jUqB3pn3bqWm7pgdXfDWncXrLVrkSsWIr8fHpTtoWE4o5/On1YMFakRcC2b9o0PovjcFuQ6OyORzUVoDKwjI1MpINzSpbt3wbrzjsiNdk+VMPXytv+L8ax9Uiug+MLz6HjkYaC1tQmA+/MvmNr2CgVcS2C2K2HJklHc+iI6HtoI5HLXgw4C1L4aQ6WvnwLiFHBDfy/yq29pghw4DuyDhxqno0n4pHIJKjz7DDoeexS5trYmxvVz51DeuQv1CxeSwD85L+ktdAnKr1iB/OpVaFt/N/IrV0au/Y1T0OGP4Yx8kgj44Y9YFBOgQsv3UTt2HJW9+1XitEKyIcDzGrelqwMDiboPlIkJCMplOJ99AfujYa2dVjUnGxMQBKhfvAhnZBThKW2SPtkQMEM8XIq+HUflzb7EOMiWgBB7wg7Gi0LAXK6ErTXdaOnqQn7VzbBuvw0ty5Y1XwVf3e+DqTKqg4OojX1jfBJSI+C/JMNbEe0P3B95MRZ+1z35A6Ze3U4BMwQWeiEWRXLp/r2wbl0TCdmfnETljX1wS78alZDaCQipFrY8jcLmTUA+33xPyLZRfW/A+DKUagHtG+5DcetL0U/HPA/2yCjsD4c4ASGBOJagwlNPovDE44BlNUOmgOuZxCGgs2c72u5ZH7mHh3/Sqr79DmrjxzgBcUxAx+ZNjb0/t2RJ9EF4YhLl3Xvg/fY7BWgJmMst6RnaSXkuvCgOwtq7aOOp2KHDcD4/oh0977xMCgjP/cs7ehJxazpzAvyJSVR6++D++NO899Y4CjIlwL9yBdV3BzB94vs4WIoysyHA8+CePg37g6HE/Cd0xla6BATBv2/I+AHgTsOfmID3xxk4R79M3HsBiRMgmt8UFCVmAlLAUrQJFCDCpldEAXosRUkUIMKmV0QBeixFSRQgwqZXRAF6LEVJFCDCpldEAXosRUkUIMKmV0QBeixFSRQgwqZXRAF6LEVJFCDCpldEAXosRUkUIMKmV0QBeixFSRQgwqZXRAF6LEVJFCDCpldEAXosRUkUIMKmV0QBeixFSRQgwqZXRAF6LEVJFCDCpldEAXosRUkUIMKmV0QBeixFSRQgwqZXRAF6LEVJFCDCplf0D3PvmZ/Z5a1VAAAAAElFTkSuQmCC" style="background-color: rgb(237, 66, 69);"><span class="member-name">Bob</span><span class="member-mod"><button type="button" title="Kick (simulated)">👢</button><button type="button" title="Ban (simulated)">🔨</button></span></div><div class="member-row" tabindex="0" role="button" title="View @Carol's profile"><img class="member-avatar image" data-status="online" alt="" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAAAAXNSR0IArs4c6QAABdJJREFUeF7tnFtsFFUYx/+zt9lrWxAFFEoviihNLQGlVVtqUQIiicYHTEw0GqMJUR5MNKliCPHyoBGMNhoSY6I+YXyEqAiV1JRaLymKiRZTSrlrSy270+1ud3fGnJEGtDPdnWU232nyzVuzZ853zv83/3POnPNNleH7PjLAF5kCCgMg094MzABo9WcAxPozAAZArQBxfJ4DGACxAsTh2QEMgFgB4vDsAAZArABxeHYAAyBWgDg8O4ABECtAHJ4dwACIFSAOzw5gAMQKEIdnBzAAYgWIw7MDGACxAsTh2QEMgFgB4vDsAAZQuAJqWw3U5ip4a+bCMycERfUByqX7DcBIZ6GPJpH9bRjpzuOY/OF04ZUTlZTeAUrIj/DjK6C21cJTHrwseD7BDCB3LoHU3t8x8fmv+UqT/S41gOD6pQg/1gDPvEjxAukGMkfOQfugF7mhseLrKdGd0gKIbGlEcMNSKKrXla7nzsQx/n6vdMOSlABiLzRDjPfwelwRf6oSGSFIByD8xEqEHl4OJeDOk/8fggaQ6TuL+I5OGBMZV+EWW5lUANTWakSfa4ISU+37oxvInbqIyd5TSH97Atn+EYiJOrB6EQLNVQisusH82/bK6kju+QXJj/uK1czV+6QBIEQre2Md/Muvs+2gPjKO5CdHkPrymG0Z3y3XIvLUKvjrFtiumLKDfyPxaidyp+OuillMZdIACD1Sj/CjDbaTrpPx24S5vQ3+FddbQjDSOSQ/7cPEZ0eL0czVe6QBUL7zfvjr5lt2ztAmMb77e6S++qPgzgsnxNrXwLsgZnmPGMLirxwouL5SFZQCQKBxMaLP3w1PRXB6Pw0g3TWIxOuHHGsQ3dqE4MabAWXqdflyFbk/NSRe+8acQygvKQBEnr4doYdutVx2iqdf6+gxtxacXmpLFSJiUvd7oY9OQP9LgxjKhOiZ/mEpXsykAFC2Yy0CTZWW+oq317Gte6VZNjp9CPKVlwJAxe4H4aueYz1W95xEfPvBfP2Ytb+TAxATb+ylNdb7PQaQ+qIf2juHZ63A+RpODmDGCViyl6Z8YhbzOzkA9d7af99+rd5eGUAxTJ3dwwCI/1kHA2AAzizrcmmeA1wW1Gl15AD8DQsRe7EFnnlhy7aLnU9tZ7fTfs2a8uQAxOqnomMTvIvLLUXL/HQGF9v3zxpBnTaUHIBocPlb6+G/baH1VsTZOOLbvi5q717ALd+1EZ5oAJmj56VMVZECQPTZRgQ3LbPctTSSGfMwPbW/8K3oKZLBdTchsmU1lPClEzKROzQ+ieyxEaS7h5A+MEC+xyQFgGlCXemFq9iOjr3cCrWl2vpQ5irAOh1mZiovBQBzqHh7A3w3XmPZ1mIOZPKdL8uyyyoFAKG6yH4Lb64HfNapKLmTY9De60Hm5/N5H0DvkgrE2lvhq7HeYYVhILWvH9q7PXnrKnUBaQB4F5Uhtu0e+Grm2va5kEN5kRUReeYOeCsrbA/l9ZEkEm92mRlz1Jc0AIQQwQeWIfLkSijRgL0uOR0iqyHddcLM8RGnWyJ1UQgvhh1f3fyZc4p0w8wX1Tq+o9bejC8VANEgMytubS3gmX6O64Zi2eOj5lmwDCkpUgIoJQQxhGm7DkuVHyqdA8ynIuQ31+9B4QSbSdmpG/QLSYx/+CPSBwec3lrS8lICmOqxyBENba63TlcpVBYDyA5cMPOKCllBFVqtW+WkBiA6KSZY8wONu5bMPDn/XxEDZhrKhPhAYw99BpwdMOkBTDVcDEvi8Ea9sxJinS8SeJXAFZ8o6QaMVBZiqBETbfrQICa7h9x6UEtWz6wBUDIFiCtmAAyAWAHi8OwABkCsAHF4dgADIFaAODw7gAEQK0Acnh3AAIgVIA7PDmAAxAoQh2cHMABiBYjDswMYALECxOHZAQyAWAHi8OwABkCsAHF4dgADIFaAODw7gAEQK0Acnh3AAIgVIA7PDmAAxAoQh2cHMABiBYjDswMYALECxOH/AXWq2l+98VRZAAAAAElFTkSuQmCC" style="background-color: rgb(235, 69, 158);"><span class="member-name">Carol</span><span class="member-mod"><button type="button" title="Kick (simulated)">👢</button><button type="button" title="Ban (simulated)">🔨</button></span></div><div class="member-group">OFFLINE — 0</div></aside>
   </div>
     <div id="composer">
+      <div class="typing-row" id="typing-row" hidden="" aria-live="polite"><span class="typing-dots"><i></i><i></i><i></i></span><strong id="typing-name"></strong>&nbsp;is typing…</div>
+      <div id="upload-tray" aria-label="Pending uploads"></div>
       <div id="palette"></div>
       <div id="cmd-form"></div>
       <div id="composer-box">
-        <span style="color:var(--txt-dim)">＋</span>
-        <input id="composer-input" placeholder="Message #playground — type !ping, !hello, or / for commands"
-               autocomplete="off" spellcheck="false">
-        <span style="color:var(--txt-dim)">😀</span>
+        <span id="attach-btn" role="button" tabindex="0" title="Attach files">＋</span>
+        <input id="file-input" type="file" multiple="" hidden="" aria-hidden="true">
+        <input id="composer-input" placeholder="Message #playground — type !ping, !hello, or / for commands" autocomplete="off" spellcheck="false">
+        <span class="comp-emoji" title="Emoji (decorative)">😀</span>
       </div>
     </div>
   </main>
@@ -437,14 +729,25 @@
   <aside id="editor-pane">
     <div id="workspace-bar">
       <label for="workspace-select">Bot folder</label>
-      <select id="workspace-select"><option value="">connect a folder…</option></select>
+      <select id="workspace-select"><option value="">connect a folder…</option><option value="Blurrys-Verify-Bot" data-entry="bot.py" data-files="[&quot;bot.py&quot;,&quot;cogs/__init__.py&quot;,&quot;cogs/admin.py&quot;,&quot;cogs/minecraft.py&quot;,&quot;core/__init__.py&quot;,&quot;core/api.py&quot;,&quot;core/config.py&quot;,&quot;core/cooldown.py&quot;,&quot;core/database.py&quot;,&quot;services/__init__.py&quot;,&quot;services/firebase.py&quot;,&quot;services/geyser.py&quot;,&quot;services/mcprofile.py&quot;,&quot;services/openxbl.py&quot;,&quot;services/patreon.py&quot;,&quot;services/playerdb.py&quot;,&quot;services/rghlab.py&quot;,&quot;services/xuid.py&quot;]">Blurrys-Verify-Bot (18 files)</option><option value="demo_bot" data-entry="bot.py" data-files="[&quot;bot.py&quot;]">demo_bot (1 files)</option><option value="E_XPV6" data-entry="main.py" data-files="[&quot;__testing/__init__.py&quot;,&quot;__testing/data_wiring_test.py&quot;,&quot;__testing/debug_suite.py&quot;,&quot;__testing/logging_config.py&quot;,&quot;__testing/testmode.py&quot;,&quot;cache.py&quot;,&quot;cogs/admin.py&quot;,&quot;cogs/admin_data.py&quot;,&quot;cogs/economy.py&quot;,&quot;cogs/xp.py&quot;,&quot;core/buffer.py&quot;,&quot;core/database.py&quot;,&quot;keep_alive.py&quot;,&quot;main.py&quot;,&quot;utils.py&quot;]">E_XPV6 (15 files)</option><option value="EanXP-ALPHAV7" data-entry="main.py" data-files="[&quot;__colors_audit.py&quot;,&quot;__colors_finish.py&quot;,&quot;__repoint_final.py&quot;,&quot;cache.py&quot;,&quot;cogs/admin/__init__.py&quot;,&quot;cogs/admin/_common.py&quot;,&quot;cogs/admin/controls.py&quot;,&quot;cogs/admin/core_settings.py&quot;,&quot;cogs/admin/dashboard.py&quot;,&quot;cogs/admin/data_settings.py&quot;,&quot;cogs/admin/economy_settings.py&quot;,&quot;cogs/admin/experimental_settings.py&quot;,&quot;cogs/admin/modals.py&quot;,&quot;cogs/admin/rewards.py&quot;,&quot;cogs/admin/wizard.py&quot;,&quot;cogs/auto_posts.py&quot;,&quot;cogs/economy.py&quot;,&quot;cogs/xp.py&quot;,&quot;core/buffer.py&quot;,&quot;core/database.py&quot;,&quot;core/logs.py&quot;,&quot;embeds.py&quot;,&quot;games.py&quot;,&quot;keep_alive.py&quot;,&quot;main.py&quot;,&quot;utils/__init__.py&quot;,&quot;utils/colors.py&quot;,&quot;utils/embeds_builders.py&quot;,&quot;utils/embeds_uniform.py&quot;,&quot;utils/guild_log.py&quot;,&quot;utils/helpers.py&quot;,&quot;utils/levels.py&quot;,&quot;utils/prestige.py&quot;,&quot;utils/skins.py&quot;,&quot;utils/views.py&quot;]">EanXP-ALPHAV7 (35 files)</option><option value="EanXP-repo" data-entry="main.py" data-files="[&quot;__testing/__init__.py&quot;,&quot;__testing/data_wiring_test.py&quot;,&quot;__testing/debug_suite.py&quot;,&quot;__testing/logging_config.py&quot;,&quot;__testing/testmode.py&quot;,&quot;cache.py&quot;,&quot;cogs/admin.py&quot;,&quot;cogs/admin_data.py&quot;,&quot;cogs/economy.py&quot;,&quot;cogs/xp.py&quot;,&quot;core/buffer.py&quot;,&quot;core/database.py&quot;,&quot;keep_alive.py&quot;,&quot;main.py&quot;,&quot;utils.py&quot;]">EanXP-repo (15 files)</option><option value="FinBot" data-entry="main.py" data-files="[&quot;cogs/__init__.py&quot;,&quot;cogs/admin.py&quot;,&quot;cogs/ai.py&quot;,&quot;cogs/economy.py&quot;,&quot;cogs/voice.py&quot;,&quot;core/__init__.py&quot;,&quot;core/database.py&quot;,&quot;data.py&quot;,&quot;main.py&quot;]">FinBot (9 files)</option><option value="Forumly" data-entry="bot.py" data-files="[&quot;bot.py&quot;,&quot;config.py&quot;,&quot;create_test_data.py&quot;,&quot;database.py&quot;,&quot;onedrive.py&quot;,&quot;setup.py&quot;]">Forumly (6 files)</option><option value="JERKESS" data-entry="main.py" data-files="[&quot;cogs/__init__.py&quot;,&quot;cogs/admin.py&quot;,&quot;cogs/ai.py&quot;,&quot;cogs/economy.py&quot;,&quot;cogs/voice.py&quot;,&quot;core/__init__.py&quot;,&quot;core/database.py&quot;,&quot;data.py&quot;,&quot;main.py&quot;]">JERKESS (9 files)</option><option value="Ragebait-b0t" data-entry="bot.py" data-files="[&quot;bot.py&quot;]">Ragebait-b0t (1 files)</option><option value="RageBot" data-entry="" data-files="[]">RageBot (0 files)</option><option value="showcase_bot" data-entry="bot.py" data-files="[&quot;bot.py&quot;]">showcase_bot (1 files)</option></select>
       <button id="btn-connect" class="lib-btn" title="Load a bot folder from bots/">📂 Connect</button>
       <button id="btn-blocks" class="lib-btn" title="Edit a message visually with blocks">🧱 Blocks</button>
     </div>
+    <div id="workspace-files" hidden="">
+      <label for="workspace-file-select">Python file</label>
+      <select id="workspace-file-select" disabled=""><option value="">connect a folder first…</option></select>
+      <button id="btn-open-file" class="lib-btn" type="button" disabled="">Open</button>
+    </div>
+    <div id="workspace-note" hidden="">Run File executes the current editor buffer without saving. Run boots the bot from saved files. <span id="workspace-dirty" hidden="">Unsaved changes</span></div>
+    <div id="legacy-draft-notice" hidden="" role="status" aria-live="polite">
+      <span id="legacy-draft-message"></span>
+      <button id="legacy-draft-standalone" class="lib-btn" type="button">Use as standalone draft</button>
+      <button id="legacy-draft-discard" class="lib-btn" type="button">Discard draft</button>
+    </div>
     <div id="script-lib">
       <label for="script-select">Scripts</label>
-      <select id="script-select"><option>loading…</option></select>
-      <button id="btn-save" class="lib-btn" title="Save the editor contents into the library">Save</button>
+      <select id="script-select"><option value="demo" title="Playground demo: embeds, buttons, selects, modals, files, chat, and slash commands.">★ demo</option><option value="make_icon" title="Generate ScriptPlayground's app icon (assets/icon.ico + icon.png + static/icon.svg).">　make_icon</option><option value="poll_bot" title="Poll bot demo: /poll creates a live poll, votes update the embed in place.">　poll_bot</option><option value="ticket_panel" title="Ticket panel demo: a support panel that opens private ticket channels.">　ticket_panel</option><option value="verify_exe" title="Verify the frozen app against real discord.py scripts and development mode.">　verify_exe</option></select>
+      <button id="btn-save" class="lib-btn" title="Save the editor contents into the library" data-workspace-save="true">Save</button>
       <button id="btn-delete" class="lib-btn" title="Delete the loaded script from the library">🗑</button>
       <button id="btn-suite" class="lib-btn" title="Run every saved script in isolated mock sessions">🧪 Test</button>
       <button id="btn-scenarios" class="lib-btn" title="Create and replay a saved interaction scenario">Scenarios</button>
@@ -460,10 +763,17 @@
       </div>
       <textarea id="scenario-json" spellcheck="false" aria-label="Scenario JSON">{
   "version": 1,
-  "name": "Greeting",
+  "name": "Profile-aware greeting",
   "steps": [
-    {"action": "message", "content": "!hello", "as": "Alice"},
-    {"assert": "message_exists", "content": "Hello, <@111111111111111111>!"}
+    {"action": "profile", "user": "Alice", "profile": {"display_name": "Alice Example", "bio": "Profile-aware scenario"}},
+    {"assert": "member_profile", "user": "Alice", "display_name": "Alice Example", "bio": "Profile-aware scenario"},
+    {"action": "profile", "user": "Bob", "profile": {"display_name": "Bobby Example", "status": "idle"}},
+    {"action": "message", "content": "!profile", "as": "Alice Example"},
+    {"assert": "message_exists", "content": "Hello, Alice Example!"},
+    {"assert": "event_occurred", "interaction": "message_create", "actor": "Alice", "status": "dispatched"},
+    {"action": "message", "content": "!profile", "as": "Bobby Example"},
+    {"assert": "message_exists", "content": "Hello, Bobby Example!"},
+    {"assert": "event_occurred", "interaction": "message_create", "actor": "Bob", "status": "dispatched"}
   ]
 }</textarea>
       <div id="scenario-results" aria-live="polite"></div>
@@ -484,7 +794,7 @@
       <button id="btn-apply-blocks" class="lib-btn">Apply to code</button>
     </div>
     <div id="editor-head">
-      <span>bot.py</span>
+      <span id="editor-filename" title="Standalone playground script">demo.py</span>
       <span style="display:flex;align-items:center">
         <div class="view-settings" aria-label="Display settings">
           <label for="density-select">View</label>
@@ -498,7 +808,10 @@
             <option value="compact">Compact</option>
           </select>
         </div>
-        <button id="btn-run">▶ Run</button>
+        <span id="run-actions" hidden="">
+          <button id="btn-run-file" type="button" disabled="" title="Run the active editor buffer without saving">▶ Run File</button>
+        </span>
+        <button id="btn-run" title="Run the editor buffer as a playground script">▶ Run</button>
         <button id="btn-restart" title="Restart the script runtime">↻</button>
       </span>
     </div>
@@ -506,18 +819,157 @@
     <div id="console">
       <div id="console-head">Developer tools <span id="run-stats" class="run-stats"></span>
         <button class="inspect-tab active" data-inspector="console" type="button">Console</button>
+        <button class="inspect-tab" data-inspector="problems" type="button">Problems</button>
         <button class="inspect-tab" data-inspector="state" type="button">State</button>
         <button class="inspect-tab" data-inspector="events" type="button">Events</button>
         <button class="inspect-tab" data-inspector="actions" type="button">Actions</button>
         <button class="inspect-tab" data-inspector="environment" type="button">Env</button>
       </div>
-      <div id="run-error" role="alert" aria-live="assertive"></div>
-      <div id="console-body"></div>
-      <div id="inspector" aria-label="Runtime state inspector"></div>
+      <div id="problems" aria-label="Problems" aria-live="polite"></div>
+      <div id="console-body" style="display: block;"></div>
+      <div id="inspector" aria-label="Runtime state inspector" style="display: none;"></div>
     </div>
   </aside>
 </div>
 
+<div id="profile-card" role="dialog" aria-label="Member profile" aria-modal="false">
+  <div id="profile-banner"><img id="profile-banner-image" alt=""></div><div id="profile-card-body"><img id="profile-avatar" class="avatar" alt=""><div id="profile-name"></div><div id="profile-user"></div><span id="profile-status"></span><div id="profile-bio"></div><div id="profile-controls"></div></div>
+</div>
+<div id="settings-overlay" role="presentation">
+  <section id="profile-settings" role="dialog" aria-modal="true" aria-labelledby="settings-head">
+    <div id="settings-head">Create simulated user</div>
+    <form id="settings-form">
+      <label>Username<input name="username" required="" maxlength="32" pattern="[A-Za-z0-9_.-]+" placeholder="e.g. Jamie"></label>
+      <label>Display name<input name="display_name" maxlength="32" placeholder="What people see"></label>
+      <label>About me<textarea name="bio" maxlength="190" placeholder="A little bio"></textarea></label>
+      <label>Avatar image URL<input name="avatar_url" type="url" maxlength="1000" placeholder="https://…"></label>
+      <label>Banner image URL<input name="banner_url" type="url" maxlength="1000" placeholder="https://…"></label>
+      <label>Profile accent<input name="accent_color" type="color" value="#5865f2"></label>
+      <label>Status<select name="status"><option value="online">Online</option><option value="idle">Idle</option><option value="dnd">Do not disturb</option><option value="invisible">Invisible</option><option value="offline">Offline</option></select></label>
+      <div id="settings-error" role="alert"></div>
+    </form>
+    <div id="settings-actions"><button id="settings-cancel" class="lib-btn" type="button">Cancel</button><button id="settings-save" class="btn btn-1" type="button">Save profile</button></div>
+  </section>
+</div>
+<div id="toast-stack" aria-live="polite"></div>
+<div id="quick-switcher" role="dialog" aria-label="Quick switcher">
+  <div id="qs-box">
+    <input id="qs-input" placeholder="Where would you like to go?" autocomplete="off" spellcheck="false">
+    <div id="qs-list" role="listbox"></div>
+  </div>
+</div>
+<div id="ctx-menu" role="menu"></div>
+<div id="new-channel-overlay" role="presentation">
+  <div id="new-channel" role="dialog" aria-modal="true" aria-labelledby="nc-title">
+    <h2 id="nc-title">Create channel</h2>
+    <label for="nc-name">Channel name</label>
+    <input id="nc-name" maxlength="100" placeholder="new-channel" autocomplete="off">
+    <label for="nc-topic">Topic (optional)</label>
+    <input id="nc-topic" maxlength="1024" placeholder="What's this channel about?" autocomplete="off">
+    <div id="new-channel-actions">
+      <button id="nc-cancel" class="lib-btn" type="button">Cancel</button>
+      <button id="nc-create" class="btn btn-1" type="button">Create</button>
+    </div>
+  </div>
+</div>
+<div id="emoji-picker" role="menu" aria-label="Pick a reaction emoji"></div>
+<div id="user-settings-overlay" role="presentation">
+  <div id="user-settings" role="dialog" aria-modal="true" aria-labelledby="us-title">
+    <nav id="settings-nav">
+      <h2>User Settings</h2>
+      <button class="settings-nav-item active" data-pane="account" type="button">My Account</button>
+      <button class="settings-nav-item" data-pane="appearance" type="button">Appearance</button>
+      <button class="settings-nav-item" data-pane="sound" type="button">Voice &amp; Sound</button>
+    </nav>
+    <div id="user-settings-body">
+      <button id="settings-close" type="button" title="Close (Esc)">✕</button>
+
+      <section class="settings-pane active" data-pane="account">
+        <h1 class="settings-title" id="us-title">My Account</h1>
+        <div class="account-card">
+          <div class="account-banner"></div>
+          <div class="account-body">
+            <img class="account-avatar avatar status-ring image" id="us-avatar" alt="You" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAAAAXNSR0IArs4c6QAABGRJREFUeF7tm1uIVVUAhv+110nNLopKU0MMCaWFaYOilJlm9NJTvXRBCmR8SLCHRB8Gg0SxmIekoARfkqALmk9B0EtU1mSQKGNqFw0VE3NgEq/jNJ61d+zNCA6z5px1ZmbPv3f+53XWXv9e33f+s/baMKZ/Z3MCfWgEjATQ2GfBEsDlLwFk/hIgAWwC5HztARJAJkCOVwMkgEyAHK8GSACZADleDZAAMgFyvBogAWQC5Hg1QALIBMjxaoAEkAmQ49UACSATIMerARJAJkCOVwMkgEyAHK8GSACZADme2gAzfT7sY9tgbmvxY0gc4j8/hjvwxogwRS3Pwi54G5gw1Xt9cukEXGcbkotHRzT/WFxEFZAuwD68DtGDawA70Q/pajfcvvVI/v6msfVWbkdl2ScwMxb6r3N9cEfeRfzbB43NO8aj6QKQglqyA6bp8WGWliA+8zXcDysbWnr00Guwc9YCdpLnugTJ2e9R3bOioTnzGMwXAKDeTwWqvXCHOhAf/TCIgblzFmwq9Y6ZY9uqoPTGBhVCQPZTtGgrovueB4z1Qzt3ENVvXwCql+uu0M5/C9H9r/jniquIj+2A69pUd57xGFAYAdm3dvF2mCmz/esOBBfd+wzsgg5g0oxRi7ypBKSLjWatgp3bDlQm++FdOQX30xok/xwYlo194iNEzU+n//owdMy1i3BdWxAf/3Q82AZlFKYB1++2JkAkiP/6Em7vau/iagusfW0QrRwGFU5A+jRkF70HM7nZv9z+C3BdmxGf2Dn47+nT1PLPYaY9MuL25MC37pSFE5BtyPPaEc1eDUS3+GH27EN1z8uDNmTbuhHRA21AVBl6jfsX8e/b4A5vrQtkvAcUUkB2Nqh5iBoMtN6JOun+EdXOtqAnKAkYIFDvbHDjawT76PuIWp4DTDSUX18P3P52xKe/Gm+2QXnFbMDArdc8G6TviU7uzk60w77vGeW7pCCCoxxUaAF1zwZ9PUh6T8NMa/XvFed/hdv7KpJLx0eJKb/LCy0g5GwwLJoGX1/kh7j2zIUXkN5+ZdlnMHcv9R+u/N/9Eb3AY0gohQBzz1OwC9+BubUpiFHSewbu59eRPv0U/VMKAdnZoNZz/o2U42uI/9gO90tH0dln91caAdnZoMZJ9zrtxHNIK7KJ8ghIX9bNfAm29U1gwhQ/0/7zcPs3ID71RZGZD7q3UgnINuTlu2HuWuzfers7Uf3uxdLAL9dP0ADWypO7YJqWSADrayYBLPJqAJm8BEhAHgTK9xSkTTiP70H4nNqEw1nlMlICcsEaPqkEhLPKZaQE5II1fFIJCGeVy0gJyAVr+KQSEM4ql5ESkAvWm3fS0p2E/2+qJIBsVAIkgEyAHK8GSACZADleDZAAMgFyvBogAWQC5Hg1QALIBMjxaoAEkAmQ49UACSATIMerARJAJkCOVwMkgEyAHK8GSACZADleDZAAMgFyvBogAWQC5Hg1QALIBMjxaoAEkAmQ49UACSATIMf/BykwcJ/26PNSAAAAAElFTkSuQmCC" data-status="online" style="background-color: rgb(250, 168, 26);">
+            <div class="account-names">
+              <div class="name" id="us-display">You</div>
+              <div class="sub" id="us-username">@You</div>
+            </div>
+          </div>
+          <div class="account-facts">
+            <div class="account-fact"><div class="k">Status</div><div class="v" id="us-status">online</div></div>
+            <div class="account-fact"><div class="k">Acting as</div><div class="v" id="us-acting">You</div></div>
+            <div class="account-fact"><div class="k">Simulated members</div><div class="v" id="us-members">5</div></div>
+          </div>
+        </div>
+        <div class="settings-section">
+          <div class="settings-section-title">Simulation</div>
+          <div class="settings-row">
+            <div class="settings-row-copy">
+              <div class="name">Switch simulated user</div>
+              <div class="desc">Send messages and click components as this member.</div>
+            </div>
+            <select id="us-act-as" class="settings-select" title="Act as user"><option value="123456789012345678">You</option><option value="111111111111111111">Alice</option><option value="222222222222222222">Bob</option><option value="333333333333333333">Carol</option></select>
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-copy">
+              <div class="name">Edit profile</div>
+              <div class="desc">Open the profile editor for the active simulated user.</div>
+            </div>
+            <button id="us-edit-profile" class="lib-btn" type="button" disabled="">✎ Edit profile</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="settings-pane" data-pane="appearance">
+        <h1 class="settings-title">Appearance</h1>
+        <div class="settings-section">
+          <div class="settings-section-title">Message Display</div>
+          <div class="settings-row">
+            <div class="settings-row-copy">
+              <div class="name">Message display</div>
+              <div class="desc">Cozy groups consecutive messages; compact uses tighter spacing and small avatars.</div>
+            </div>
+            <select id="us-message-display" class="settings-select">
+              <option value="cozy">Cozy</option>
+              <option value="compact">Compact</option>
+            </select>
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-copy">
+              <div class="name">Density</div>
+              <div class="desc">Compact tightens tool spacing in the editor pane.</div>
+            </div>
+            <select id="us-density" class="settings-select">
+              <option value="comfortable">Comfortable</option>
+              <option value="compact">Compact</option>
+            </select>
+          </div>
+        </div>
+      </section>
+
+      <section class="settings-pane" data-pane="sound">
+        <h1 class="settings-title">Voice &amp; Sound</h1>
+        <div class="settings-section">
+          <div class="settings-section-title">Sound effects</div>
+          <div class="settings-row">
+            <div class="settings-row-copy">
+              <div class="name">Sound effects</div>
+              <div class="desc">Message pop, connect chord, join ding, and interaction clicks.</div>
+            </div>
+            <button id="us-sound-switch" class="switch" type="button" role="switch" aria-checked="true" aria-label="Sound effects"></button>
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-copy">
+              <div class="name">Output volume</div>
+              <div class="desc">Volume of every playground sound cue.</div>
+            </div>
+            <input id="us-volume" class="volume-slider" type="range" min="0" max="100" value="70" aria-label="Output volume">
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+</div>
 <div id="modal-overlay">
   <div id="modal">
     <div id="modal-head">Modal</div>
@@ -534,6 +986,7 @@
 const $ = (sel) => document.querySelector(sel);
 const timeline = $("#timeline"), consoleBody = $("#console-body"), inspector = $("#inspector");
 let currentChannel = null;   // which channel's timeline we're viewing
+let lastRenderedUser = null, lastToastEvent = null, lastMessageIds = new Set(), lastMessageScope = null;
 const seenCounts = {};       // channel key -> count of seen messages
 let SID = null, pollTimer = null, ws = null, lastRevision = "", lastModalKey = "";
 let messageRows = new Map(), dayRows = new Map(), renderedChannel = null, emptyTimeline = null;
@@ -542,7 +995,11 @@ const unreadCounts = {};
 const dismissedModals = new Set();
 const AVATAR_COLORS = ["#5865f2","#3ba55d","#faa81a","#ed4245","#eb459e","#9b59b6"];
 let lastState = null, cmdMode = null; // cmdMode: the command being composed
+let profileTarget = null, settingsTarget = null, settingsMode = "edit";
+let soundEnabled = localStorage.getItem("pg-sounds") !== "false";
+let audioContext = null;
 let libScripts = [];                  // the script library listing
+let libraryLoadRequest = 0;
 const pickedValues = {};               // "mid|custom_id" -> [values], so selects keep state across re-renders
 const viewSettings = {
     density: localStorage.getItem("pg-density") || "comfortable",
@@ -566,22 +1023,62 @@ const viewSettings = {
     if (lastState) { lastRevision = ""; render(lastState); }
   };
   applyViewSettings();
+  function syncViewSettingsControls() {
+    $("#us-density").value = viewSettings.density;
+    $("#us-message-display").value = viewSettings.messages;
+  }
 
 /* ---------------- boot ---------------- */
 async function boot() {
+  const savedCode = localStorage.getItem("pg-code");
+  const hasWorkspaceState = localStorage.getItem(WORKSPACE_STATE_KEY) !== null;
+  workspaceRestorePending = hasWorkspaceState;
+  const codeContext = localStorage.getItem(PG_CODE_CONTEXT_KEY);
+  legacyDraftPending = savedCode !== null && !hasWorkspaceState && codeContext !== "standalone";
+  workspaceBootReady = false;
+  legacyDraftCode = legacyDraftPending ? savedCode : null;
+  legacyDraftMessage = legacyDraftPending
+    ? codeContext === "workspace"
+      ? "This draft was last saved while a bot folder was connected, but its folder metadata is missing. It is preserved; choose whether to use it as a standalone script or discard it."
+      : "This saved draft predates workspace tracking, so its origin is unknown. It is preserved; choose whether to use it as a standalone script or discard it."
+    : "";
+  syncWorkspaceUI();
+
   const res = await fetch("/api/session", { method: "POST" });
   const data = await res.json();
   SID = data.sid;
-  if (data.example && !localStorage.getItem("pg-code")) $("#code").value = data.example;
-  else $("#code").value = localStorage.getItem("pg-code") || "";
+  initialExampleCode = data.example || "";
+  if (legacyDraftPending) $("#code").value = legacyDraftCode;
+  else if (data.example && savedCode === null) $("#code").value = data.example;
+  else $("#code").value = savedCode || "";
   connectWS();
   render(data.state);
+  sessionReady = true;
+  syncWorkspaceUI();
   loadAuthStatus();
   loadLibrary();
-  loadWorkspaces();
+  try {
+    await loadWorkspaces();
+    workspaceListReady = true;
+    await restoreWorkspaceState();
+    workspaceRestorePending = false;
+  } catch (error) {
+    if (localStorage.getItem(WORKSPACE_STATE_KEY) === null) workspaceRestorePending = false;
+    pgAlert(error.message || "Could not load workspaces.");
+    if (workspaceRestorePending) $("#run-stats").textContent = "— workspace recovery failed; saved buffer preserved (reload to retry)";
+  }
+  workspaceBootReady = true;
+  syncWorkspaceUI();
 }
 function flushLocalState() {
-  localStorage.setItem("pg-code", $("#code").value);
+  if (legacyDraftPending || (workspaceRestorePending && !workspaceBootReady)) {
+    if (savedCode !== null) localStorage.setItem("pg-code", savedCode);
+  } else {
+    localStorage.setItem("pg-code", $("#code").value);
+    localStorage.setItem(PG_CODE_CONTEXT_KEY,
+      activeWorkspace || localStorage.getItem(WORKSPACE_STATE_KEY) !== null ? "workspace" : "standalone");
+  }
+  persistWorkspaceState();
   const design = localStorage.getItem("discord-embeder:autosave:v1");
   if (design !== null) localStorage.setItem("discord-embeder:autosave:v1", design);
 }
@@ -599,18 +1096,30 @@ async function loadAuthStatus() {
       link.href = "#";
       link.title = "Discord sign-in is optional and not configured";
       link.onclick = (event) => event.preventDefault();
+      syncAccountUI(false, "Offline mode");
     } else if (data.authenticated) {
       link.textContent = `Signed in as ${data.user.username}`;
       link.href = "/auth/logout";
       link.title = "Sign out of Discord identity session";
+      syncAccountUI(true, `Signed in — ${data.user.username}`);
     } else {
       link.textContent = "Sign in with Discord";
+      syncAccountUI(false, "Connect Discord");
     }
   } catch (_) {
     link.textContent = "Offline mode";
     link.href = "#";
     link.onclick = (event) => event.preventDefault();
+    syncAccountUI(false, "Offline mode");
   }
+}
+function syncAccountUI(authed, label) {
+  const row = $("#account-row");
+  if (!row) return;
+  row.classList.toggle("authed", Boolean(authed));
+  $("#account-row-label").textContent = label;
+  const foot = $("#account-foot");
+  if (foot) foot.title = authed ? `Discord connected — ${label}` : "Connect Discord account";
 }
 
 function startPolling() {
@@ -640,16 +1149,19 @@ function render(st) {
   if (!st || st.ok === false) return;
   lastState = st;
   document.body.dataset.running = String(Boolean(st.running));
-  renderRunError(st.last_run);
   $("#guild-name").textContent = st.guild.name;
   $("#me-name").textContent = st.user.name;
   $("#me-sub").textContent = st.running ? "runtime live" : "not running — press Run";
   $("#sim-context").textContent = `LOCAL · ACTING AS ${st.user.name.toUpperCase()}`;
-  const activeUser = (st.users || []).find((user) => user.id == st.user.id) || st.user;
+  const activeUser = (st.member_details || []).find((member) => member.id == st.user.id) || st.user;
   const activeIndex = (st.users || []).findIndex((user) => user.id == st.user.id);
   const avatar = $("#me-avatar");
-  avatar.textContent = (activeUser.name || "?")[0].toUpperCase();
-  avatar.style.background = AVATAR_COLORS[(activeIndex < 0 ? 0 : activeIndex) % AVATAR_COLORS.length];
+  setAvatar(avatar, activeUser, activeIndex);
+  avatar.dataset.status = activeUser.status || "online";
+  $("#edit-profile").disabled = !activeUser.custom;
+  $("#edit-profile").title = activeUser.custom ? "Edit this simulated user's profile" : "Add a user to create an editable profile";
+  syncUserSettings(st, activeUser);
+  voiceSync(st);
   const actAs = $("#act-as");
   actAs.innerHTML = "";
   for (const user of st.users || []) actAs.appendChild(new Option(user.name, user.id));
@@ -662,7 +1174,28 @@ function render(st) {
   renderInspector(st);
 
   const shown = st.messages.filter((m) => !m.deleted && (m.channel == currentChannel || (!m.channel && currentChannel === st.channels[0]?.id)));
-  const chatKey = `${st.revision}|${currentChannel}`;
+  const messageScope = `${st.user.id}|${currentChannel}`;
+  if (lastMessageScope !== messageScope) {
+    lastMessageScope = messageScope;
+    lastMessageIds = new Set(shown.map((message) => message.id));
+  } else {
+    const arrived = shown.filter((message) => !lastMessageIds.has(message.id));
+    const fromOthers = arrived.filter((message) => String(message.author.id) !== String(st.user.id));
+    if (fromOthers.length) {
+      playSound("message");
+      hideTyping();
+      notifyDesktop(fromOthers[fromOthers.length - 1], st);
+    }
+    if (arrived.some((message) => String(message.author.id) === String(st.user.id))) showTyping(1400);
+    lastMessageIds = new Set(shown.map((message) => message.id));
+  }
+  if (lastRenderedUser !== st.user.id) {
+    lastRenderedUser = st.user.id;
+    timeline.replaceChildren(); messageRows.clear(); dayRows.clear(); previousShownIds = new Set();
+    renderedChannel = null; lastRevision = "";
+  }
+  const chatKey = `${st.revision}|${currentChannel}|${st.user.id}`;
+
   if (chatKey === lastRevision) return;
   const stick = timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < 200;
   const channelChanged = renderedChannel !== currentChannel;
@@ -753,12 +1286,17 @@ function render(st) {
   timelinePainted = true;
   lastRevision = chatKey;
 
+  if (activeModal && activeModal.user_id && activeModal.user_id !== st.user.id) {
+    activeModal = null;
+    $("#modal-overlay").classList.remove("open", "closing");
+  }
   const mk = JSON.stringify(st.modals);
   if (mk !== lastModalKey) {
     lastModalKey = mk;
     const pending = st.modals.find((mo) => !dismissedModals.has(mo.id));
     if (pending && !activeModal) openModal(pending);
   }
+  renderFeedback(st);
   consoleBody.innerHTML = "";
   for (const e of st.events) {
     const line = document.createElement("div");
@@ -767,8 +1305,10 @@ function render(st) {
     consoleBody.appendChild(line);
   }
   consoleBody.scrollTop = consoleBody.scrollHeight;
-  if (st.last_run) {
-    $("#run-stats").textContent = `— ${st.last_run.ms.toFixed(0)} ms ${st.last_run.ok ? "" : "· error"}`;
+  if (st.last_run && (!activeWorkspace || !st.last_run.ok)) {
+    $("#run-stats").textContent = st.last_run.ok
+      ? `— ${st.last_run.ms.toFixed(0)} ms`
+      : `— hosted bot error · ${st.last_run.exception?.type || "error"} · ${activeWorkspace || "editor"}`;
   }
 }
 
@@ -782,14 +1322,72 @@ function canGroupMessages(previous, current) {
 }
 function messageFingerprint(message, grouped) {
   return JSON.stringify([message.author, message.channel, message.command, message.timestamp,
-    message.content, message.embeds, message.components, message.v2, message.files,
-    message.ephemeral, message.deleted, message.revision, grouped]);
+    message.content, message.embeds, message.components, message.v2, message.files, message.reactions,
+    message.ephemeral, message.deleted, message.revision, grouped, lastState?.user?.id, pendingUploads.length]);
 }
 function updateMessageRow(row, message, st, grouped) {
   const fresh = renderMessage(message, st, grouped);
   row.className = fresh.className;
   row.replaceChildren(...fresh.childNodes);
 }
+function memberName(userId) {
+  const member = (lastState?.member_details || []).find((m) => String(m.id) === String(userId));
+  return member ? (member.display_name || member.name) : "Unknown";
+}
+
+function renderReactions(m) {
+  const bar = document.createElement("div");
+  bar.className = "reaction-bar";
+  const myId = String(lastState?.user?.id ?? "");
+  for (const reaction of m.reactions || []) {
+    const pill = document.createElement("button");
+    pill.type = "button";
+    pill.className = "reaction" + (reaction.users.includes(myId) ? " me" : "");
+    pill.title = reaction.users.map(memberName).join(", ");
+    const emoji = document.createElement("span");
+    emoji.className = "reaction-emoji";
+    emoji.textContent = reaction.emoji;
+    const count = document.createElement("span");
+    count.className = "reaction-count";
+    count.textContent = String(reaction.users.length);
+    pill.append(emoji, count);
+    pill.onclick = () => react(m.id, reaction.emoji);
+    bar.appendChild(pill);
+  }
+  return bar;
+}
+
+async function react(messageId, emoji) {
+  const result = await post("react", { message_id: messageId, emoji });
+  if (result) playSound("click");
+  return result;
+}
+
+const EMOJI_CHOICES = ["👍", "👎", "❤️", "😂", "😮", "😢", "🔥", "🎉", "👀", "🙏", "💯", "🚀", "🤖", "✅", "❌", "⭐", "😅", "🤔"];
+let emojiTarget = null;
+function openEmojiPicker(messageId, anchor) {
+  emojiTarget = messageId;
+  const picker = $("#emoji-picker");
+  picker.innerHTML = "";
+  for (const emoji of EMOJI_CHOICES) {
+    const cell = document.createElement("button");
+    cell.type = "button";
+    cell.className = "emoji-cell";
+    cell.textContent = emoji;
+    cell.title = `React with ${emoji}`;
+    cell.onclick = () => { const target = emojiTarget; closeEmojiPicker(); react(target, emoji); };
+    picker.appendChild(cell);
+  }
+  picker.classList.add("open");
+  const rect = anchor.getBoundingClientRect();
+  picker.style.left = `${Math.max(8, Math.min(rect.left, innerWidth - 250))}px`;
+  picker.style.top = `${Math.min(rect.bottom + 6, innerHeight - 220)}px`;
+}
+function closeEmojiPicker() { $("#emoji-picker").classList.remove("open"); emojiTarget = null; }
+window.addEventListener("click", (event) => {
+  if (!$("#emoji-picker").contains(event.target) && !event.target.closest("button[title=\"Add reaction\"]")) closeEmojiPicker();
+});
+
 $("#jump-present").onclick = () => {
   timeline.scrollTop = timeline.scrollHeight;
   $("#jump-present").classList.remove("open");
@@ -800,6 +1398,7 @@ timeline.addEventListener("scroll", () => {
 
 let inspectorMode = "console";
 let expandedInspectorEntry = null;
+let problemFingerprint = null;
 let envReport = null;               // last fetched workspace environment discovery
 let envWorkspace = null;            // workspace the report belongs to
 
@@ -879,6 +1478,16 @@ function toolLink(label, mode, entryId = null) {
 }
 
 function renderInspector(st) {
+  const problems = $("#problems");
+  const showProblems = inspectorMode === "problems";
+  problems.style.display = showProblems ? "block" : "none";
+  problems.classList.toggle("open", showProblems);
+  if (showProblems) {
+    consoleBody.style.display = "none";
+    inspector.style.display = "none";
+    renderProblems(st);
+    return;
+  }
   const showInspector = inspectorMode !== "console";
   consoleBody.style.display = showInspector ? "none" : "block";
   inspector.style.display = showInspector ? "block" : "none";
@@ -1008,20 +1617,36 @@ window.addEventListener("click", (event) => {
 
 function renderMessage(m, st, grouped = false) {
   const row = document.createElement("div");
-  row.className = "msg" + (grouped ? " grouped" : "");
+  row.className = "msg" + (grouped ? " grouped" : "") + (m.author.bot ? " msg-accent" : "");
   row.dataset.messageId = m.id;
-  const av = document.createElement("div");
-  av.className = "avatar";
-  av.style.background = AVATAR_COLORS[m.author.id % AVATAR_COLORS.length];
-  av.textContent = m.author.name[0].toUpperCase();
+  row.dataset.bot = String(Boolean(m.author.bot));
+  const av = document.createElement("img");
+  av.className = "avatar msg-avatar";
+  const author = (st.member_details || []).find((member) => member.id == m.author.id) || m.author;
+  setAvatar(av, author, Number(m.author.id) || 0);
+  av.alt = author.display_name || author.name || "User";
+  av.title = `View ${av.alt}'s profile`;
+  av.onclick = (event) => showProfile(author, event.currentTarget);
   const body = document.createElement("div");
   body.className = "msg-body";
 
   const head = document.createElement("div");
-  head.innerHTML = `<span class="msg-author"></span>` +
+  head.innerHTML = `<button class="msg-author-button" type="button"></button>` +
     (m.author.bot ? `<span class="bot-tag">APP</span>` : "") +
     `<span class="msg-time">${(m.timestamp || "").slice(11, 16)}</span>`;
-  head.querySelector(".msg-author").textContent = m.author.name;
+  if (!grouped) {
+    const hoverTime = document.createElement("span");
+    hoverTime.className = "hover-time";
+    hoverTime.textContent = (m.timestamp || "").slice(11, 16);
+    row.appendChild(hoverTime);
+  }
+  const authorButton = head.querySelector(".msg-author-button");
+  authorButton.textContent = m.author.name;
+  authorButton.onclick = (event) => showProfile(author, event.currentTarget);
+  if (m.author.accent_color) authorButton.style.color = m.author.accent_color;
+  if (m.author.username && m.author.username !== m.author.name) {
+    const tag = document.createElement("span"); tag.className = "user-stamp"; tag.textContent = `@${m.author.username}`; head.insertBefore(tag, head.querySelector(".msg-time"));
+  }
   body.appendChild(head);
   if (m.command) {
     const chip = document.createElement("span");
@@ -1076,6 +1701,7 @@ function renderMessage(m, st, grouped = false) {
     note.textContent = "Only visible to you (ephemeral)";
     body.appendChild(note);
   }
+  if (m.reactions && m.reactions.length) body.appendChild(renderReactions(m));
   const rev = document.createElement("span");
   rev.className = "edited-note";
   rev.textContent = m.revision > 0 ? `(edited ×${m.revision})` : "";
@@ -1089,7 +1715,15 @@ function renderMessage(m, st, grouped = false) {
   copy.textContent = "Copy";
   copy.title = "Copy message text";
   copy.onclick = () => copyMessage(m);
+  const reactButton = document.createElement("button");
+  reactButton.className = "msg-action";
+  reactButton.type = "button";
+  reactButton.textContent = "＋";
+  reactButton.title = "Add reaction";
+  reactButton.setAttribute("aria-haspopup", "menu");
+  reactButton.onclick = (event) => { event.stopPropagation(); openEmojiPicker(m.id, event.currentTarget); };
   actions.appendChild(copy);
+  actions.insertBefore(reactButton, copy);
   const more = document.createElement("div");
   more.className = "msg-more";
   const moreButton = document.createElement("button");
@@ -1469,13 +2103,133 @@ function renderItem(m, item, st) {
 
 /* ---------------- actions ---------------- */
 async function post(path, body) {
-  const res = await fetch(`/api/session/${SID}/${path}`, {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-  });
-  if (res.ok) { render(await res.json()); }
+  try {
+    const res = await fetch(`/api/session/${SID}/${path}`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    // Envelope routes return {ok, state}; plain routes return the state itself.
+    if (res.ok) { render(data.state ?? data); return data; }
+    showToast(data.error || "Interaction failed", "error");
+  } catch (error) { showToast(error.message || "The simulator did not respond", "error"); }
+  return null;
 }
-const click = (mid, cid, values) => post("click", { message_id: mid, custom_id: cid, values });
+const click = async (mid, cid, values) => {
+  const result = await post("click", { message_id: mid, custom_id: cid, values });
+  if (result) playSound("click");
+  return result;
+};
 let userChange = 0;
+function initialAvatar(name, color) {
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = 96;
+  const context = canvas.getContext("2d");
+  context.fillStyle = color;
+  context.fillRect(0, 0, 96, 96);
+  context.fillStyle = "#fff";
+  context.font = "700 48px Arial, sans-serif";
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+  context.fillText(Array.from(name)[0]?.toUpperCase() || "?", 48, 50);
+  return canvas.toDataURL("image/png");
+}
+function setAvatar(element, member = {}, index = 0) {
+  const name = member.display_name || member.name || "?";
+  const color = member.accent_color || member.role_color || AVATAR_COLORS[Math.abs(index) % AVATAR_COLORS.length];
+  const fallback = initialAvatar(name, color);
+  element.style.backgroundColor = color;
+  element.alt = name;
+  element.classList.add("image");
+  element.onerror = () => { element.onerror = null; element.src = fallback; };
+  element.src = member.avatar_url || fallback;
+}
+
+function showProfile(member, anchor) {
+  if (!member) return;
+  profileTarget = member;
+  const card = $("#profile-card"), rect = anchor.getBoundingClientRect();
+  const banner = $("#profile-banner"), bannerImage = $("#profile-banner-image");
+  banner.style.backgroundColor = member.accent_color || "#5865f2";
+  bannerImage.classList.remove("loaded");
+  bannerImage.onerror = () => bannerImage.classList.remove("loaded");
+  bannerImage.onload = () => bannerImage.classList.add("loaded");
+  if (member.banner_url) bannerImage.src = member.banner_url;
+  else { bannerImage.removeAttribute("src"); bannerImage.onload = null; bannerImage.onerror = null; }
+  setAvatar($("#profile-avatar"), member, Number(member.id) || 0);
+  $("#profile-name").textContent = member.display_name || member.name;
+  $("#profile-user").textContent = `@${member.username || member.name}${member.bot ? " · APP" : ""}`;
+  $("#profile-status").textContent = member.bot ? "Bot" : (member.status || "online");
+
+  $("#profile-bio").textContent = member.bio || "No bio yet.";
+  const controls = $("#profile-controls"); controls.replaceChildren();
+  if (!member.bot && member.custom) {
+    const edit = document.createElement("button"); edit.className = "lib-btn"; edit.textContent = "Edit profile";
+    edit.onclick = () => { closeProfile(); openProfileSettings(member); };
+    controls.appendChild(edit);
+  }
+  const act = document.createElement("button"); act.className = "btn btn-2"; act.textContent = "Act as user"; act.disabled = member.bot;
+  act.onclick = async () => { await setActiveUser(member.id); closeProfile(); };
+  controls.appendChild(act);
+  card.classList.add("open");
+  card.style.left = `${Math.min(rect.right + 8, innerWidth - 320)}px`;
+  card.style.top = `${Math.min(rect.top, innerHeight - 280)}px`;
+}
+function closeProfile() { $("#profile-card").classList.remove("open"); profileTarget = null; }
+window.addEventListener("click", (event) => { if (!$("#profile-card").contains(event.target) && !event.target.closest(".member-row,.msg-avatar,.msg-author-button")) closeProfile(); });
+window.addEventListener("keydown", (event) => { if (event.key === "Escape") { closeProfile(); closeProfileSettings(); closeEmojiPicker(); closeUserSettings(); closeCtxMenu(); closeQuickSwitcher(); } });
+
+async function setActiveUser(userId) {
+  const res = await fetch(`/api/session/${SID}/user`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ user_id: userId }) });
+  const data = await res.json();
+  if (res.ok) { render(data); playSound("switch"); }
+  else showToast(data.error || "Could not switch user", "error");
+}
+
+$("#settings-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  $("#settings-save").click();
+});
+function openProfileSettings(member = null, addNew = false) {
+  settingsTarget = member;
+  settingsMode = addNew ? "add" : "edit";
+  const form = $("#settings-form"); form.reset();
+  $("#settings-head").textContent = addNew ? "Add simulated user" : `Edit ${member.display_name || member.name}`;
+  $("#settings-error").textContent = "";
+  const field = (name) => form.elements.namedItem(name);
+  field("username").value = member?.username || member?.name || "";
+  field("display_name").value = member?.display_name || member?.name || "";
+  field("bio").value = member?.bio || "";
+  field("avatar_url").value = member?.avatar_url || "";
+  field("banner_url").value = member?.banner_url || "";
+  field("accent_color").value = member?.accent_color || "#5865f2";
+  field("status").value = member?.status || "online";
+  field("username").readOnly = !addNew;
+  $("#settings-save").textContent = addNew ? "Add user" : "Save profile";
+  $("#settings-overlay").classList.add("open");
+  field("username").focus();
+}
+function closeProfileSettings() { $("#settings-overlay").classList.remove("open"); settingsTarget = null; }
+$("#add-user").onclick = () => openProfileSettings(null, true);
+$("#edit-profile").onclick = () => {
+  const member = lastState?.member_details?.find((entry) => entry.id === lastState.user.id);
+  if (member?.custom) openProfileSettings(member);
+};
+$("#settings-cancel").onclick = closeProfileSettings;
+$("#settings-overlay").onclick = (event) => { if (event.target.id === "settings-overlay") closeProfileSettings(); };
+$("#settings-save").onclick = async () => {
+  const form = $("#settings-form");
+  if (!form.reportValidity()) return;
+  const mode = settingsMode, target = settingsTarget;
+  const values = Object.fromEntries(new FormData(form));
+  const path = mode === "add" ? "members" : `members/${target.id}/profile`;
+  const method = mode === "add" ? "POST" : "PUT";
+  const res = await fetch(`/api/session/${SID}/${path}`, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(values) });
+  const data = await res.json();
+  if (!res.ok) { if (settingsTarget === target) $("#settings-error").textContent = data.error || "Could not save profile"; return; }
+  if (settingsTarget === target) closeProfileSettings();
+  render(data); playSound("success"); showToast(mode === "add" ? "User added" : "Profile saved", "success");
+};
+
 $("#act-as").onchange = async () => {
   const select = $("#act-as");
   const previous = String(lastState?.user.id ?? select.value);
@@ -1486,10 +2240,10 @@ $("#act-as").onchange = async () => {
   });
   const data = await res.json();
   if (attempt !== userChange) return;
-  if (res.ok) render(data);
+  if (res.ok) { render(data); playSound("switch"); }
   else {
     select.value = previous;
-    pgAlert(data.error || "Could not switch user");
+    showToast(data.error || "Could not switch user", "error");
   }
 };
 
@@ -1504,12 +2258,14 @@ function openModal(modal) {
     const label = document.createElement("label");
     label.innerHTML = `<span></span>${item.required ? ' <span class="req">*</span>' : ""}`;
     label.querySelector("span").textContent = item.label || item.custom_id;
-    const input = document.createElement("input");
+    const input = item.style === 2 ? document.createElement("textarea") : document.createElement("input");
     input.dataset.cid = item.custom_id;
     input.value = item.value || "";
     input.maxLength = item.max_length || 4000;
-    if (item.style === 2) { input.size = 40; }
+    input.required = Boolean(item.required);
+    if (item.min_length) input.minLength = item.min_length;
     input.placeholder = item.placeholder || "";
+    input.setAttribute("aria-label", item.label || item.custom_id);
     f.appendChild(label); f.appendChild(input);
     if (item.min_length) {
       const hint = document.createElement("div"); hint.className = "modal-hint";
@@ -1521,15 +2277,27 @@ function openModal(modal) {
   const overlay = $("#modal-overlay");
   overlay.classList.remove("closing");
   overlay.classList.add("open");
-  body.querySelector("input")?.focus();
+  body.querySelector("input, textarea")?.focus();
 }
 function closeModal(submit) {
   if (!activeModal) return;
+  if (!submit) {
+    const modal = activeModal;
+    dismissedModals.add(modal.id);
+    activeModal = null;
+    const overlay = $("#modal-overlay");
+    overlay.classList.remove("open");
+    overlay.classList.add("closing");
+    setTimeout(() => overlay.classList.remove("closing"), 100);
+    post("dismiss", { modal_id: modal.id });
+    return;
+  }
   const values = {};
   if (submit) {
-    for (const input of $("#modal-body").querySelectorAll("input")) {
-      values[input.dataset.cid] = input.value;
-    }
+    const fields = [...$("#modal-body").querySelectorAll("input, textarea")];
+    const invalid = fields.find((input) => !input.checkValidity());
+    if (invalid) { invalid.reportValidity(); invalid.focus(); return; }
+    for (const input of fields) values[input.dataset.cid] = input.value;
   }
   const modal = activeModal;
   activeModal = null;
@@ -1537,12 +2305,12 @@ function closeModal(submit) {
   overlay.classList.remove("open");
   overlay.classList.add("closing");
   setTimeout(() => overlay.classList.remove("closing"), 100);
-  if (submit) post("submit", { modal_id: modal.id, values });
-  else dismissedModals.add(modal.id);
+  post("submit", { modal_id: modal.id, values });
 }
 $("#modal-ok").onclick = () => closeModal(true);
 $("#modal-cancel").onclick = () => closeModal(false);
 $("#modal-overlay").onclick = (e) => { if (e.target.id === "modal-overlay") closeModal(false); };
+
 document.addEventListener("keydown", (e) => {
   if (!$("#modal-overlay").classList.contains("open")) return;
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); closeModal(true); }
@@ -1565,18 +2333,42 @@ function renderMembers(st) {
     list.appendChild(group);
     members.forEach((member, index) => {
       const row = document.createElement("div");
-      row.className = "member-row";
-      const avatar = document.createElement("div");
+      row.className = "member-row" + (member.id == st.user.id ? " active" : "");
+      row.tabIndex = 0;
+      row.setAttribute("role", "button");
+      const avatar = document.createElement("img");
       avatar.className = "member-avatar";
       avatar.dataset.status = member.status || "online";
-      avatar.style.background = member.bot ? "var(--brand-primary)"
-        : (member.role_color || AVATAR_COLORS[(index + offset) % AVATAR_COLORS.length]);
-      avatar.textContent = (member.name || "?")[0].toUpperCase();
+      setAvatar(avatar, member, index + offset);
+      avatar.alt = "";
       const label = document.createElement("span");
       label.className = "member-name" + (member.bot ? " bot" : "");
+      if (member.banned) label.classList.add("banned-name");
       if (!member.bot && member.role_color) label.style.color = member.role_color;
-      label.textContent = member.name;
+      label.textContent = member.display_name || member.name;
       row.append(avatar, label);
+      if (member.bot) {
+        const botTag = document.createElement("span"); botTag.className = "member-bot-tag"; botTag.textContent = "APP";
+        row.appendChild(botTag);
+      }
+      if (member.timed_out) {
+        const clock = document.createElement("span"); clock.className = "member-bot-tag"; clock.title = "Timed out"; clock.textContent = "⏳";
+        row.appendChild(clock);
+      }
+      const mod = document.createElement("span");
+      mod.className = "member-mod";
+      const kick = document.createElement("button"); kick.type = "button"; kick.title = "Kick (simulated)"; kick.textContent = "👢";
+      kick.onclick = (event) => { event.stopPropagation(); moderatePost("kick", member.id); };
+      const ban = document.createElement("button"); ban.type = "button"; ban.title = "Ban (simulated)"; ban.textContent = "🔨";
+      ban.onclick = (event) => { event.stopPropagation(); moderatePost("ban", member.id); };
+      mod.append(kick, ban);
+      row.appendChild(mod);
+      row.title = `View @${member.username || member.name}'s profile`;
+      row.onclick = (event) => showProfile(member, event.currentTarget);
+      row.oncontextmenu = (event) => { event.preventDefault(); openCtxMenu(event.currentTarget, memberModerationItems(member)); };
+      row.onkeydown = (event) => {
+        if (event.key === "Enter" || event.key === " ") { event.preventDefault(); showProfile(member, event.currentTarget); }
+      };
       list.appendChild(row);
     });
   };
@@ -1598,6 +2390,13 @@ function renderChannels(st) {
   chevron.className = "channel-chevron" + (categoryCollapsed ? " closed" : "");
   chevron.textContent = "▾";
   cat.append(chevron, document.createTextNode("TEXT CHANNELS"));
+  const addChannel = document.createElement("button");
+  addChannel.type = "button";
+  addChannel.className = "new-channel-btn";
+  addChannel.title = "Create channel";
+  addChannel.textContent = "＋";
+  addChannel.onclick = (event) => { event.stopPropagation(); openNewChannelDialog(); };
+  cat.appendChild(addChannel);
   const channelItems = document.createElement("div");
   channelItems.className = "channel-items" + (categoryCollapsed ? " collapsed" : "");
   cat.onclick = () => {
@@ -1606,6 +2405,30 @@ function renderChannels(st) {
     chevron.classList.toggle("closed", categoryCollapsed);
   };
   list.append(cat, channelItems);
+  const voice = st.voice;
+  if (voice?.channel) {
+    const voiceRow = document.createElement("div");
+    voiceRow.className = "voice-row lit";
+    voiceRow.innerHTML = `<span class="bolt">⚡</span>`;
+    const voiceLabel = document.createElement("span");
+    voiceLabel.id = "voice-channel-label";
+    voiceLabel.textContent = voice.name || "voice";
+    voiceRow.appendChild(voiceLabel);
+    voiceRow.title = "Simulated voice — click leave in the sidebar foot";
+    channelItems.appendChild(voiceRow);
+    const voiceMember = document.createElement("div");
+    voiceMember.className = "voice-member" + ((voice.speaking || []).includes(String(st.user.id)) ? " speaking" : "");
+    const vmImg = document.createElement("img");
+    setAvatar(vmImg, activeStateUser(st), Number(st.user.id) || 0);
+    vmImg.alt = "";
+    const vmName = document.createElement("span");
+    vmName.textContent = st.user.name;
+    const vmFlags = document.createElement("span");
+    vmFlags.className = "vm-flag";
+    vmFlags.textContent = (voice.self_mute ? "🔇" : "") + (voice.self_deaf ? "🎧" : "");
+    voiceMember.append(vmImg, vmName, vmFlags);
+    channelItems.appendChild(voiceMember);
+  }
   for (const c of st.channels || []) {
     const row = document.createElement("div");
     row.className = "channel-row" + (c.id == currentChannel ? " active" : "");
@@ -1630,7 +2453,8 @@ function renderChannels(st) {
   $("#chat-head-name").textContent = "# " + channelName(st);
   $("#head-topic").textContent = channel?.topic || "";
   $("#head-topic").hidden = !channel?.topic;
-  composerInput.placeholder = `Message #${channelName(st)} — type !ping, !hello, or / for commands`;
+  composerInput.placeholder = `Message #${channelName(st)} — type !ping, !hello, or / for commands`
+    + (pendingUploads.length ? ` · ${pendingUploads.length} attachment(s) staged` : "");
 }
 
 /* ---------------- composer: chat + slash commands ---------------- */
@@ -1694,7 +2518,7 @@ function paramInput(p) {
     }
   } else if (p.type === "channel") {
     field = document.createElement("select");
-    field.appendChild(new Option("#" + lastState.channel.name, lastState.channel.id));
+    for (const channel of lastState.channels || []) field.appendChild(new Option("#" + channel.name, channel.id));
   } else {
     field = document.createElement("input");
     field.type = p.type === "integer" || p.type === "number" ? "number"
@@ -1752,7 +2576,7 @@ composerInput.addEventListener("input", () => {
   if (!cmdMode && v.startsWith("/")) showPalette(v.slice(1));
   else hidePalette();
 });
-composerInput.addEventListener("keydown", (e) => {
+composerInput.addEventListener("keydown", async (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
     const text = composerInput.value.trim();
@@ -1764,9 +2588,10 @@ composerInput.addEventListener("keydown", (e) => {
       return;
     }
     if (cmdMode) { submitCommand(); return; }
-    if (!text) return;
+    if (!text && !pendingUploads.length) return;
     composerInput.value = "";
-    post("message", { content: text, channel_id: currentChannel });
+    const files = await flushUploads();
+    post("message", { content: text || `Sent ${files.length} attachment(s)`, channel_id: currentChannel, files });
   }
 });
 document.addEventListener("keydown", (e) => {
@@ -1774,11 +2599,191 @@ document.addEventListener("keydown", (e) => {
 });
 
 /* editor */
+const WORKSPACE_STATE_KEY = "pg-workspace-state";
+const PG_CODE_CONTEXT_KEY = "pg-code-context";
 let activeWorkspace = null;
 let activeEntry = "bot.py";
+let workspaceBaseline = null;
+let workspaceFiles = [];
+let legacyDraftPending = false;
+let legacyDraftCode = null;
+let legacyDraftMessage = "";
+let initialExampleCode = "";
+let sessionReady = false;
+let runPending = false;
+let workspaceBootReady = false;
+let workspaceListReady = false;
+let workspaceRestorePending = false;
+
+function persistEditorCode(code = $("#code").value) {
+  if (legacyDraftPending) return;
+  localStorage.setItem("pg-code", code);
+  localStorage.setItem(PG_CODE_CONTEXT_KEY,
+    activeWorkspace || localStorage.getItem(WORKSPACE_STATE_KEY) !== null ? "workspace" : "standalone");
+}
+
+function persistWorkspaceState() {
+  if (!activeWorkspace || !activeEntry || workspaceBaseline === null) return;
+  localStorage.setItem(WORKSPACE_STATE_KEY, JSON.stringify({
+    version: 1, workspace: activeWorkspace, filename: activeEntry, baseline: workspaceBaseline,
+  }));
+}
+
+function clearWorkspacePersistence() {
+  localStorage.removeItem(WORKSPACE_STATE_KEY);
+}
+
+function discardUnavailableWorkspaceState() {
+  clearWorkspacePersistence();
+  workspaceRestorePending = false;
+  localStorage.removeItem("pg-code");
+  localStorage.removeItem(PG_CODE_CONTEXT_KEY);
+  activeWorkspace = null;
+  activeEntry = "bot.py";
+  workspaceBaseline = null;
+  $("#code").value = "";
+  $("#workspace-select").value = "";
+  updateWorkspaceFiles([]);
+  syncWorkspaceUI();
+}
+
+async function restoreWorkspaceState() {
+  const stored = localStorage.getItem(WORKSPACE_STATE_KEY);
+  if (stored === null) { workspaceRestorePending = false; return false; }
+  let saved;
+  try { saved = JSON.parse(stored); }
+  catch { discardUnavailableWorkspaceState(); return true; }
+  const option = [...$("#workspace-select").options].find((item) => item.value === saved.workspace);
+  const files = option ? JSON.parse(option.dataset.files || "[]") : [];
+  const buffer = localStorage.getItem("pg-code");
+  if (saved.version !== 1 || typeof saved.filename !== "string" || !files.includes(saved.filename)
+      || typeof saved.baseline !== "string" || buffer === null) {
+    discardUnavailableWorkspaceState();
+    return true;
+  }
+  const url = `/api/workspaces/${encodeURIComponent(saved.workspace)}/files/${saved.filename.split("/").map(encodeURIComponent).join("/")}`;
+  const response = await fetch(url);
+  if (response.status === 404) { discardUnavailableWorkspaceState(); return true; }
+  if (!response.ok) throw new Error("Could not load saved workspace file.");
+  const file = await response.json();
+  if (file.name !== saved.filename || typeof file.code !== "string") {
+    throw new Error("Could not validate saved workspace file.");
+  }
+  activeWorkspace = saved.workspace;
+  $("#workspace-select").value = saved.workspace;
+  updateWorkspaceFiles(files, file.name);
+  activeEntry = file.name;
+  workspaceBaseline = file.code;
+  $("#code").value = buffer === saved.baseline ? file.code : buffer;
+  loadedScript = null;
+  persistEditorCode();
+  persistWorkspaceState();
+  syncWorkspaceUI();
+  $("#run-stats").textContent = $("#code").value === workspaceBaseline
+    ? `— restored ${activeWorkspace}/${activeEntry}`
+    : `— restored unsaved ${activeWorkspace}/${activeEntry}; Run File uses this buffer, Run boots saved files`;
+  return true;
+}
+
+function syncWorkspaceUI() {
+  const connected = Boolean(activeWorkspace);
+  const editorLocked = !sessionReady || legacyDraftPending || workspaceRestorePending;
+  $("#legacy-draft-notice").hidden = !legacyDraftPending || !workspaceBootReady;
+  $("#legacy-draft-message").textContent = legacyDraftMessage;
+  $("#code").readOnly = editorLocked;
+  $("#workspace-select").disabled = !workspaceListReady || editorLocked;
+  $("#btn-connect").disabled = !workspaceListReady || editorLocked;
+  $("#workspace-file-select").disabled = !workspaceListReady || editorLocked || !connected || !workspaceFiles.length;
+  $("#script-select").disabled = editorLocked;
+  $("#btn-delete").disabled = editorLocked;
+  $("#btn-blocks").disabled = editorLocked;
+  $("#btn-apply-blocks").disabled = editorLocked;
+  $("#btn-design").disabled = editorLocked;
+  $("#btn-run").disabled = editorLocked || runPending;
+  $("#btn-save").disabled = editorLocked;
+  $("#workspace-files").hidden = !connected;
+  $("#workspace-note").hidden = !connected;
+  $("#run-actions").hidden = !connected;
+  $("#btn-run").textContent = "▶ Run";
+  $("#btn-run").title = legacyDraftPending
+    ? "Choose how to migrate this draft before running it"
+    : connected
+      ? "Boot the whole bot from files saved on disk; editor changes are not saved"
+      : "Run the editor buffer as a playground script";
+  $("#btn-run-file").disabled = !workspaceListReady || editorLocked || runPending || !connected || !activeEntry;
+  $("#btn-open-file").disabled = !workspaceListReady || editorLocked || !connected || !$("#workspace-file-select").value;
+  $("#btn-save").textContent = connected ? "Save file" : "Save";
+  $("#btn-save").title = legacyDraftPending
+    ? "Choose how to migrate this draft before saving"
+    : connected
+      ? `Save editor contents to ${activeWorkspace}/${activeEntry}`
+      : "Save the editor contents into the library";
+  $("#editor-filename").textContent = legacyDraftPending
+    ? "Unassigned legacy draft"
+    : connected ? activeEntry : loadedScript ? `${loadedScript}.py` : "bot.py";
+  $("#editor-filename").title = legacyDraftPending
+    ? "The draft's workspace origin is unverified"
+    : connected ? `Editing ${activeWorkspace}/${activeEntry}` : "Standalone playground script";
+  const dirty = connected && workspaceBaseline !== null && $("#code").value !== workspaceBaseline;
+  $("#workspace-dirty").hidden = !dirty;
+  $("#btn-run-file").title = dirty
+    ? "Run the unsaved editor buffer; it will not be written to disk"
+    : "Run the active editor buffer without saving";
+}
+
+function resolveLegacyDraft(choice) {
+  if (!legacyDraftPending) return;
+  const draft = legacyDraftCode;
+  const keepAsStandalone = choice === "standalone";
+  legacyDraftPending = false;
+  legacyDraftCode = null;
+  if (keepAsStandalone) {
+    clearWorkspacePersistence();
+    activeWorkspace = null;
+    activeEntry = "bot.py";
+    workspaceBaseline = null;
+    loadedScript = null;
+    $("#workspace-select").value = "";
+    $("#script-select").value = "";
+    $("#code").value = draft;
+    updateWorkspaceFiles([]);
+  } else {
+    loadedScript = null;
+    $("#script-select").value = "";
+    $("#code").value = initialExampleCode;
+  }
+  $("#btn-run").disabled = false;
+  $("#btn-save").disabled = false;
+  persistEditorCode();
+  syncWorkspaceUI();
+  $("#run-stats").textContent = keepAsStandalone
+    ? "— restored legacy draft as standalone; Run uses the playground and Save uses the script library"
+    : "— discarded legacy draft; restored the example script";
+}
+
+$("#legacy-draft-standalone").onclick = () => resolveLegacyDraft("standalone");
+$("#legacy-draft-discard").onclick = () => resolveLegacyDraft("discard");
+
+function confirmWorkspaceReplacement(action) {
+  return workspaceBaseline === null || $("#code").value === workspaceBaseline
+    || confirm(`Discard unsaved changes to ${activeWorkspace}/${activeEntry} before ${action}?`);
+}
+
+function updateWorkspaceFiles(files, selected = activeEntry) {
+  workspaceFiles = files || [];
+  const select = $("#workspace-file-select");
+  select.replaceChildren(...workspaceFiles.map((filename) => new Option(filename, filename)));
+  if (!workspaceFiles.length) select.appendChild(new Option("No Python files found", ""));
+  select.disabled = legacyDraftPending || !workspaceListReady || !activeWorkspace || !workspaceFiles.length;
+  if (workspaceFiles.includes(selected)) select.value = selected;
+  else if (workspaceFiles.length) select.value = workspaceFiles[0];
+  activeEntry = select.value || "";
+  syncWorkspaceUI();
+}
 
 async function loadWorkspaces() {
   const res = await fetch("/api/workspaces");
+  if (!res.ok) throw new Error("Could not load workspaces.");
   const items = (await res.json()).workspaces;
   const select = $("#workspace-select");
   select.innerHTML = '<option value="">connect a folder…</option>';
@@ -1786,37 +2791,94 @@ async function loadWorkspaces() {
     const entry = item.files.find((f) => f === "main.py") || item.files.find((f) => f === "bot.py") || item.files[0] || "";
     const option = new Option(`${item.name} (${item.files.length} files)`, item.name);
     option.dataset.entry = entry;
+    option.dataset.files = JSON.stringify(item.files);
     select.appendChild(option);
   }
 }
 
+$("#workspace-select").addEventListener("change", () => {
+  if (!activeWorkspace) updateWorkspaceFiles($("#workspace-select").selectedOptions[0]?.dataset.files
+    ? JSON.parse($("#workspace-select").selectedOptions[0].dataset.files) : []);
+  else if ($("#workspace-select").value === activeWorkspace) syncWorkspaceUI();
+});
+
+async function openWorkspaceFile(filename = $("#workspace-file-select").value) {
+  if (legacyDraftPending || !activeWorkspace || !filename) return;
+  if (!confirmWorkspaceReplacement("opening another file")) {
+    $("#workspace-file-select").value = activeEntry;
+    return;
+  }
+  const res = await fetch(`/api/workspaces/${encodeURIComponent(activeWorkspace)}/files/${filename.split("/").map(encodeURIComponent).join("/")}`);
+  if (!res.ok) { pgAlert("Could not load that workspace file."); return; }
+  const data = await res.json();
+  activeEntry = data.name;
+  $("#workspace-file-select").value = data.name;
+  $("#code").value = data.code;
+  workspaceBaseline = data.code;
+  loadedScript = null;
+  $("#workspace-select").value = activeWorkspace || "";
+  persistEditorCode(data.code);
+  persistWorkspaceState();
+  syncWorkspaceUI();
+  $("#run-stats").textContent = `— opened ${activeWorkspace}/${activeEntry}`;
+}
+
 $("#btn-connect").onclick = async () => {
+  if (!workspaceListReady || legacyDraftPending) return;
   const select = $("#workspace-select");
   const name = select.value;
   if (!name) { pgAlert("Choose a bot folder first."); return; }
-  const entry = select.selectedOptions[0].dataset.entry;
+  const option = select.selectedOptions[0];
+  const files = JSON.parse(option.dataset.files || "[]");
+  const entry = option.dataset.entry;
   if (!entry) { pgAlert("That folder has no Python entry file."); return; }
-  const res = await fetch(`/api/workspaces/${encodeURIComponent(name)}/files/${encodeURIComponent(entry)}`);
-  if (!res.ok) { pgAlert("Could not load the bot's entry file."); return; }
-  const data = await res.json();
+  if (activeWorkspace && !confirmWorkspaceReplacement("connecting another workspace")) {
+    select.value = activeWorkspace;
+    return;
+  }
+  workspaceBaseline = null;
   activeWorkspace = name;
-  activeEntry = entry;
-  loadedScript = null;
-  $("#code").value = data.code;
-  $("#run-stats").textContent = `— connected ${name}/${entry}`;
+  updateWorkspaceFiles(files, entry);
+  await openWorkspaceFile(entry);
+  syncWorkspaceUI();
+  $("#run-stats").textContent = `— connected ${name}/${entry} · Run boots saved files; Run File uses the editor buffer`;
 };
+
+$("#btn-open-file").onclick = () => openWorkspaceFile();
+$("#workspace-file-select").addEventListener("change", () => {
+  $("#btn-open-file").disabled = !workspaceListReady || legacyDraftPending
+    || !activeWorkspace || !$("#workspace-file-select").value;
+});
 
 $("#btn-save").dataset.workspaceSave = "true";
 $("#btn-save").addEventListener("click", async (event) => {
+  if (legacyDraftPending) { event.preventDefault(); event.stopImmediatePropagation(); return; }
   if (!activeWorkspace || event.__workspaceHandled) return;
   event.__workspaceHandled = true;
   event.stopImmediatePropagation();
-  const res = await fetch(`/api/workspaces/${encodeURIComponent(activeWorkspace)}/files/${encodeURIComponent(activeEntry)}`, {
+  const filename = activeEntry.split("/").map(encodeURIComponent).join("/");
+  const res = await fetch(`/api/workspaces/${encodeURIComponent(activeWorkspace)}/files/${filename}`, {
     method: "PUT", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ code: $("#code").value }),
   });
   const data = await res.json();
-  $("#run-stats").textContent = data.ok ? `— saved ${activeWorkspace}/${activeEntry}` : `— ${data.error}`;
+  if (!res.ok || !data.ok) { pgAlert(data.error || "Workspace save failed."); return; }
+  workspaceBaseline = $("#code").value;
+  persistWorkspaceState();
+  syncWorkspaceUI();
+  $("#run-stats").textContent = `— saved ${activeWorkspace}/${activeEntry}`;
+});
+
+$("#code").addEventListener("input", () => {
+  if (legacyDraftPending) { $("#code").value = legacyDraftCode; return; }
+  persistEditorCode();
+  persistWorkspaceState();
+  syncWorkspaceUI();
+  if (activeWorkspace && workspaceBaseline !== null) {
+    $("#run-stats").textContent = $("#code").value !== workspaceBaseline
+      ? `— unsaved ${activeWorkspace}/${activeEntry}; Run File uses this buffer, Run boots saved files`
+      : `— editing saved file ${activeWorkspace}/${activeEntry}`;
+  }
 });
 
 function blockCode() {
@@ -1836,9 +2898,16 @@ function updateBlocks() {
 for (const field of document.querySelectorAll("#block-panel input")) field.addEventListener("input", updateBlocks);
 $("#btn-blocks").onclick = () => { $("#block-panel").classList.toggle("open"); updateBlocks(); };
 $("#btn-apply-blocks").onclick = () => {
+  if (activeWorkspace && !confirmWorkspaceReplacement("applying blocks")) return;
   $("#code").value = blockCode();
+  clearWorkspacePersistence();
   activeWorkspace = null;
+  activeEntry = "bot.py";
+  workspaceBaseline = null;
+  $("#workspace-select").value = "";
+  updateWorkspaceFiles([]);
   loadedScript = null;
+  syncWorkspaceUI();
   $("#block-panel").classList.remove("open");
   $("#run-stats").textContent = "— blocks applied to editor";
 };
@@ -1854,113 +2923,144 @@ function jumpToEditorLine(line) {
   editor.scrollTop = Math.max(0, (line - 3) * lineHeight);
 }
 
-let runErrorFingerprint;
-function renderRunError(run) {
-  const fingerprint = JSON.stringify(run ?? null);
-  if (fingerprint === runErrorFingerprint) return;
-  runErrorFingerprint = fingerprint;
-  const panel = $("#run-error");
-  panel.replaceChildren();
-  const error = run && run.exception;
-  if (!error || run.ok) { panel.classList.remove("open"); return; }
-  const heading = document.createElement("div");
-  heading.className = "run-error-title";
-  heading.textContent = `ERROR · ${error.type || "ScriptError"}`;
-  const location = document.createElement("div");
-  location.className = "run-error-location";
-  const filename = error.file === "<playground>" ? "bot.py" : error.file;
-  location.textContent = filename && Number.isInteger(error.line) ? `${filename}:${error.line}` : "Script location unavailable";
-  const message = document.createElement("div");
-  message.className = "run-error-message";
-  message.textContent = error.message || run.error || "Script failed";
-  const trace = document.createElement("details");
-  trace.className = "run-error-trace";
-  if (run.error && run.error !== error.message) {
-    const summary = document.createElement("summary");
-    summary.textContent = "Show traceback";
-    const pre = document.createElement("pre");
-    pre.textContent = run.error;
-    trace.append(summary, pre);
+async function openProblemLocation(problem) {
+  const file = problem.file;
+  if (!file || !problem.workspace) return;
+  const replacingBuffer = activeWorkspace && workspaceBaseline !== null
+    && $("#code").value !== workspaceBaseline;
+  if (replacingBuffer && !confirmWorkspaceReplacement("opening the problem location")) return;
+  if (activeWorkspace !== problem.workspace) {
+    await loadWorkspaces();
+    workspaceListReady = true;
+    const option = [...$("#workspace-select").options].find((item) => item.value === problem.workspace);
+    if (!option) return pgAlert(`Workspace ${problem.workspace} is no longer available.`);
+    activeWorkspace = problem.workspace;
+    $("#workspace-select").value = problem.workspace;
+    updateWorkspaceFiles(JSON.parse(option.dataset.files || "[]"), file);
   }
-  const actions = document.createElement("div");
-  actions.className = "run-error-actions";
-  const copy = document.createElement("button");
-  copy.type = "button";
-  copy.className = "tool-link";
-  copy.textContent = "Copy error";
-  copy.onclick = async () => {
-    const summary = `${error.type || "ScriptError"}: ${error.message || run.error || "Script failed"}`
-      + (filename && error.line ? `\n${filename}:${error.line}` : "")
-      + (run.error && run.error !== error.message ? `\n\n${run.error}` : "");
-    try {
-      await navigator.clipboard.writeText(summary);
-      copy.textContent = "Copied";
-    } catch (_) {
-      const fallback = document.createElement("textarea");
-      fallback.value = summary;
-      fallback.setAttribute("readonly", "");
-      fallback.style.position = "fixed";
-      fallback.style.opacity = "0";
-      document.body.appendChild(fallback);
-      fallback.select();
-      const copied = document.execCommand("copy");
-      fallback.remove();
-      if (copied) copy.textContent = "Copied";
-      else pgAlert("Could not copy the error in this browser context.");
-    }
-  };
-  actions.appendChild(copy);
-  if (error.file === "<playground>" && Number.isInteger(error.line)) {
-    const jump = document.createElement("button");
-    jump.type = "button";
-    jump.className = "tool-link";
-    jump.textContent = "Jump to line";
-    jump.onclick = () => {
-      jumpToEditorLine(error.line);
-      $("#run-stats").textContent = `— ${lastRunSource}:${error.line}`;
-    };
-    actions.appendChild(jump);
-  }
-  const stateButton = document.createElement("button");
-  stateButton.type = "button";
-  stateButton.className = "tool-link";
-  stateButton.textContent = "Inspect State";
-  stateButton.onclick = () => setInspector("state");
-  actions.appendChild(stateButton);
-  panel.append(heading, location, message);
-  if (trace.childNodes.length) panel.appendChild(trace);
-  panel.appendChild(actions);
-  panel.classList.add("open");
+  if (!workspaceFiles.includes(file)) updateWorkspaceFiles(workspaceFiles, file);
+  const response = await fetch(`/api/workspaces/${encodeURIComponent(problem.workspace)}/files/${file.split("/").map(encodeURIComponent).join("/")}`);
+  if (!response.ok) return pgAlert(`Could not open ${problem.workspace}/${file}.`);
+  const source = await response.json();
+  activeWorkspace = problem.workspace;
+  activeEntry = source.name;
+  workspaceBaseline = source.code;
+  $("#workspace-select").value = problem.workspace;
+  $("#workspace-file-select").value = source.name;
+  $("#code").value = source.code;
+  loadedScript = null;
+  persistEditorCode(source.code);
+  persistWorkspaceState();
+  syncWorkspaceUI();
+  setInspector("console");
+  jumpToEditorLine(problem.line);
+  $("#run-stats").textContent = `— opened ${problem.workspace}/${source.name}:${problem.line}`;
 }
 
-$("#btn-run").onclick = async () => {
-  const code = $("#code").value;
-  localStorage.setItem("pg-code", code);
-  lastRunSource = activeWorkspace ? `${activeWorkspace}/${activeEntry}` : loadedScript ? `${loadedScript}.py` : "editor";
-  $("#btn-run").disabled = true;
+function renderProblems(st) {
+  const panel = $("#problems");
+  const error = st?.last_run?.exception;
+  const fingerprint = JSON.stringify(error || null);
+  if (fingerprint === problemFingerprint && (panel.childNodes.length || !error)) return;
+  problemFingerprint = fingerprint;
+  panel.replaceChildren();
+  if (!error || st.last_run?.ok) {
+    const empty = document.createElement("div");
+    empty.className = "inspect-empty";
+    empty.textContent = "No problems detected.";
+    panel.appendChild(empty);
+    return;
+  }
+  const heading = document.createElement("div");
+  heading.className = "problem-heading";
+  heading.textContent = "Python · 1 problem";
+  panel.appendChild(heading);
+  const entry = document.createElement("button");
+  entry.type = "button";
+  entry.disabled = !(error.workspace && error.file) && !Number.isInteger(error.line);
+  entry.className = "problem-entry";
+  entry.innerHTML = '<span class="problem-icon">●</span><span class="problem-copy"><span class="problem-message"></span><span class="problem-location"></span></span>';
+  entry.querySelector(".problem-message").textContent = `${error.type || "ScriptError"}: ${error.message || "Script failed"}`;
+  const location = error.workspace && error.file
+    ? `${error.workspace}/${error.file}:${error.line}` : `${error.file || "Unknown"}:${error.line || "?"}`;
+  entry.querySelector(".problem-location").textContent = location;
+  entry.onclick = () => error.workspace ? openProblemLocation(error) : jumpToEditorLine(error.line);
+  panel.appendChild(entry);
+  if (error.traceback || st.last_run.error) {
+    const trace = document.createElement("details");
+    trace.className = "problem-trace";
+    const summary = document.createElement("summary");
+    summary.textContent = "Show traceback";
+    const content = document.createElement("pre");
+    content.textContent = error.traceback || st.last_run.error;
+    trace.append(summary, content);
+    panel.appendChild(trace);
+  }
+}
+
+async function runRequest(url, payload, source) {
+  runPending = true;
+  syncWorkspaceUI();
+  lastRunSource = source;
+  let statusText = "";
+  let showProblems = false;
   try {
-    const url = activeWorkspace ? `/api/session/${SID}/project` : `/api/session/${SID}/run`;
-    const payload = activeWorkspace ? { workspace: activeWorkspace } : { code };
     const res = await fetch(url, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
     });
-    if (!res.ok) {
-      const error = await res.json();
-      pgAlert(error.error || "Run failed.");
-      return;
-    }
-    if (activeWorkspace) {
-      const data = await res.json();
+    const data = await res.json();
+    const failedRun = data.last_run?.exception && !data.last_run.ok ? data.last_run : null;
+    if (failedRun) {
+      showProblems = true;
+      const failureLabel = res.ok && data.ok ? "hosted bot error" : "hosted bot startup failed";
+      statusText = `— ${failureLabel} · ${failedRun.exception.type || "error"} · ${failedRun.exception.workspace || activeWorkspace}`;
+    } else if (!res.ok || !data.ok) {
+      showProblems = typeof data.ms === "number";
+      statusText = `— ${data.error || "Run failed."}`;
+      if (!showProblems) pgAlert(data.error || "Run failed.");
+    } else if (data.mode === "project") {
       const status = data.status || {};
-      $("#run-stats").textContent =
-        `— ${status.bot || "bot"} · cogs: ${(status.cogs || []).join(", ") || "none"} · ${(status.commands || []).length} slash commands`;
+      statusText = `— saved bot booted · ${status.bot || "bot"} · cogs: ${(status.cogs || []).join(", ") || "none"} · ${(status.commands || []).length} slash commands`;
+    } else {
+      const unsaved = workspaceBaseline !== null && $("#code").value !== workspaceBaseline;
+      statusText = `— ran editor buffer: ${source}${unsaved ? " (unsaved; disk unchanged)" : ""}`;
     }
   } catch (error) {
+    statusText = `— ${error.message || "Run request failed."}`;
     pgAlert(error.message || "Run request failed.");
-  } finally { $("#btn-run").disabled = false; await refresh(); }
+  } finally {
+    try {
+      await refresh();
+      if (showProblems) setInspector("problems");
+    } finally {
+      runPending = false;
+      syncWorkspaceUI();
+    }
+    if (statusText) $("#run-stats").textContent = statusText;
+  }
+}
+
+$("#btn-run").onclick = async () => {
+  if (legacyDraftPending) return;
+  const code = $("#code").value;
+  persistEditorCode(code);
+  const url = activeWorkspace ? `/api/session/${SID}/project` : `/api/session/${SID}/run`;
+  const payload = activeWorkspace ? { workspace: activeWorkspace } : { code };
+  await runRequest(url, payload, activeWorkspace ? `${activeWorkspace} (saved project)`
+    : loadedScript ? `${loadedScript}.py` : "editor");
+};
+$("#btn-run-file").onclick = async () => {
+  if (legacyDraftPending || !activeWorkspace || !activeEntry) return;
+  const source = `${activeWorkspace}/${activeEntry}`;
+  await runRequest(`/api/session/${SID}/run-file`, {
+    workspace: activeWorkspace, filename: activeEntry, code: $("#code").value,
+  }, source);
 };
 $("#code").addEventListener("keydown", (e) => {
-  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); $("#btn-run").click(); }
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+    e.preventDefault();
+    (activeWorkspace ? $("#btn-run-file") : $("#btn-run")).click();
+  }
   if (e.key === "Tab") {
     e.preventDefault();
     const { selectionStart: s, selectionEnd: en, value: v } = e.target;
@@ -1987,8 +3087,11 @@ function pgAlert(message) {
 }
 
 async function loadLibrary() {
+  const request = ++libraryLoadRequest;
   const res = await fetch("/api/scripts");
-  libScripts = (await res.json()).scripts;
+  const scripts = (await res.json()).scripts;
+  if (request !== libraryLoadRequest) return;
+  libScripts = scripts;
   const sel = $("#script-select");
   sel.innerHTML = "";
   for (const s of libScripts) {
@@ -2002,18 +3105,31 @@ async function loadLibrary() {
 }
 
 $("#script-select").addEventListener("change", async (e) => {
+  if (legacyDraftPending) { e.target.value = ""; return; }
   const name = e.target.value;
   if (!name) return;
+  if (activeWorkspace && !confirmWorkspaceReplacement("loading a library script")) {
+    e.target.value = "";
+    return;
+  }
   const res = await fetch(`/api/scripts/${encodeURIComponent(name)}`);
   if (!res.ok) return;
   const data = await res.json();
   $("#code").value = data.code;
-  localStorage.setItem("pg-code", data.code);
+  clearWorkspacePersistence();
+  activeWorkspace = null;
+  activeEntry = "bot.py";
+  workspaceBaseline = null;
+  $("#workspace-select").value = "";
+  updateWorkspaceFiles([]);
   loadedScript = name;
+  persistEditorCode(data.code);
+  syncWorkspaceUI();
   $("#run-stats").textContent = "— loaded " + name;
 });
 
 $("#btn-save").onclick = async () => {
+  if (legacyDraftPending) return;
   const name = prompt("Save script as:", loadedScript || "");
   if (name === null) return;
   const res = await fetch("/api/scripts", {
@@ -2024,6 +3140,7 @@ $("#btn-save").onclick = async () => {
   if (!data.ok) { pgAlert(data.error || "Save failed"); return; }
   loadedScript = data.name;
   await loadLibrary();
+  syncWorkspaceUI();
   $("#run-stats").textContent = data.existed ? `— updated ${data.name}` : `— saved ${data.name}`;
 };
 
@@ -2143,11 +3260,13 @@ $("#btn-delete").onclick = async () => {
   await fetch(`/api/scripts/${encodeURIComponent(loadedScript)}`, { method: "DELETE" });
   loadedScript = null;
   await loadLibrary();
+  syncWorkspaceUI();
   $("#run-stats").textContent = "— deleted";
 };
 
 /* ---------------- design bridge (Embeder -> playground) ---------------- */
 $("#btn-design").onclick = async () => {
+  if (activeWorkspace && !confirmWorkspaceReplacement("importing a design")) return;
   const res = await fetch("/api/designs");
   const { designs } = await res.json();
   if (!designs.length) {
@@ -2165,21 +3284,439 @@ $("#btn-design").onclick = async () => {
   const data = await bridge.json();
   if (!data.ok) { pgAlert(data.error || "Bridge failed"); return; }
   $("#code").value = data.code;
-  localStorage.setItem("pg-code", data.code);
+  clearWorkspacePersistence();
+  activeWorkspace = null;
+  activeEntry = "bot.py";
+  workspaceBaseline = null;
+  $("#workspace-select").value = "";
+  updateWorkspaceFiles([]);
   loadedScript = null;
+  persistEditorCode(data.code);
+  syncWorkspaceUI();
   $("#run-stats").textContent = "— design imported: " + pick;
 };
 
 /* Receiving side of the builder's "Test in playground" button: the builder
    writes our autosave key, and the storage event fires here (same origin). */
 window.addEventListener("storage", (e) => {
-  if (e.key !== "pg-code" || e.newValue === null || e.newValue === $("#code").value) return;
+  if (e.key !== "pg-code") return;
+  if (legacyDraftPending) {
+    localStorage.setItem("pg-code", legacyDraftCode);
+    return;
+  }
+  if (e.newValue === null || e.newValue === $("#code").value) return;
+  if (activeWorkspace && !confirmWorkspaceReplacement("loading code from Embeder")) return;
   $("#code").value = e.newValue;
+  clearWorkspacePersistence();
+  activeWorkspace = null;
+  activeEntry = "bot.py";
+  workspaceBaseline = null;
+  $("#workspace-select").value = "";
+  updateWorkspaceFiles([]);
   loadedScript = null;
+  persistEditorCode(e.newValue);
+  syncWorkspaceUI();
   $("#run-stats").textContent = "— design pushed from Embeder";
 });
 
+function showToast(message, type = "info") {
+  const stack = $("#toast-stack");
+  const toast = document.createElement("div");
+  toast.className = `toast ${type}`;
+  toast.textContent = message;
+  stack.appendChild(toast);
+  while (stack.children.length > 4) stack.firstElementChild.remove();
+  setTimeout(() => toast.remove(), 4000);
+}
+
+function playSound(kind = "message") {
+  if (!soundEnabled) return;
+  const AudioCtor = window.AudioContext || window.webkitAudioContext;
+  if (!AudioCtor) return;
+  try {
+    audioContext ||= new AudioCtor();
+    if (audioContext.state === "suspended") audioContext.resume().catch(() => {});
+    const notes = {
+      message: [[740, 0], [988, 0.07]], click: [[660, 0]], switch: [[520, 0], [780, 0.08]],
+      success: [[660, 0], [880, 0.08]], error: [[330, 0], [247, 0.1]],
+      connect: [[392, 0], [523.25, 0.09], [659.25, 0.18]], join: [[523.25, 0], [659.25, 0.07]],
+    }[kind] || [[660, 0]];
+    // A tiny generated-impulse convolver gives the cues Discord's soft, roomy feel.
+    if (!audioContext.__pgVerb) {
+      const verb = audioContext.createConvolver();
+      const rate = audioContext.sampleRate, length = Math.floor(rate * 0.4);
+      const impulse = audioContext.createBuffer(2, length, rate);
+      for (let channel = 0; channel < 2; channel += 1) {
+        const data = impulse.getChannelData(channel);
+        for (let i = 0; i < length; i += 1) data[i] = (Math.random() * 2 - 1) * (1 - i / length) ** 2.2;
+      }
+      verb.buffer = impulse;
+      const wet = audioContext.createGain();
+      wet.gain.value = 0.22;
+      verb.connect(wet); wet.connect(audioContext.destination);
+      audioContext.__pgVerb = verb;
+    }
+    const peak = 0.055 * soundVolume;
+    for (const [frequency, delay] of notes) {
+      const start = audioContext.currentTime + delay;
+      const oscillator = audioContext.createOscillator(), gain = audioContext.createGain();
+      oscillator.type = "sine";
+      oscillator.frequency.setValueAtTime(frequency, start);
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.exponentialRampToValueAtTime(peak, start + 0.012);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.16);
+      oscillator.connect(gain); gain.connect(audioContext.destination);
+      gain.connect(audioContext.__pgVerb);
+      oscillator.start(start); oscillator.stop(start + 0.17);
+    }
+  } catch (_) { /* Audio is an optional UI enhancement. */ }
+}
+let typingTimer = null;
+function showTyping(duration = 1400) {
+  const row = $("#typing-row");
+  if (!row) return;
+  $("#typing-name").textContent = lastState?.bot?.name || "Playground Bot";
+  row.hidden = false;
+  clearTimeout(typingTimer);
+  typingTimer = setTimeout(() => { row.hidden = true; }, duration);
+}
+function hideTyping() {
+  clearTimeout(typingTimer);
+  const row = $("#typing-row");
+  if (row) row.hidden = true;
+}
+function renderSoundToggle() {
+  const button = $("#sound-toggle");
+  button.textContent = soundEnabled ? "🔊" : "🔇";
+  button.setAttribute("aria-pressed", String(soundEnabled));
+  button.title = `Sound effects are ${soundEnabled ? "on" : "off"}`;
+}
+function setSoundEnabled(enabled, announce = true) {
+  soundEnabled = enabled;
+  localStorage.setItem("pg-sounds", String(enabled));
+  renderSoundToggle();
+  $("#us-sound-switch").setAttribute("aria-checked", String(enabled));
+  if (announce) desktopBridge?.sendSoundState?.(enabled);
+}
+let soundVolume = Number(localStorage.getItem("pg-volume") ?? 0.7);
+if (!Number.isFinite(soundVolume) || soundVolume < 0 || soundVolume > 1) soundVolume = 0.7;
+function applySoundVolume() {
+  $("#us-volume").value = String(Math.round(soundVolume * 100));
+}
+$("#us-volume").addEventListener("input", (event) => {
+  soundVolume = Number(event.target.value) / 100;
+  localStorage.setItem("pg-volume", String(soundVolume));
+  if (soundEnabled) playSound("switch");
+});
+applySoundVolume();
+$("#sound-toggle").onclick = () => {
+  setSoundEnabled(!soundEnabled);
+  if (soundEnabled) playSound("switch");
+};
+renderSoundToggle();
+
+/* ---------------- desktop shell bridge (Electron) ---------------- */
+const desktopBridge = window.scriptplaygroundDesktop || null;
+if (desktopBridge?.onTrayMute) {
+  // Tray-originated mute: apply locally without echoing back to the shell.
+  desktopBridge.onTrayMute((muted) => { setSoundEnabled(!muted, false); playSound("switch"); });
+}
+if (desktopBridge?.sendSoundState) desktopBridge.sendSoundState(soundEnabled);
+function notifyDesktop(message, st) {
+  // Native notification only when the window is hidden; muted shells stay quiet.
+  if (!soundEnabled || document.visibilityState !== "hidden") return;
+  const channel = (st.channels || []).find((c) => String(c.id) === String(message.channel));
+  const author = message.author?.name || "Someone";
+  const body = (message.content || "(attachment)").slice(0, 200);
+  desktopBridge?.notify(`${author} · #${channel ? channel.name : channelName(st)}`, body)?.catch?.(() => {});
+}
+
+/* ---------------- user settings overlay ---------------- */
+function syncUserSettings(st, activeUser) {
+  $("#us-display").textContent = activeUser.display_name || activeUser.name;
+  $("#us-username").textContent = "@" + (activeUser.username || activeUser.name) + (activeUser.bot ? " · APP" : "");
+  $("#us-status").textContent = activeUser.bot ? "Bot" : (activeUser.status || "online");
+  $("#us-acting").textContent = st.user.name;
+  $("#us-members").textContent = String((st.member_details || []).length);
+  setAvatar($("#us-avatar"), activeUser, Number(activeUser.id) || 0);
+  $("#us-avatar").dataset.status = activeUser.bot ? "online" : (activeUser.status || "online");
+  const actAs = $("#us-act-as");
+  actAs.innerHTML = "";
+  for (const user of st.users || []) actAs.appendChild(new Option(user.name, user.id));
+  actAs.value = String(st.user.id);
+  $("#us-edit-profile").disabled = !activeUser.custom;
+  syncViewSettingsControls();
+  $("#us-sound-switch").setAttribute("aria-checked", String(soundEnabled));
+}
+function activeStateUser(st) {
+  return (st.member_details || []).find((member) => member.id == st.user.id) || st.user;
+}
+function showSettingsPane(pane) {
+  document.querySelectorAll(".settings-nav-item").forEach((item) =>
+    item.classList.toggle("active", item.dataset.pane === pane));
+  document.querySelectorAll(".settings-pane").forEach((section) =>
+    section.classList.toggle("active", section.dataset.pane === pane));
+}
+function openUserSettings(pane = "account") {
+  if (lastState) syncUserSettings(lastState, activeStateUser(lastState));
+  showSettingsPane(pane);
+  $("#user-settings-overlay").classList.add("open");
+}
+function closeUserSettings() { $("#user-settings-overlay").classList.remove("open"); }
+$("#open-user-settings").onclick = () => openUserSettings();
+$("#settings-close").onclick = closeUserSettings;
+$("#user-settings-overlay").onclick = (event) => { if (event.target.id === "user-settings-overlay") closeUserSettings(); };
+document.querySelectorAll(".settings-nav-item").forEach((item) => {
+  item.onclick = () => showSettingsPane(item.dataset.pane);
+});
+$("#us-act-as").onchange = async (event) => {
+  await setActiveUser(event.target.value);
+  if (lastState) syncUserSettings(lastState, activeStateUser(lastState));
+};
+$("#us-edit-profile").onclick = () => {
+  const member = lastState?.member_details?.find((entry) => entry.id === lastState.user.id);
+  if (member?.custom) { closeUserSettings(); openProfileSettings(member); }
+};
+$("#us-density").onchange = (event) => {
+  viewSettings.density = event.target.value;
+  localStorage.setItem("pg-density", viewSettings.density);
+  applyViewSettings();
+};
+$("#us-message-display").onchange = (event) => {
+  viewSettings.messages = event.target.value;
+  localStorage.setItem("pg-message-display", viewSettings.messages);
+  applyViewSettings();
+  if (lastState) { lastRevision = ""; render(lastState); }
+};
+$("#us-sound-switch").onclick = () => {
+  setSoundEnabled(!soundEnabled);
+  if (soundEnabled) playSound("switch");
+};
+
+/* ---------------- voice (simulated) ---------------- */
+function voiceSync(st) {
+  const v = st.voice || {};
+  const panel = $("#voice-panel");
+  panel.hidden = !st.channels?.length;
+  const label = $("#voice-join-label");
+  label.textContent = v.channel ? `Voice connected — ${v.name || "voice"}` : "Join voice (simulated)";
+  $("#voice-join-row").classList.toggle("lit", Boolean(v.channel));
+  $("#voice-controls").hidden = !v.channel;
+  const members = $("#voice-members");
+  members.hidden = !v.channel;
+  if (!v.channel) { members.replaceChildren(); return; }
+  const speaking = new Set(v.speaking || []);
+  members.replaceChildren(...[st.user].map((u) => {
+    const row = document.createElement("div");
+    row.className = "voice-member" + (speaking.has(String(u.id)) ? " speaking" : "");
+    row.dataset.userId = String(u.id);
+    const img = document.createElement("img");
+    setAvatar(img, activeStateUser(st), Number(u.id) || 0);
+    img.alt = "";
+    const name = document.createElement("span");
+    name.textContent = u.name;
+    const flags = document.createElement("span");
+    flags.className = "vm-flag";
+    flags.textContent = (v.self_mute ? "🔇" : "") + (v.self_deaf ? "🎧" : "");
+    row.append(img, name, flags);
+    return row;
+  }));
+  $("#voice-mute").classList.toggle("lit", Boolean(v.self_mute));
+  $("#voice-deafen").classList.toggle("lit", Boolean(v.self_deaf));
+}
+async function voicePost(action) {
+  const result = await post("voice", { action, channel_id: currentChannel });
+  if (result) playSound(result.sound || "click");
+  return result;
+}
+$("#voice-join-row").onclick = () => voicePost(lastState?.voice?.channel ? "leave" : "join");
+$("#voice-mute").onclick = () => voicePost(lastState?.voice?.self_mute ? "unmute" : "mute");
+$("#voice-deafen").onclick = () => voicePost(lastState?.voice?.self_deaf ? "undeafen" : "deafen");
+$("#voice-leave").onclick = () => voicePost("leave");
+
+/* ---------------- uploads ---------------- */
+const pendingUploads = [];
+const MAX_INLINE_UPLOAD = 256 * 1024;
+function renderUploadTray() {
+  const tray = $("#upload-tray");
+  tray.replaceChildren(...pendingUploads.map((up) => {
+    const chip = document.createElement("span");
+    chip.className = "upload-chip";
+    chip.textContent = `📎 ${up.name} (${Math.max(1, Math.round(up.size / 1024))} KB)`;
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "up-del";
+    del.title = "Remove attachment";
+    del.textContent = "✕";
+    del.onclick = () => { pendingUploads.splice(pendingUploads.indexOf(up), 1); renderUploadTray(); };
+    chip.appendChild(del);
+    return chip;
+  }));
+}
+async function stageFiles(fileList) {
+  for (const file of Array.from(fileList || [])) {
+    if (pendingUploads.length >= 5) { showToast("Up to 5 attachments per message.", "error"); break; }
+    if (file.size > MAX_INLINE_UPLOAD) { showToast(`"${file.name}" is over the 256 KB inline limit.`, "error"); continue; }
+    const up = { name: file.name, size: file.size, content_type: file.type || "application/octet-stream", data_uri: null };
+    if ((file.type || "").startsWith("image/")) {
+      up.data_uri = await new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.onerror = () => resolve(null);
+        reader.readAsDataURL(file);
+      });
+    }
+    pendingUploads.push(up);
+  }
+  renderUploadTray();
+}
+async function flushUploads() {
+  const staged = pendingUploads.splice(0, pendingUploads.length);
+  renderUploadTray();
+  const entries = [];
+  for (const up of staged) {
+    const res = await post("upload", up);
+    entries.push({ name: up.name, ...(up.data_uri ? { data_uri: up.data_uri } : {}) });
+    if (!res) break;
+  }
+  return entries;
+}
+$("#attach-btn").onclick = () => $("#file-input").click();
+$("#attach-btn").onkeydown = (event) => { if (event.key === "Enter" || event.key === " ") $("#file-input").click(); };
+$("#file-input").onchange = (event) => { stageFiles(event.target.files); event.target.value = ""; };
+const composerBox = $("#composer-box");
+["dragenter", "dragover"].forEach((type) => composerBox.addEventListener(type, (event) => {
+  event.preventDefault(); composerBox.classList.add("dragover");
+}));
+["dragleave", "drop"].forEach((type) => composerBox.addEventListener(type, (event) => {
+  event.preventDefault(); composerBox.classList.remove("dragover");
+}));
+composerBox.addEventListener("drop", (event) => { if (event.dataTransfer?.files?.length) stageFiles(event.dataTransfer.files); });
+
+/* ---------------- quick switcher (Ctrl+K) ---------------- */
+let qsSelection = 0;
+function quickSwitcherItems() {
+  const channels = (lastState?.channels || []).map((c) => ({ kind: "channel", id: c.id, name: "#" + c.name }));
+  const people = (lastState?.users || []).map((u) => ({ kind: "person", id: u.id, name: "@" + u.name }));
+  return [...channels, ...people];
+}
+function renderQuickSwitcher() {
+  const query = $("#qs-input").value.trim().toLowerCase();
+  const items = quickSwitcherItems().filter((item) => item.name.toLowerCase().includes(query));
+  qsSelection = Math.min(qsSelection, Math.max(0, items.length - 1));
+  const list = $("#qs-list");
+  list.replaceChildren(...items.map((item, index) => {
+    const row = document.createElement("div");
+    row.className = "qs-item" + (index === qsSelection ? " selected" : "");
+    row.setAttribute("role", "option");
+    row.textContent = item.name;
+    const kind = document.createElement("span");
+    kind.className = "qs-kind";
+    kind.textContent = item.kind;
+    row.appendChild(kind);
+    row.onclick = () => { closeQuickSwitcher(); quickGo(item); };
+    return row;
+  }));
+  if (!items.length) list.innerHTML = "<div class='qs-item'>No matches.</div>";
+  return items;
+}
+function quickGo(item) {
+  if (item.kind === "channel") { currentChannel = item.id; lastRevision = ""; if (lastState) render(lastState); }
+  else setActiveUser(item.id);
+}
+function openQuickSwitcher() { $("#quick-switcher").classList.add("open"); $("#qs-input").value = ""; qsSelection = 0; renderQuickSwitcher(); $("#qs-input").focus(); }
+function closeQuickSwitcher() { $("#quick-switcher").classList.remove("open"); }
+$("#qs-input").addEventListener("input", () => { qsSelection = 0; renderQuickSwitcher(); });
+$("#qs-input").addEventListener("keydown", (event) => {
+  const items = renderQuickSwitcher();
+  if (event.key === "ArrowDown") { qsSelection = Math.min(qsSelection + 1, items.length - 1); renderQuickSwitcher(); event.preventDefault(); }
+  else if (event.key === "ArrowUp") { qsSelection = Math.max(qsSelection - 1, 0); renderQuickSwitcher(); event.preventDefault(); }
+  else if (event.key === "Enter") { event.preventDefault(); const item = items[qsSelection]; if (item) { closeQuickSwitcher(); quickGo(item); } }
+  else if (event.key === "Escape") closeQuickSwitcher();
+});
+$("#quick-switcher").onclick = (event) => { if (event.target.id === "quick-switcher") closeQuickSwitcher(); };
+document.addEventListener("keydown", (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") { event.preventDefault(); openQuickSwitcher(); }
+});
+
+/* ---------------- context menu + moderation ---------------- */
+function closeCtxMenu() { $("#ctx-menu").classList.remove("open"); }
+window.addEventListener("click", closeCtxMenu);
+window.addEventListener("blur", closeCtxMenu);
+function openCtxMenu(anchor, items) {
+  const menu = $("#ctx-menu");
+  menu.innerHTML = "";
+  for (const item of items) {
+    if (item === "-") { const sep = document.createElement("div"); sep.className = "ctx-sep"; menu.appendChild(sep); continue; }
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ctx-item" + (item.danger ? " danger" : "");
+    button.textContent = item.label;
+    button.onclick = (event) => { event.stopPropagation(); closeCtxMenu(); item.run(); };
+    menu.appendChild(button);
+  }
+  menu.classList.add("open");
+  const rect = anchor.getBoundingClientRect();
+  menu.style.left = `${Math.min(rect.left, innerWidth - 200)}px`;
+  menu.style.top = `${Math.min(rect.bottom + 4, innerHeight - menu.offsetHeight - 8)}px`;
+}
+async function moderatePost(action, userId, extra = {}) {
+  const result = await post(`moderate/${action}`, { user_id: userId, ...extra });
+  if (result) playSound(action === "unban" ? "success" : "click");
+  return result;
+}
+function memberModerationItems(member) {
+  const items = [
+    { label: "Profile", run: () => showProfile(member, $("#member-list")) },
+    { label: "Switch to this user", run: () => setActiveUser(member.id), disabled: member.bot },
+    "-",
+    { label: "Kick", danger: true, run: () => moderatePost("kick", member.id) },
+    { label: "Ban", danger: true, run: () => moderatePost("ban", member.id) },
+    { label: "Timeout 10 min", danger: true, run: () => moderatePost("timeout", member.id, { minutes: 10 }) },
+    { label: "Clear timeout", run: () => moderatePost("timeout", member.id, { minutes: 0 }) },
+  ];
+  return items;
+}
+function openNewChannelDialog() { $("#new-channel-overlay").classList.add("open"); $("#nc-name").value = ""; $("#nc-topic").value = ""; $("#nc-name").focus(); }
+function closeNewChannelDialog() { $("#new-channel-overlay").classList.remove("open"); }
+$("#nc-cancel").onclick = closeNewChannelDialog;
+$("#new-channel-overlay").onclick = (event) => { if (event.target.id === "new-channel-overlay") closeNewChannelDialog(); };
+$("#nc-create").onclick = async () => {
+  const name = $("#nc-name").value.trim();
+  if (!name) { $("#nc-name").focus(); return; }
+  const result = await post("channels", { name, topic: $("#nc-topic").value.trim() });
+  if (result) { closeNewChannelDialog(); playSound("success"); currentChannel = result.channel.id; lastRevision = ""; render(result); }
+};
+$("#nc-name").addEventListener("keydown", (event) => { if (event.key === "Enter") $("#nc-create").click(); });
+document.addEventListener("keydown", (event) => { if (event.key === "Escape") closeNewChannelDialog(); });
+
+function renderFeedback(st) {
+  const events = st.events || [];
+  if (lastToastEvent === null) {
+    lastToastEvent = events.at(-1)?.id || "";
+    return;
+  }
+  const cursor = events.findIndex((event) => event.id === lastToastEvent);
+  const fresh = cursor >= 0 ? events.slice(cursor + 1) : [];
+  if (events.length) lastToastEvent = events.at(-1).id;
+  const failures = new Set(["missing_handler", "invalid_component", "unanswered", "denied",
+    "missing_modal", "missing_command", "missing_arguments", "invalid_form", "script_error", "transport_gap"]);
+  const failure = fresh.slice().reverse().find((event) => failures.has(event.details?.status));
+
+  if (failure) {
+    const status = failure.details.status;
+    const message = status === "unanswered" ? "Interaction failed — the bot did not respond."
+      : status === "missing_handler" ? "Interaction failed — no handler is registered."
+      : status === "invalid_component" ? "That component is no longer available."
+      : status === "denied" ? "This action is not allowed for the active user."
+      : failure.text || "The bot interaction failed.";
+    showToast(message, "error");
+    playSound("error");
+  }
+}
+
 boot();
 </script>
-</body>
-</html>
+
+
+</body></html>

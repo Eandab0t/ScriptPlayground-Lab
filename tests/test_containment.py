@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import bot_runtime  # noqa: E402
+import bot_runtime
 
 APP_DIR = Path(__file__).resolve().parent.parent
 
@@ -51,7 +51,6 @@ async def main() -> None:
     try:
         runtime = await asyncio.wait_for(bot_runtime.run_project(session, ws), timeout=60)
         sandbox = runtime.sandbox
-        app_cwd_before = Path.cwd()
 
         await runtime.dispatch_command("write", {})
         await asyncio.sleep(0.3)

@@ -1,5 +1,33 @@
 # Desktop build
 
+## Electron app (current)
+
+From the project root:
+
+```powershell
+npm install
+npm run dist
+```
+
+`npm run dist` builds the headless server with PyInstaller (`ScriptPlayground-server.spec` → `dist/server-build/server/ScriptPlayground-server.exe`) and then packages the Electron shell with electron-builder. The distributable is **`release\win-unpacked\ScriptPlayground.exe`** (one-folder build; a folder of server resources sits beside it under `resources\server\`). Double-click it to run — one native window, no browser, no console.
+
+The shell spawns the frozen server with `--auto-shutdown`, so the server stops itself 30 seconds after the last UI disconnects even if the window process dies; closing the window normally tree-kills the server immediately. User data (scripts, workspaces, scenarios, designs) persists in `%LOCALAPPDATA%\ScriptPlayground\`; the seeded `demo_bot` sample and bundled resources are read-only.
+
+### Native notifications and tray
+
+The shell adds two OS integrations:
+
+- **Tray icon** (Windows) — *Show ScriptPlayground*, a **Sound effects** checkbox wired to the in-app 🔊 toggle (both stay in sync; the web client never echoes tray-originated changes back), and *Quit*. Left-clicking the tray icon focuses the window.
+- **Native notifications** — when messages arrive while the window is hidden and sounds are on, the page asks the shell for a real Windows toast (`Author · #channel`). Clicking it focuses the window.
+
+Windows toast prerequisites the shell self-heals on launch: an App User Model ID (`com.ean.scriptplayground`), a Start Menu shortcut carrying it, and a per-user registry entry. If toasts are disabled in Windows Settings (system-wide or via Do Not Disturb), `Notification.show()` fails with `WPN_E_NOTIFICATION_TYPE_DISABLED` (`0x803E0114`) and the shell logs it — the in-app sound cues are unaffected.
+
+End-to-end verification (what a release check should cover): launch the exe, confirm `GET /` serves the UI, confirm the `demo_bot` workspace is discovered from the user-data root, run it (project boot → `ready=true`), invoke its `/hello` slash command and see the bot reply in the timeline, then close the window and confirm no `ScriptPlayground*` processes and no listening ports remain.
+
+`node scripts/walk_desktop.js --packaged` automates that release check: it launches the built exe via Playwright, connects `showcase_bot`, runs it, drives `/panel` + the Wave button, adds a 🔥 reaction from the hover toolbar, opens the user-settings overlay (appearance + sound panes, switch toggle, Escape), sweeps for browser windows before/during/after, and verifies clean shutdown. Plain `node scripts/walk_desktop.js` walks the dev checkout the same way.
+
+## Legacy PyInstaller-only build (browser/Chrome-app mode)
+
 On Windows, from the project root run:
 
 ```powershell

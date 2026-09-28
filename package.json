@@ -1,0 +1,64 @@
+{
+  "name": "scriptplayground",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Offline Discord-bot UI playground with an Electron desktop shell",
+  "main": "desktop/main.js",
+  "scripts": {
+    "start": "electron .",
+    "server": "pyinstaller ScriptPlayground-server.spec --noconfirm --distpath dist/server-build",
+    "dist": "npm run server && electron-builder --win",
+    "test:browser": "playwright test",
+    "walk": "node scripts/walk_desktop.js",
+    "walk:packaged": "node scripts/walk_desktop.js --packaged"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.1",
+    "electron": "^37.2.0",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.ean.scriptplayground",
+    "productName": "ScriptPlayground",
+    "directories": {
+      "output": "release/"
+    },
+    "files": [
+      "desktop/**",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "dist/server-build/server",
+        "to": "server"
+      },
+      {
+        "from": "static",
+        "to": "server/static"
+      },
+      {
+        "from": "embeder",
+        "to": "server/embeder"
+      },
+      {
+        "from": "scripts",
+        "to": "server/scripts"
+      },
+      {
+        "from": "assets",
+        "to": "server/assets"
+      },
+      {
+        "from": "node_shim",
+        "to": "server/node_shim"
+      }
+    ],
+    "win": {
+      "target": "dir",
+      "icon": "assets/icon.ico"
+    }
+  },
+  "allowScripts": {
+    "electron@37.10.3": true
+  }
+}

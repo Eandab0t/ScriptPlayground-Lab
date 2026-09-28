@@ -25,6 +25,7 @@ import webbrowser
 from pathlib import Path
 from urllib.parse import urlencode
 
+import discord
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
 from aiohttp.web_log import AccessLogger
 
@@ -67,6 +68,24 @@ _DESKTOP_POLL_INTERVAL = 0.25
 _AUTO_SHUTDOWN = "scriptplayground_auto_shutdown"
 _DATA_DIR_KEY = "scriptplayground_data_dir"
 _DESKTOP_SHUTDOWN_REQUESTED = "scriptplayground_shutdown_requested"
+
+
+def _server_already_running(host: str, port: int) -> bool:
+    """True when another ScriptPlayground instance already listens on host:port.
+
+    Without this guard, every `python main.py` (or exe launch) with a server
+    still up opened yet another browser tab — the "running a new bot opens a
+    window" complaint. With it, a relaunch focuses nothing and opens nothing.
+    """
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=0.4):
+            return True
+    except OSError:
+        return False
+
+
 _DESKTOP_CLIENT_CONNECTED = "scriptplayground_client_connected"
 _DESKTOP_LAST_CLIENT_DISCONNECT = "scriptplayground_last_client_disconnect"
 _DESKTOP_SHUTDOWN_WATCHER = "scriptplayground_shutdown_watcher"
@@ -149,10 +168,17 @@ def bootstrap_default_scripts() -> None:
 
 
 SESSIONS: dict[str, Session] = {}
-RUNTIMES: dict[str, bot_runtime.ProjectRuntime] = {}  # sid -> booted project runtime
+RUNTIMES: dict[str, bot_runtime.ProjectRuntime | bot_runtime.NodeProjectRuntime] = {}  # sid -> booted runtime
 WS_CLIENTS: dict[str, set[web.WebSocketResponse]] = {}
 OAUTH_STATES: dict[str, float] = {}
 AUTH_SESSIONS: dict[str, dict[str, str | None]] = {}
+
+
+def _session_project_lock(session: Session) -> asyncio.Lock:
+    lock = getattr(session, "_project_operation_lock", None)
+    if lock is None:
+        lock = session._project_operation_lock = asyncio.Lock()
+    return lock
 
 
 def _oauth_config() -> dict[str, str] | None:
@@ -345,54 +371,135 @@ async def logout(request: web.Request) -> web.Response:
 _HIDDEN_SCRIPTS = {"vendor_embeder"}
 
 
+def _workspace_dir(workspace: str) -> Path:
+    if not _SAFE_NAME.fullmatch(workspace):
+        raise web.HTTPBadRequest(text="invalid workspace")
+    workspaces_root = WORKSPACES_DIR.resolve()
+    root = (workspaces_root / workspace).resolve()
+    if not root.is_relative_to(workspaces_root):
+        raise web.HTTPBadRequest(text="invalid workspace")
+    if not root.is_dir():
+        raise web.HTTPNotFound(text="workspace not found")
+    return root
+
+
+def _workspace_file(workspace: str, filename: str = "bot.py") -> Path:
+    relative = Path(filename)
+    parts = filename.split("/")
+    if (not filename or "\\" in filename or ":" in filename or relative.is_absolute()
+            or relative.suffix != ".py" or any(part in {"", ".", ".."} for part in parts)):
+        raise web.HTTPBadRequest(text="invalid workspace file")
+    root = _workspace_dir(workspace)
+    path = (root / relative).resolve()
+    if not path.is_relative_to(root):
+        raise web.HTTPBadRequest(text="invalid workspace file")
+    return path
+
+
+def _workspace_python_files(folder: Path) -> list[str]:
+    root = folder.resolve()
+    skipped = {"__pycache__", ".git", "node_modules", ".venv", "venv", "browser-profile", "backups"}
+    files = []
+    for path in folder.rglob("*.py"):
+        relative = path.relative_to(folder)
+        if (skipped.intersection(relative.parts) or any(part.startswith(".") for part in relative.parts)
+                or not path.is_file() or not path.resolve().is_relative_to(root)):
+            continue
+        files.append(relative.as_posix())
+    return sorted(files)
+
+
+class _ProjectBootDeadline(Exception):
+    """The server's boot deadline expired (distinct from a script TimeoutError)."""
+
+
+class _ProjectShutdownPending(Exception):
+    """A prior in-process project ignored cancellation and still owns the session."""
+
+
+async def _shutdown_runtime(session: Session) -> None:
+    old = RUNTIMES.pop(session.sid, None)
+    if old is not None:
+        await old.shutdown()
+    if bot_runtime.project_shutdown_pending(session):
+        raise _ProjectShutdownPending("previous hosted project is still shutting down")
+
+
+async def _boot_workspace_project(session: Session, folder: Path) -> dict:
+    """Run the saved workspace entry point, never the editor buffer."""
+    await _shutdown_runtime(session)
+    session.restart()
+    boot = asyncio.create_task(
+        bot_runtime.run_project(session, folder, on_exception=lambda: _bump(session.sid))
+    )
+
+    async def cancel_boot() -> None:
+        boot.cancel()
+        done, _ = await asyncio.wait({boot}, timeout=0.75)
+        if done:
+            try:
+                runtime = boot.result()
+            except BaseException:  # noqa: BLE001 - cancellation/failure is already reported
+                return
+            await runtime.shutdown()
+
+    deadline = asyncio.get_running_loop().time() + 90
+    try:
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                await cancel_boot()
+                raise _ProjectBootDeadline
+            done, _ = await asyncio.wait({boot}, timeout=remaining)
+            if not done and not boot.done():
+                await cancel_boot()
+                raise _ProjectBootDeadline
+            runtime = boot.result()
+            break
+    except asyncio.CancelledError:
+        await cancel_boot()
+        raise
+    RUNTIMES[session.sid] = runtime
+    _bump(session.sid)
+    return {"ok": True, "mode": "project", "status": runtime.status(), "last_run": session.last_run}
+
+
 async def workspace_environment(request: web.Request) -> web.Response:
     """Configuration discovery for a workspace's dotenv files (values redacted)."""
-    workspace = request.match_info["workspace"]
-    if not _SAFE_NAME.match(workspace):
-        raise web.HTTPBadRequest(text="invalid workspace")
-    folder = WORKSPACES_DIR / workspace
-    if not folder.is_dir():
-        raise web.HTTPNotFound(text="workspace not found")
+    folder = _workspace_dir(request.match_info["workspace"])
     return web.json_response(env_discovery.discover(folder))
 
 
 async def list_workspaces(_request: web.Request) -> web.Response:
     WORKSPACES_DIR.mkdir(parents=True, exist_ok=True)
+    root = WORKSPACES_DIR.resolve()
     workspaces = []
     for folder in sorted(WORKSPACES_DIR.iterdir()):
-        if not folder.is_dir() or folder.name.startswith("."):
+        if (not _SAFE_NAME.fullmatch(folder.name) or not folder.is_dir()
+                or folder.name.startswith(".") or not folder.resolve().is_relative_to(root)):
             continue
-        files = [str(path.relative_to(folder)).replace("\\", "/")
-                 for path in folder.rglob("*.py") if path.is_file()]
-        workspaces.append({"name": folder.name, "files": sorted(files)})
+        workspaces.append({"name": folder.name, "files": _workspace_python_files(folder)})
     return web.json_response({"workspaces": workspaces})
 
 
-def _workspace_file(workspace: str, filename: str = "bot.py") -> Path:
-    if not _SAFE_NAME.match(workspace) or Path(filename).name != filename:
-        raise web.HTTPBadRequest(text="invalid workspace file")
-    path = WORKSPACES_DIR / workspace / filename
-    if path.suffix != ".py":
-        raise web.HTTPBadRequest(text="only Python files are supported")
-    return path
-
-
 async def get_workspace_file(request: web.Request) -> web.Response:
-    path = _workspace_file(request.match_info["workspace"], request.match_info["filename"])
+    filename = request.match_info["filename"]
+    path = _workspace_file(request.match_info["workspace"], filename)
     if not path.is_file():
         raise web.HTTPNotFound(text="workspace file not found")
-    return web.json_response({"name": path.name, "code": path.read_text(encoding="utf-8")})
+    return web.json_response({"name": filename, "code": path.read_text(encoding="utf-8")})
 
 
 async def save_workspace_file(request: web.Request) -> web.Response:
-    path = _workspace_file(request.match_info["workspace"], request.match_info["filename"])
+    filename = request.match_info["filename"]
+    path = _workspace_file(request.match_info["workspace"], filename)
     body = await request.json()
     code = body.get("code") or ""
     if not code.strip():
         return web.json_response({"ok": False, "error": "Refusing to save empty code."}, status=400)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(code, encoding="utf-8")
-    return web.json_response({"ok": True, "name": path.name})
+    return web.json_response({"ok": True, "name": filename})
 
 
 async def list_scripts(_request: web.Request) -> web.Response:
@@ -499,7 +606,7 @@ async def run_scenario_route(request: web.Request) -> web.Response:
     session = _get_session(request)
     body = await request.json()
     try:
-        result = await run_scenario(session, body.get("scenario", body))
+        result = await run_scenario(session, body.get("scenario", body), runtime=_runtime(session))
     except (TypeError, ValueError) as error:
         return web.json_response({"ok": False, "error": str(error)}, status=400)
     _bump(session.sid)
@@ -571,35 +678,67 @@ async def set_user(request: web.Request) -> web.Response:
     body = await request.json()
     try:
         session.set_user(int(body.get("user_id")))
-    except (TypeError, ValueError):
+    except (AttributeError, TypeError, ValueError):
         return web.json_response({"ok": False, "error": "unknown simulated user"}, status=400)
+    _bump(session.sid)
+    return web.json_response(state(session))
+
+
+async def add_member(request: web.Request) -> web.Response:
+    session = _get_session(request)
+    body = await request.json()
+    try:
+        profile = {key: body[key] for key in ("display_name", "bio", "avatar_url", "banner_url",
+                                               "accent_color", "status") if key in body}
+        member = session.add_member(body.get("username"), profile)
+        session.set_user(member.id)
+    except (AttributeError, TypeError, ValueError) as error:
+        return web.json_response({"ok": False, "error": str(error)}, status=400)
+    _bump(session.sid)
+    return web.json_response(state(session))
+
+
+async def update_member_profile(request: web.Request) -> web.Response:
+    session = _get_session(request)
+    body = await request.json()
+    try:
+        session.update_member_profile(int(request.match_info["user_id"]), body)
+    except (AttributeError, TypeError, ValueError) as error:
+        return web.json_response({"ok": False, "error": str(error)}, status=400)
+    _bump(session.sid)
     return web.json_response(state(session))
 
 
 async def run_code(request: web.Request) -> web.Response:
     session = _get_session(request)
     body = await request.json()
+    async with _session_project_lock(session):
+        return await _run_code(session, body)
+
+
+async def _run_code(session: Session, body: dict) -> web.Response:
+    if bot_runtime.project_shutdown_pending(session):
+        return web.json_response({"ok": False, "error": "previous hosted project is still shutting down"},
+                                 status=503)
     workspace = (body.get("workspace") or "").strip()
     if workspace:
-        # Project run: boot the whole bot (login → setup_hook → cogs → sync).
-        folder = WORKSPACES_DIR / workspace
-        if not folder.is_dir():
-            return web.json_response({"ok": False, "error": f"unknown workspace {workspace!r}"}, status=404)
-        old = RUNTIMES.pop(session.sid, None)
-        if old is not None:
-            await old.shutdown()
-        session.restart()
+        # Run always boots the saved workspace entry point; editor text is intentionally ignored.
         try:
-            RUNTIMES[session.sid] = await asyncio.wait_for(
-                bot_runtime.run_project(session, folder), timeout=90
-            )
-        except asyncio.TimeoutError:
+            folder = _workspace_dir(workspace)
+        except (web.HTTPBadRequest, web.HTTPNotFound):
+            return web.json_response({"ok": False, "error": f"unknown workspace {workspace!r}"}, status=404)
+        try:
+            return web.json_response(await _boot_workspace_project(session, folder))
+        except _ProjectBootDeadline:
+            _bump(session.sid)
             return web.json_response({"ok": False, "error": "project boot exceeded 90s"}, status=504)
-        except BaseException as error:  # noqa: BLE001 - details were logged to the timeline
-            return web.json_response({"ok": False, "error": f"{type(error).__name__}: {error}"}, status=500)
-        _bump(session.sid)
-        return web.json_response({"ok": True, "mode": "project",
-                                  "status": RUNTIMES[session.sid].status()})
+        except _ProjectShutdownPending as error:
+            return web.json_response({"ok": False, "error": str(error)}, status=503)
+        except Exception as error:  # noqa: BLE001 - details were logged to the timeline
+            last_run = session.last_run or {}
+            return web.json_response({
+                "ok": False, "error": f"{type(error).__name__}: {error}", "last_run": last_run or None,
+            }, status=500)
     code = body.get("code") or ""
     if not code.strip():
         return web.json_response({"ok": False, "error": "Nothing to run — the editor is empty."}, status=400)
@@ -608,33 +747,144 @@ async def run_code(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
-async def run_project_file(request: web.Request) -> web.Response:
-    """Run a workspace's entry file through the offline project runtime."""
-    body = {} if request.can_read_body is False else await request.json()
-    workspace = (body.get("workspace") or request.match_info.get("workspace") or "").strip()
+async def run_workspace_file(request: web.Request) -> web.Response:
+    """Run the active editor buffer without saving or booting the whole project."""
     session = _get_session(request)
-    folder = WORKSPACES_DIR / workspace
-    if not workspace or not folder.is_dir():
-        return web.json_response({"ok": False, "error": f"unknown workspace {workspace!r}"}, status=404)
-    old = RUNTIMES.pop(session.sid, None)
-    if old is not None:
-        await old.shutdown()
-    session.restart()
+    body = await request.json()
+    async with _session_project_lock(session):
+        return await _run_workspace_file(session, body)
+
+
+async def _run_workspace_file(session: Session, body: dict) -> web.Response:
+    if bot_runtime.project_shutdown_pending(session):
+        return web.json_response({"ok": False, "error": "previous hosted project is still shutting down"},
+                                 status=503)
+    workspace = str(body.get("workspace") or "").strip()
+    filename = str(body.get("filename") or "")
+    code = body.get("code") or ""
     try:
-        RUNTIMES[session.sid] = await asyncio.wait_for(
-            bot_runtime.run_project(session, folder), timeout=90
-        )
-    except asyncio.TimeoutError:
-        return web.json_response({"ok": False, "error": "project boot exceeded 90s"}, status=504)
-    except BaseException as error:  # noqa: BLE001
+        _workspace_file(workspace, filename)
+        if not code.strip():
+            return web.json_response({"ok": False, "error": "Nothing to run — the active file is empty."}, status=400)
+        await _shutdown_runtime(session)
+        session.restart()
+        result = await run_script(session, code)
+        _bump(session.sid)
+        result = {**result, "mode": "file", "file": filename}
+        return web.json_response(result)
+    except web.HTTPBadRequest as error:
+        return web.json_response({"ok": False, "error": error.text}, status=400)
+    except web.HTTPNotFound as error:
+        return web.json_response({"ok": False, "error": error.text}, status=404)
+    except _ProjectShutdownPending as error:
+        return web.json_response({"ok": False, "error": str(error)}, status=503)
+    except Exception as error:  # noqa: BLE001 - script failures remain visible in session state
         return web.json_response({"ok": False, "error": f"{type(error).__name__}: {error}"}, status=500)
-    _bump(session.sid)
-    return web.json_response({"ok": True, "mode": "project",
-                              "status": RUNTIMES[session.sid].status()})
 
 
-def _runtime(session: Session) -> bot_runtime.ProjectRuntime | None:
+
+def _runtime(session: Session) -> bot_runtime.ProjectRuntime | bot_runtime.NodeProjectRuntime | None:
     return RUNTIMES.get(session.sid)
+
+
+async def react(request: web.Request) -> web.Response:
+    """Toggle the active simulated user's reaction on a timeline message."""
+    session = _get_session(request)
+    body = await request.json()
+    try:
+        added = session.toggle_reaction(str(body.get("message_id") or ""),
+                                        str(body.get("emoji") or ""),
+                                        user_id=session.user_id, actor="user")
+    except KeyError:
+        return web.json_response({"ok": False, "error": "message not found"}, status=404)
+    except ValueError as error:
+        return web.json_response({"ok": False, "error": str(error)}, status=400)
+    except discord.Forbidden as error:
+        return web.json_response({"ok": False, "error": str(error)}, status=403)
+    _bump(session.sid)
+    return web.json_response({"ok": True, "added": added, "state": state(session)})
+
+
+async def voice(request: web.Request) -> web.Response:
+    """Simulated voice state change (join/leave/mute/deafen) for the active user."""
+    session = _get_session(request)
+    body = await request.json()
+    try:
+        result = session.voice_action(str(body.get("action") or ""),
+                                      channel_id=body.get("channel_id"))
+    except ValueError as error:
+        return web.json_response({"ok": False, "error": str(error)}, status=400)
+    _bump(session.sid)
+    return web.json_response({"ok": True, **result, "state": state(session)})
+
+
+async def upload(request: web.Request) -> web.Response:
+    """Register a browser-side file upload (data URI; nothing leaves the machine)."""
+    session = _get_session(request)
+    body = await request.json()
+    entry = session.add_upload(str(body.get("name") or "file"),
+                               int(body.get("size") or 0),
+                               str(body.get("content_type") or ""),
+                               body.get("data_uri"))
+    _bump(session.sid)
+    return web.json_response({"ok": True, "upload": {k: v for k, v in entry.items() if k != "data_uri"},
+                              "state": state(session)})
+
+
+async def delete_upload(request: web.Request) -> web.Response:
+    session = _get_session(request)
+    try:
+        session.delete_upload(int(request.match_info["index"]))
+    except (KeyError, ValueError):
+        return web.json_response({"ok": False, "error": "upload not found"}, status=404)
+    _bump(session.sid)
+    return web.json_response({"ok": True, "state": state(session)})
+
+
+async def create_channel(request: web.Request) -> web.Response:
+    """User-driven channel creation (same model path bots use)."""
+    session = _get_session(request)
+    body = await request.json()
+    try:
+        channel = session.create_text_channel_ui(str(body.get("name") or ""),
+                                                  str(body.get("topic") or ""))
+    except discord.Forbidden as error:
+        return web.json_response({"ok": False, "error": str(error)}, status=403)
+    except ValueError as error:
+        return web.json_response({"ok": False, "error": str(error)}, status=400)
+    _bump(session.sid)
+    return web.json_response({"ok": True, "channel": {"id": str(channel.id), "name": channel.name},
+                              "state": state(session)})
+
+
+async def moderate(request: web.Request) -> web.Response:
+    """Kick / ban / unban / timeout a simulated member with permission checks."""
+    session = _get_session(request)
+    action = request.match_info["action"]
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 - unban may post an empty body
+        body = {}
+    user_id = str(body.get("user_id") or "")
+    if not user_id.isdigit():
+        return web.json_response({"ok": False, "error": "user_id required"}, status=400)
+    try:
+        if action == "kick":
+            session.kick_member(int(user_id))
+        elif action == "ban":
+            session.ban_member(int(user_id))
+        elif action == "unban":
+            session.unban_member(int(user_id))
+        elif action == "timeout":
+            session.timeout_member(int(user_id), int(body.get("minutes") or 10))
+        else:
+            return web.json_response({"ok": False, "error": "unknown moderation action"}, status=404)
+    except discord.Forbidden as error:
+        return web.json_response({"ok": False, "error": str(error)}, status=403)
+    except ValueError as error:
+        return web.json_response({"ok": False, "error": str(error)}, status=400)
+    _bump(session.sid)
+    return web.json_response({"ok": True, "state": state(session)})
 
 
 async def click(request: web.Request) -> web.Response:
@@ -661,7 +911,7 @@ async def submit_modal(request: web.Request) -> web.Response:
     if runtime is not None:
         handled = False
         try:
-            handled = await runtime.dispatch_pending_modal(values)
+            handled = await runtime.dispatch_pending_modal(values, body.get("modal_id"))
         except Exception as error:  # noqa: BLE001
             session.log("💥", f"{type(error).__name__}: {error}", "error",
                         details={"operation": "project.callback", "status": "script_error"})
@@ -674,11 +924,30 @@ async def submit_modal(request: web.Request) -> web.Response:
     return web.json_response(state(session))
 
 
+async def dismiss_modal(request: web.Request) -> web.Response:
+    session = _get_session(request)
+    body = await request.json()
+    modal_id = body.get("modal_id")
+    if not isinstance(modal_id, str) or not modal_id:
+        return web.json_response({"ok": False, "error": "modal_id is required"}, status=400)
+    runtime = _runtime(session)
+    try:
+        if runtime is not None:
+            runtime.dismiss_modal(modal_id)
+        else:
+            session.dismiss_modal(modal_id, session.active_user.id)
+    except ValueError as error:
+        return web.json_response({"ok": False, "error": str(error)}, status=403)
+    _bump(session.sid)
+    return web.json_response(state(session))
+
+
 async def send_message(request: web.Request) -> web.Response:
     session = _get_session(request)
     body = await request.json()
     content = (body.get("content") or "").strip()
-    if not content:
+    files = body.get("files") if isinstance(body.get("files"), list) else None
+    if not content and not files:
         return web.json_response({"ok": False, "error": "empty message"}, status=400)
     runtime = _runtime(session)
     if runtime is not None:
@@ -688,7 +957,7 @@ async def send_message(request: web.Request) -> web.Response:
             session.log("💥", f"{type(error).__name__}: {error}", "error",
                         details={"operation": "project.callback", "status": "script_error"})
     else:
-        await dispatch_message(session, content, channel_id=body.get("channel_id"))
+        await dispatch_message(session, content, channel_id=body.get("channel_id"), files=files)
     _bump(session.sid)
     return web.json_response(state(session))
 
@@ -698,34 +967,34 @@ async def run_command(request: web.Request) -> web.Response:
     body = await request.json()
     name = body.get("name") or ""
     channel_id = body.get("channel_id")
-    if channel_id:
-        session.channel = session.channels.get(str(channel_id), session.channel)
     runtime = _runtime(session)
     if runtime is not None:
         commands = runtime.commands_payload()
         if name not in commands:
             return web.json_response({"ok": False, "error": f"unknown command /{name}"}, status=400)
         try:
-            await runtime.dispatch_command(name, body.get("args") or {})
+            await runtime.dispatch_command(name, body.get("args") or {}, channel_id=channel_id)
         except Exception as error:  # noqa: BLE001
             session.log("💥", f"{type(error).__name__}: {error}", "error",
                         details={"operation": "project.callback", "status": "script_error"})
     else:
         if name not in session.cmd_objects:
             return web.json_response({"ok": False, "error": f"unknown command /{name}"}, status=400)
-        await dispatch_command(session, name, body.get("args") or {})
+        await dispatch_command(session, name, body.get("args") or {}, channel_id=channel_id)
     _bump(session.sid)
     return web.json_response(state(session))
 
 
 async def restart(request: web.Request) -> web.Response:
     session = _get_session(request)
-    old = RUNTIMES.pop(session.sid, None)
-    if old is not None:
-        await old.shutdown()
-    session.restart()
-    _bump(session.sid)
-    return web.json_response(state(session))
+    async with _session_project_lock(session):
+        try:
+            await _shutdown_runtime(session)
+        except _ProjectShutdownPending as error:
+            return web.json_response({"ok": False, "error": str(error)}, status=503)
+        session.restart()
+        _bump(session.sid)
+        return web.json_response(state(session))
 
 
 async def websocket(request: web.Request) -> web.WebSocketResponse:
@@ -819,8 +1088,8 @@ def build_app(*, auto_shutdown: bool = False, data_dir: Path | None = None) -> w
     app.router.add_get("/api/embeder/info", embeder_info)
     app.router.add_get("/api/workspaces", list_workspaces)
     app.router.add_get("/api/workspaces/{workspace}/environment", workspace_environment)
-    app.router.add_get("/api/workspaces/{workspace}/files/{filename}", get_workspace_file)
-    app.router.add_put("/api/workspaces/{workspace}/files/{filename}", save_workspace_file)
+    app.router.add_get("/api/workspaces/{workspace}/files/{filename:.*}", get_workspace_file)
+    app.router.add_put("/api/workspaces/{workspace}/files/{filename:.*}", save_workspace_file)
     app.router.add_get("/api/scripts", list_scripts)
     app.router.add_get("/api/scripts/{name}", get_script)
     app.router.add_post("/api/scripts/test", test_scripts)
@@ -836,13 +1105,23 @@ def build_app(*, auto_shutdown: bool = False, data_dir: Path | None = None) -> w
     app.router.add_post("/api/session", create_session)
     app.router.add_get("/api/session/{sid}/state", get_state)
     app.router.add_post("/api/session/{sid}/user", set_user)
+    app.router.add_post("/api/session/{sid}/members", add_member)
+    app.router.add_put("/api/session/{sid}/members/{user_id}/profile", update_member_profile)
     app.router.add_post("/api/session/{sid}/run", run_code)
     app.router.add_post("/api/session/{sid}/click", click)
     app.router.add_post("/api/session/{sid}/submit", submit_modal)
+    app.router.add_post("/api/session/{sid}/dismiss", dismiss_modal)
     app.router.add_post("/api/session/{sid}/message", send_message)
+    app.router.add_post("/api/session/{sid}/react", react)
+    app.router.add_post("/api/session/{sid}/voice", voice)
+    app.router.add_post("/api/session/{sid}/upload", upload)
+    app.router.add_delete("/api/session/{sid}/upload/{index}", delete_upload)
+    app.router.add_post("/api/session/{sid}/channels", create_channel)
+    app.router.add_post("/api/session/{sid}/moderate/{action}", moderate)
     app.router.add_post("/api/session/{sid}/command", run_command)
     app.router.add_post("/api/session/{sid}/restart", restart)
-    app.router.add_post("/api/session/{sid}/project", run_project_file)
+    app.router.add_post("/api/session/{sid}/project", run_code)
+    app.router.add_post("/api/session/{sid}/run-file", run_workspace_file)
     app.router.add_get("/api/session/{sid}/ws", websocket)
     if STATIC_DIR.exists():
         app.router.add_static("/static/", STATIC_DIR)
@@ -858,11 +1137,20 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, help="override the persistent user data directory")
     args = parser.parse_args()
 
-    data_dir = configure_data_directory(args.data_dir) if args.data_dir else None
+    if args.data_dir:
+        configure_data_directory(args.data_dir)
+    elif getattr(sys, "frozen", False):
+        # The packaged server bundle is read-only; writable scripts/workspaces
+        # live in the OS user-data root instead (mirrors launcher.py's flow).
+        configure_data_directory()
     if args.auto_shutdown or getattr(sys, "frozen", False):
         bootstrap_default_scripts()
+    data_dir = None
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     url = f"http://{args.host}:{args.port}/"
+    if _server_already_running(args.host, args.port):
+        log.info("ScriptPlayground is already running at %s — not starting a second instance", url)
+        return
     if not args.no_browser:
         threading.Timer(0.6, webbrowser.open, args=(url,)).start()
     log.info("ScriptPlayground listening on %s", url)

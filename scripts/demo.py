@@ -182,6 +182,8 @@ async def on_message(message):
         await message.channel.send(f"🏓 Pong! (latency {client.latency * 1000:.0f} ms)")
     elif message.content.startswith("!hello"):
         await message.reply(f"Hello, {message.author.mention}!")
+    elif message.content.startswith("!profile"):
+        await message.reply(f"Hello, {message.author.display_name}!")
     elif message.content.startswith("!here"):
         await message.channel.send(f"You are in **#{message.channel.name}** (id {message.channel.id}).")
 

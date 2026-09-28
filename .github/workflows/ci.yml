@@ -1,0 +1,141 @@
+name: CI
+
+# Desktop flow on every push: the Windows job boots the real Electron shell
+# via scripts/walk_desktop.js. PRs run everything too; pushes to main run the
+# same (cheap, fully offline) pipeline. No jobs need network egress beyond
+# package installation.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_COLOR: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  python:
+    name: Python suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Install dev tools (not in requirements.txt)
+        run: python -m pip install pytest ruff
+
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Smoke suites (auto-discovered)
+        run: |
+          python -X utf8 -m tests.test_smoke
+          python -X utf8 -m tests.test_scenarios
+
+      - name: Project runtime (pytest)
+        run: python -X utf8 -m pytest tests/test_project_runtime.py -q
+
+      - name: Clean session artifacts
+        if: always()
+        run: rm -rf .test-artifacts __pycache__ tests/__pycache__
+
+  browser:
+    name: Browser (Playwright)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Browser regression suite
+        run: npm run test:browser
+
+      - name: Upload test results on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-results
+          path: test-results/
+          retention-days: 5
+
+  desktop:
+    name: Desktop walk (Electron)
+    # The walker boots the real Electron shell against a spawned server; only
+    # Windows runners match the environment the product actually ships on.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Install Playwright chromium (drives the Electron shell)
+        # No --with-deps on Windows; Electron ships its own runtime.
+        run: npx playwright install chromium
+
+      - name: Walk the desktop app end to end
+        run: npm run walk
+
+      - name: Upload walker artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-walk-logs
+          path: |
+            .test-artifacts/desktop-walk/
+            ~/AppData/Local/ScriptPlayground/ScriptPlayground.log
+          if-no-files-found: ignore
+          retention-days: 5

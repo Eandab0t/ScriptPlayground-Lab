@@ -6,12 +6,17 @@ server.log
 .env
 build/
 dist/
+release/
 
 # local bot workspaces: real bots carry live tokens and local databases —
 # never commit them (the tracked demo_bot sample stays)
 bots/*
 !bots/demo_bot/
+!bots/showcase_bot/
 browser-profile/
+node_modules/
+playwright-report/
+test-results/
 *.db
 *.db-journal
 *.db-wal

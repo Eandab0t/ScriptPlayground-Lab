@@ -1,5 +1,7 @@
 # ScriptPlayground
 
+[![CI](https://github.com/Eandab0t/ScriptPlayground-Lab/actions/workflows/ci.yml/badge.svg)](https://github.com/Eandab0t/ScriptPlayground-Lab/actions/workflows/ci.yml)
+
 A **local Discord bot UI playground** with no Discord connection by default. The simulator makes no Discord API calls; optional OAuth signs in with `identify`, and Embeder's explicit webhook test-send posts to the URL you enter. Scripts run as ordinary Python with your account's permissions—not sandboxed—and can access local files, the network, and available credentials. Run only code you trust. The UI uses Discord's dark palette and `gg sans`/Discord's standard fallback font stack. The chat shell includes an informational member rail, animated message/channel surfaces, and a reduced-motion fallback; editor and developer tools remain ScriptPlayground surfaces.
 
 Write plain `discord.py` code in the web editor, press **Run**, and see exactly what your bot would post: embeds, buttons, select menus, and modals, rendered in a Discord-styled chat. Then use the UI: click the buttons, pick from the selects, fill in the modals, or type `/` for the **slash-command palette** — your code's handlers run against mocked `Interaction` objects.
@@ -26,9 +28,27 @@ python main.py            # opens http://127.0.0.1:8741 in your browser
 
 Options: `--port 8741`, `--host 127.0.0.1`, `--no-browser`. If you change the port or host, use that address for the UI and `/embeder` (for example, `http://127.0.0.1:8742/embeder`). The packaged exe accepts `--port` and `--data-dir` but not `--no-browser`; set the environment variable `SCRIPTPLAYGROUND_NO_BROWSER=1` instead.
 
-## Desktop launcher
+### Browser regression tests
 
-The optional Windows executable bundle is built with `scripts/build_windows.ps1`; see `docs/DESKTOP_BUILD.md` for packaging and data-location details. To use the Python launcher instead, double-click `ScriptPlayground.bat`. It activates `.venv` when present, then runs `python launcher.py` in the same console. Chrome/Edge app mode is preferred; when unavailable, the default browser is used and the server shuts down 30 seconds after the last UI WebSocket disconnects. For app mode, the spawned browser process is monitored, followed by a 5-second restart grace period.
+Install the browser-test dependencies and Chromium once, then run the user-switching/profile-editing UI checks:
+
+```bash
+npm install
+npx playwright install chromium
+npm run test:browser
+```
+
+Playwright starts a local simulator server for the tests; no Discord account or external service is used.
+
+## Desktop app (Electron)
+
+`npm install && npm start` runs ScriptPlayground as a **real desktop application**: one native window, a taskbar icon, its own process — no browser tabs. The Electron shell starts the Python server headlessly (`python -X utf8 main.py --no-browser`), opens a single window pointed at it, and shuts the server down when the window closes. If a server is already listening on the port, the shell attaches to it instead of spawning a second one, so relaunching the app never piles up windows and running bots never opens anything outside the app. Same-origin popups (the Embeder builder) stay inside the window; external links (Discord OAuth sign-in) open in the system browser.
+
+Environment knobs: `SCRIPTPLAYGROUND_PYTHON` (interpreter path), `SCRIPTPLAYGROUND_PORT` (base port; the shell scans upward if it is busy), `SCRIPTPLAYGROUND_NO_SERVER=1` (attach-only dev mode). Build the distributable with `npm run dist` — it compiles the server bundle via PyInstaller (`ScriptPlayground-server.spec`) and packages everything with electron-builder; output lands in `release/win-unpacked/`, with the server, `static/`, `embeder/`, `scripts/`, `assets/`, and `node_shim/` shipped as read-only resources and user data kept in `%LOCALAPPDATA%\ScriptPlayground` (override with `--data-dir` / `SCRIPTPLAYGROUND_DATA_DIR`).
+
+### Legacy launchers
+
+The optional Windows executable bundle is built with `scripts/build_windows.ps1`; see `docs/DESKTOP_BUILD.md` for packaging and data-location details. To use the Python launcher instead, double-click `ScriptPlayground.bat`. It activates `.venv` when present, then runs `python launcher.py` in the same console. Chrome/Edge app mode is preferred; when unavailable, the default browser is used and the server shuts down 30 seconds after the last UI WebSocket disconnects. For app mode, the spawned browser process is monitored, followed by a 5-second restart grace period. `python main.py` (terminal mode) refuses to start a second instance if one already listens on the port and no longer opens a duplicate browser tab in that case.
 
 When using a packaged exe, scripts, workspaces, scenarios, and designs are stored under `%LOCALAPPDATA%\ScriptPlayground` on Windows and survive upgrades. `--data-dir PATH` / `SCRIPTPLAYGROUND_DATA_DIR` can override this location. A first launch seeds built-in scripts, scenarios, and designs without replacing user files.
 
@@ -146,7 +166,7 @@ The ★ marks `demo`, the default script loaded on a fresh page.
 
 ## Saved scenarios
 
-Run a script first, then open **Scenarios** in the toolbar to edit, save, or replay a version-1 JSON scenario against that session. Replay uses the current handlers and adds its messages/interactions to the live session; it does not reset the timeline. The `Greeting` starter scenario is included; saved files live in `scripts/scenarios/`.
+Run a script or hosted bot first, then open **Scenarios** in the toolbar to edit, save, or replay a version-1 JSON scenario against that session. Replay uses the current handlers and adds its messages/interactions to the live session; it does not reset the timeline. `Greeting` and `Profile-aware greeting` starter scenarios are included; saved files live in `scripts/scenarios/`. The profile-aware example changes Alice and Bob's simulated profiles, replays the greeting handler as both users, then asserts their replies and actor events. Its profile changes persist in the session after replay.
 
 ```json
 {
@@ -159,7 +179,7 @@ Run a script first, then open **Scenarios** in the toolbar to edit, save, or rep
 }
 ```
 
-Actions can send a message, click a component, submit a modal, or invoke a command. Assertions can check messages, content, embed fields, components, channels, and events. Message assertions match a substring of the stored content; mentions are stored as `<@id>` and rendered with fixture names in the chat.
+Actions can send a message, click a component, submit a modal, invoke a command, update a simulated profile, assign roles, or configure channel permission overwrites. Use `as` with a fixture/custom username, display name, or ID to choose the actor for message/click/submit/command actions. A `profile` action takes `user` plus a partial `profile` object (`username`, `display_name`, `bio`, `avatar_url`, `banner_url`, `accent_color`, `status`). A `roles` action takes `user` plus `add` and/or `remove` arrays of role names or IDs; `@everyone` is automatic. A `permissions` action takes `channel`, `target` (role or member name/ID), and an `overwrites` object mapping discord.py permission names to `true` (allow), `false` (deny), or `null` (inherit); an empty object clears that target's overwrite. Example: `{"action":"roles","user":"Alice","add":["Moderators"]}` then `{"action":"permissions","channel":"staff","target":"Moderators","overwrites":{"view_channel":true,"send_messages":false}}`. Changes remain in effect for later steps and replays, and channel permissions follow Discord's @everyone → combined roles → member precedence. Assertions can check messages, content, embed fields/descriptions, components, member profiles, channels, and events (including an `actor`). Message assertions match a substring of the stored content; mentions are stored as `<@id>` and rendered with fixture names in the chat. Scenarios also run through hosted Python and Node bots: interactions expose assigned roles and effective user/app permissions, and Node channels implement `permissionsFor(member)` with permission overwrites.
 
 ## The scripting contract
 
@@ -187,7 +207,7 @@ mocks only the transport — `interaction.response.send_message(...)`,
 
 | Real Discord | Playground stand-in |
 |---|---|
-| Gateway / REST | In-process capture; nothing leaves your machine |
+| Gateway / REST | In-process capture; nothing leaves your machine. Payload limits are enforced like the real API — oversized content (2000), embeds (256/4096/2048/256-char fields, 25 fields, 6000-char total), button labels (80), select options (25), placeholder (150), and 40-node Components-V2 trees raise a real `discord.HTTPException`: 400 Invalid Form Body, code 50035 |
 | `discord.Interaction` | `MockInteraction` (response / followup / edit_original_response; command callbacks get `interaction.command` set) |
 | `discord.Message` | `MockMessage` (edit / delete / reply / react / pin) |
 | Guild, members, roles | Fixed fixtures: **You**, Alice, Bob, Carol, 3 roles |
@@ -195,6 +215,12 @@ mocks only the transport — `interaction.response.send_message(...)`,
 | Files / attachments | Real inline thumbnails for small images (data URIs); other files as name chips |
 | Embed media | `set_image` / `set_thumbnail` render; `attachment://` URLs resolve against the message's files |
 | Select menus | String multi-selects plus `UserSelect` / `RoleSelect` / `ChannelSelect` / `MentionableSelect`, all clickable |
+| Reactions | Hover a message → **＋** → emoji picker; pills show counts, who-reacted tooltips, and your-reaction highlight. Script bots: `await message.add_reaction(...)` / `remove_reaction` / `clear_reactions`; hosted bots react through the mocked REST route. Requires the actor's `add_reactions` permission |
+| Voice channels | Fully simulated: join/leave from the sidebar VOICE panel, mute/deafen toggles, speaking rings — pure UI state, no audio is captured or sent |
+| Uploads | Paperclip/drag-drop up to 5 files (256 KB inline limit, images shown as real thumbnails); they arrive in `on_message` as `message.attachments` |
+| Quick switcher | `Ctrl+K` jumps between channels (`#name`) and simulated users (`@name`) |
+| Channel management | ＋ next to the category header creates channels (same normalization as bots); right-click a member for kick/ban/timeout — all enforced through the mock permission system |
+| User settings | Profile card, switch simulated user, edit profile; **Appearance** (message display, density — kept in sync with the editor's View selects); **Voice & Sound** (sound toggle + output volume, persisted per browser) |
 
 Members' IDs and names are listed in `playground.py` (`USER_ID`, `MEMBER_IDS`,
 `ROLE_NAMES`) if you want to reference them from your scripts.

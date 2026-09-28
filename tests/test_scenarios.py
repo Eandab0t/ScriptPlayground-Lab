@@ -171,13 +171,112 @@ async def test_scenario_handler_error_fails_with_runtime_context():
         })
         assert result["ok"] is False and result["failed_step"] == 1, result
         assert "LookupError: callback boom" in result["results"][0]["actual"], result
-        assert result["results"][0]["expected"].endswith("without a simulator denial, missing handler, or script error"), result
+        assert result["results"][0]["expected"].endswith(
+            "without permission denial, invalid input/target, missing handler, or script/runtime error"
+        ), result
         assert result["runtime_state"]["messages"][-1]["content"] == "trigger", result
         assert session.last_run["exception"] == {
             "type": "LookupError", "message": "callback boom", "file": "<playground>", "line": 4,
         }, result
         assert any(event.get("details", {}).get("status") == "script_error"
                    for event in result["runtime_state"]["recent_events"]), result
+    finally:
+        session.close()
+
+
+async def test_scenario_invalid_modal_form_fails_replay():
+    session = Session("scenario-invalid-modal")
+    try:
+        await run_script(session, """
+import discord
+modal = discord.ui.Modal(title="Name")
+modal.add_item(discord.ui.TextInput(label="Name", custom_id="name", required=True))
+async def main():
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label="Open", custom_id="open"))
+    await send(view=view)
+async def on_click(interaction, custom_id, values):
+    await interaction.response.send_modal(modal)
+async def on_submit(interaction, values, modal_id):
+    await interaction.response.send_message(values["name"])
+""")
+        result = await run_scenario(session, {
+            "version": 1,
+            "name": "Invalid modal input",
+            "steps": [
+                {"action": "click", "message_id": "latest", "custom_id": "open", "as": "Alice"},
+                {"action": "submit", "modal_id": "latest", "values": {"name": ""}, "as": "Alice"},
+            ],
+        })
+        assert result["ok"] is False and result["failed_step"] == 2, result
+        assert "required" in result["results"][-1]["actual"].lower(), result
+        assert any(event.get("details", {}).get("status") == "invalid_form"
+                   for event in session.events), result
+    finally:
+        session.close()
+
+
+async def test_scenario_assigns_roles_and_enforces_channel_permissions():
+    session = Session("scenario-role-permissions")
+    try:
+        await run_script(session, """
+from discord import app_commands
+@app_commands.command(name="inspect")
+async def inspect(interaction):
+    roles = ",".join(role.name for role in interaction.user.roles if role.name != "@everyone")
+    permissions = interaction.channel.permissions_for(interaction.user)
+    await interaction.response.send_message(
+        f"{roles}|{permissions.view_channel}|{permissions.send_messages}|{interaction.app_permissions.send_messages}"
+    )
+async def main():
+    pass
+""")
+        session.make_channel("staff")
+        scenario = {"version": 1, "name": "Staff permissions", "steps": [
+            {"action": "roles", "user": "Alice", "add": ["Moderators"]},
+            {"action": "permissions", "channel": "staff", "target": "Moderators",
+             "overwrites": {"view_channel": True, "send_messages": False}},
+            {"action": "command", "name": "inspect", "as": "Alice", "channel": "staff"},
+            {"action": "permissions", "channel": "staff", "target": "Alice",
+             "overwrites": {"send_messages": True}},
+            {"action": "command", "name": "inspect", "as": "Alice", "channel": "staff"},
+            {"action": "roles", "user": "Alice", "remove": ["Moderators"]},
+        ]}
+        result = await run_scenario(session, scenario)
+        assert result["ok"], result
+        assert [session.messages[mid]["content"] for mid in session.order] == [
+            "Moderators|True|False|True", "Moderators|True|True|True"
+        ]
+        alice = session.guild.get_member(111111111111111111)
+        assert all(role.name != "Moderators" for role in alice.roles)
+        assert any(event.get("details", {}).get("operation") == "channel.permissions.update"
+                   for event in session.events)
+
+        blocked = await run_scenario(session, {"version": 1, "name": "Deny channel access", "steps": [
+            {"action": "permissions", "channel": "staff", "target": "Alice",
+             "overwrites": {"view_channel": False}},
+            {"action": "command", "name": "inspect", "as": "Alice", "channel": "staff"},
+        ]})
+        assert blocked["ok"] is False and blocked["failed_step"] == 2, blocked
+        assert blocked["runtime_state"]["recent_events"][-1]["details"]["status"] == "denied"
+
+        for invalid in (
+            {"version": 1, "name": "no roles", "steps": [{"action": "roles", "user": "Alice"}]},
+            {"version": 1, "name": "bad permission", "steps": [
+                {"action": "permissions", "channel": "staff", "target": "Alice",
+                 "overwrites": {"not_a_permission": True}},
+            ]},
+            {"version": 1, "name": "bad overwrite", "steps": [
+                {"action": "permissions", "channel": "staff", "target": "Alice",
+                 "overwrites": {"send_messages": "false"}},
+            ]},
+        ):
+            try:
+                validate_scenario(invalid)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"invalid permissions scenario was accepted: {invalid!r}")
     finally:
         session.close()
 
@@ -206,10 +305,51 @@ async def test_starter_greeting_scenario_passes_with_demo():
         await run_script(session, (project / "scripts" / "demo.py").read_text(encoding="utf-8"))
         scenario = json.loads((project / "scripts" / "scenarios" / "Greeting.scenario.json").read_text(encoding="utf-8"))
         sample = (project / "static" / "index.html").read_text(encoding="utf-8")
-        assert '{"assert": "message_exists", "content": "Hello, <@111111111111111111>!"}' in sample
+        assert '"name": "Profile-aware greeting"' in sample
         result = await run_scenario(session, scenario)
         assert result["ok"] is True, result
         assert all(step["passed"] for step in result["results"]), result
+    finally:
+        session.close()
+
+
+async def test_profile_aware_scenario_replays_across_users():
+    project = Path(__file__).resolve().parent.parent
+    session = Session("scenario-profiles")
+    try:
+        await run_script(session, (project / "scripts" / "demo.py").read_text(encoding="utf-8"))
+        scenario = json.loads(
+            (project / "scripts" / "scenarios" / "Profile-aware greeting.scenario.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        result = await run_scenario(session, scenario)
+        assert result["ok"] is True, result
+        assert len(result["results"]) == 9
+        assert all(step["passed"] for step in result["results"]), result
+        alice = session.guild.get_member(111111111111111111)
+        bob = session.guild.get_member(222222222222222222)
+        assert (alice.display_name, alice.bio) == ("Alice Example", "Profile-aware scenario")
+        assert (bob.display_name, bob.status.name) == ("Bobby Example", "idle")
+        assert [session.messages[step["message_id"]]["author"]["name"] for step in
+                (result["results"][3], result["results"][6])] == ["Alice Example", "Bobby Example"]
+        assert [session.active_user.name, session.active_user.display_name,
+                result["runtime_state"]["active_user"]] == ["Bob", "Bobby Example", "Bob"]
+        assert [session.messages[mid]["content"] for mid in session.order[-4:]] == [
+            "!profile", "Hello, Alice Example!", "!profile", "Hello, Bobby Example!"
+        ]
+        profile = next(step for step in result["results"] if step["label"] == "member_profile")
+        assert profile["passed"]
+
+        invalid = {"version": 1, "name": "bad profile", "steps": [
+            {"action": "profile", "user": "Alice", "profile": {"bio": 4}},
+        ]}
+        try:
+            validate_scenario(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid profile field type was accepted")
     finally:
         session.close()
 
@@ -263,8 +403,11 @@ async def main():
         test_scenario_submits_modal_and_dispatches_command,
         test_scenario_click_requires_an_enabled_component,
         test_scenario_handler_error_fails_with_runtime_context,
+        test_scenario_invalid_modal_form_fails_replay,
         test_scenario_validation_rejects_unknown_or_malformed_steps,
         test_starter_greeting_scenario_passes_with_demo,
+        test_profile_aware_scenario_replays_across_users,
+        test_scenario_assigns_roles_and_enforces_channel_permissions,
         test_scenario_file_routes_roundtrip_and_validate,
         test_script_error_maps_user_frame_and_syntax_line,
     ]

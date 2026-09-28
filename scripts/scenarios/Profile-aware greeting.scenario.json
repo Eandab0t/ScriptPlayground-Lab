@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "name": "Profile-aware greeting",
+  "steps": [
+    {
+      "action": "profile",
+      "user": "Alice",
+      "profile": {
+        "display_name": "Alice Example",
+        "bio": "Profile-aware scenario"
+      }
+    },
+    {
+      "assert": "member_profile",
+      "user": "Alice",
+      "display_name": "Alice Example",
+      "bio": "Profile-aware scenario"
+    },
+    {
+      "action": "profile",
+      "user": "Bob",
+      "profile": {
+        "display_name": "Bobby Example",
+        "status": "idle"
+      }
+    },
+    {
+      "action": "message",
+      "content": "!profile",
+      "as": "Alice Example"
+    },
+    {
+      "assert": "message_exists",
+      "content": "Hello, Alice Example!"
+    },
+    {
+      "assert": "event_occurred",
+      "interaction": "message_create",
+      "actor": "Alice",
+      "status": "dispatched"
+    },
+    {
+      "action": "message",
+      "content": "!profile",
+      "as": "Bobby Example"
+    },
+    {
+      "assert": "message_exists",
+      "content": "Hello, Bobby Example!"
+    },
+    {
+      "assert": "event_occurred",
+      "interaction": "message_create",
+      "actor": "Bob",
+      "status": "dispatched"
+    }
+  ]
+}

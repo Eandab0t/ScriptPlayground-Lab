@@ -936,26 +936,504 @@ async def test_folder_workspace_roundtrip():
             folder = server.WORKSPACES_DIR / "my_bot"
             folder.mkdir()
             source = "async def main():\n    await send('folder')\n"
+            nested_source = "async def main():\n    await send('nested')\n"
             (folder / "bot.py").write_text(source, encoding="utf-8")
+            (folder / "cogs").mkdir()
+            (folder / "cogs" / "worker.py").write_text(nested_source, encoding="utf-8")
             listing = json.loads((await server.list_workspaces(None)).body)["workspaces"]
-            assert listing == [{"name": "my_bot", "files": ["bot.py"]}]
-            request = _FakeReq(match={"workspace": "my_bot", "filename": "bot.py"})
-            assert json.loads((await server.get_workspace_file(request)).body)["code"] == source
+            assert listing == [{"name": "my_bot", "files": ["bot.py", "cogs/worker.py"]}]
+            request = _FakeReq(match={"workspace": "my_bot", "filename": "cogs/worker.py"})
+            assert json.loads((await server.get_workspace_file(request)).body) == {
+                "name": "cogs/worker.py", "code": nested_source
+            }
             saved = await server.save_workspace_file(_FakeReq(
                 match=request.match_info, body={"code": "updated = True\n"}
             ))
-            assert json.loads(saved.body)["ok"] is True
-            assert (folder / "bot.py").read_text(encoding="utf-8") == "updated = True\n"
+            assert json.loads(saved.body) == {"ok": True, "name": "cogs/worker.py"}
+            assert (folder / "cogs" / "worker.py").read_text(encoding="utf-8") == "updated = True\n"
+            for workspace, filename in (("../bad", "bot.py"), ("my_bot", "../outside.py"),
+                                        ("my_bot", "cogs/../../outside.py"),
+                                        ("my_bot", "cogs\\worker.py"), ("my_bot", "cogs/worker.txt")):
+                try:
+                    await server.save_workspace_file(_FakeReq(
+                        match={"workspace": workspace, "filename": filename}, body={"code": "x"}
+                    ))
+                except server.web.HTTPBadRequest:
+                    pass
+                else:
+                    raise AssertionError(f"unsafe workspace path was accepted: {workspace}/{filename}")
+            outside = pathlib.Path(td) / "outside.py"
+            outside.write_text("secret = True\n", encoding="utf-8")
             try:
-                await server.save_workspace_file(_FakeReq(
-                    match={"workspace": "../bad", "filename": "bot.py"}, body={"code": "x"}
-                ))
-            except server.web.HTTPBadRequest:
+                (folder / "escape.py").symlink_to(outside)
+            except OSError:  # Windows may not allow symlink creation without Developer Mode.
                 pass
             else:
-                raise AssertionError("workspace traversal was accepted")
+                try:
+                    await server.get_workspace_file(_FakeReq(
+                        match={"workspace": "my_bot", "filename": "escape.py"}
+                    ))
+                except server.web.HTTPBadRequest:
+                    pass
+                else:
+                    raise AssertionError("workspace symlink escape was accepted")
         finally:
             server.WORKSPACES_DIR = original
+
+
+async def test_workspace_run_actions_use_saved_project_vs_editor_buffer():
+    import json
+    import pathlib
+    import tempfile
+
+    import main as server
+
+    with tempfile.TemporaryDirectory() as td:
+        original_workspace_dir = server.WORKSPACES_DIR
+        server.WORKSPACES_DIR = pathlib.Path(td)
+        folder = server.WORKSPACES_DIR / "run_semantics"
+        (folder / "cogs").mkdir(parents=True)
+        saved_entry = "# saved bot entry\n"
+        saved_file = "async def main():\n    await send('saved file')\n"
+        (folder / "bot.py").write_text(saved_entry, encoding="utf-8")
+        (folder / "cogs" / "worker.py").write_text(saved_file, encoding="utf-8")
+
+        sid = f"run-semantics-{pathlib.Path(td).name}"
+        session = Session(sid)
+        previous_session = server.SESSIONS.get(sid)
+        previous_runtime = server.RUNTIMES.get(sid)
+        original_run_project = server.bot_runtime.run_project
+        original_run_script = server.run_script
+        captured = {}
+
+        class FakeRuntime:
+            async def shutdown(self):
+                captured["shutdown"] = True
+
+            def status(self):
+                return {"bot": "saved bot", "cogs": [], "commands": []}
+
+        async def fake_run_project(_session, project, on_exception=None):
+            captured["project_entry"] = (project / "bot.py").read_text(encoding="utf-8")
+            captured["on_exception"] = on_exception
+            return FakeRuntime()
+
+        async def fake_run_script(_session, code):
+            captured["file_buffer"] = code
+            return {"ok": True, "ms": 1.0}
+
+        server.SESSIONS[sid] = session
+        server.bot_runtime.run_project = fake_run_project
+        server.run_script = fake_run_script
+        try:
+            project_response = await server.run_code(_FakeReq(
+                match={"sid": sid}, body={"workspace": "run_semantics", "code": "unsaved bot buffer"}
+            ))
+            project = json.loads(project_response.body)
+            assert project["ok"] and project["mode"] == "project"
+            assert captured["project_entry"] == saved_entry
+            assert callable(captured["on_exception"])
+
+            file_response = await server.run_workspace_file(_FakeReq(
+                match={"sid": sid}, body={
+                    "workspace": "run_semantics", "filename": "cogs/worker.py",
+                    "code": "async def main():\n    await send('unsaved active buffer')\n",
+                }
+            ))
+            file_result = json.loads(file_response.body)
+            assert file_result["ok"] and file_result["mode"] == "file"
+            assert file_result["file"] == "cogs/worker.py"
+            assert captured["file_buffer"].endswith("unsaved active buffer')\n")
+            assert (folder / "cogs" / "worker.py").read_text(encoding="utf-8") == saved_file
+            assert captured["shutdown"] is True
+
+            invalid = await server.run_workspace_file(_FakeReq(
+                match={"sid": sid}, body={
+                    "workspace": "run_semantics", "filename": "../outside.py", "code": "x = 1\n"
+                }
+            ))
+            assert invalid.status == 400
+        finally:
+            server.bot_runtime.run_project = original_run_project
+            server.run_script = original_run_script
+            server.WORKSPACES_DIR = original_workspace_dir
+            if previous_session is None:
+                server.SESSIONS.pop(sid, None)
+            else:
+                server.SESSIONS[sid] = previous_session
+            if previous_runtime is None:
+                server.RUNTIMES.pop(sid, None)
+            else:
+                server.RUNTIMES[sid] = previous_runtime
+            session.close()
+
+
+async def test_empty_and_syntax_workspace_errors_keep_available_diagnostics():
+    import json
+    import pathlib
+    import tempfile
+
+    import bot_runtime
+    import main as server
+
+    with tempfile.TemporaryDirectory() as td:
+        original_workspace_dir = server.WORKSPACES_DIR
+        server.WORKSPACES_DIR = pathlib.Path(td)
+        sid = f"empty-project-{pathlib.Path(td).name}"
+        session = Session(sid)
+        previous_session = server.SESSIONS.get(sid)
+        server.SESSIONS[sid] = session
+        folder = server.WORKSPACES_DIR / "invalid_project"
+        folder.mkdir()
+        try:
+            empty = await server.run_code(_FakeReq(
+                match={"sid": sid}, body={"workspace": "invalid_project"}
+            ))
+            empty_data = json.loads(empty.body)
+            assert empty.status == 500 and empty_data["ok"] is False
+            empty_error = empty_data["last_run"]["exception"]
+            assert {key: empty_error[key] for key in ("type", "file", "line", "workspace")} == {
+                "type": "RuntimeError", "file": None, "line": None, "workspace": "invalid_project",
+            }
+            assert "no Python entrypoint found" in empty_data["last_run"]["error"]
+
+            (folder / "main.py").write_text("import discord\ndef broken(:\n", encoding="utf-8")
+            syntax = await server.run_code(_FakeReq(
+                match={"sid": sid}, body={"workspace": "invalid_project"}
+            ))
+            syntax_data = json.loads(syntax.body)
+            assert syntax.status == 500 and syntax_data["ok"] is False
+            syntax_error = syntax_data["last_run"]["exception"]
+            assert {key: syntax_error[key] for key in ("type", "file", "line", "workspace")} == {
+                "type": "SyntaxError", "file": "main.py", "line": 2, "workspace": "invalid_project",
+            }
+            assert "invalid_project/main.py" in syntax_data["last_run"]["error"]
+            assert str(bot_runtime._SANDBOX_ROOT) not in syntax_data["last_run"]["error"]
+            assert state(session)["last_run"] == syntax_data["last_run"]
+        finally:
+            server.WORKSPACES_DIR = original_workspace_dir
+            if previous_session is None:
+                server.SESSIONS.pop(sid, None)
+            else:
+                server.SESSIONS[sid] = previous_session
+            session.close()
+
+
+async def test_script_timeout_error_is_not_reported_as_boot_deadline_over_http():
+    import pathlib
+    import tempfile
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    import main as server
+
+    with tempfile.TemporaryDirectory() as td:
+        original_workspace_dir = server.WORKSPACES_DIR
+        sid = f"script-timeout-{pathlib.Path(td).name}"
+        session = Session(sid)
+        previous_session = server.SESSIONS.get(sid)
+        previous_runtime = server.RUNTIMES.get(sid)
+        server.WORKSPACES_DIR = pathlib.Path(td)
+        server.SESSIONS[sid] = session
+        folder = server.WORKSPACES_DIR / "timeout_project"
+        folder.mkdir()
+        (folder / "main.py").write_text("raise TimeoutError('from script')\n", encoding="utf-8")
+        app = server.web.Application()
+        app.router.add_post("/api/session/{sid}/run", server.run_code)
+        client = TestClient(TestServer(app))
+        try:
+            await client.start_server()
+            response = await client.post(
+                f"/api/session/{sid}/run", json={"workspace": "timeout_project"}
+            )
+            data = await response.json()
+            assert response.status == 500
+            assert data["error"] == "TimeoutError: from script"
+            assert session.last_run is not None
+            assert session.last_run["exception"]["type"] == "TimeoutError"
+            exception = data["last_run"]["exception"]
+            assert {key: exception[key] for key in ("type", "message", "file", "line")} == {
+                "type": "TimeoutError", "message": "from script", "file": "main.py", "line": 1,
+            }
+            assert session.last_run == data["last_run"] == state(session)["last_run"]
+        finally:
+            await client.close()
+            server.WORKSPACES_DIR = original_workspace_dir
+            runtime = server.RUNTIMES.pop(sid, None)
+            if runtime is not None:
+                await runtime.shutdown()
+            if previous_runtime is not None:
+                server.RUNTIMES[sid] = previous_runtime
+            if previous_session is None:
+                server.SESSIONS.pop(sid, None)
+            else:
+                server.SESSIONS[sid] = previous_session
+            session.close()
+
+
+async def test_concurrent_workspace_runs_replace_runtime_without_orphans():
+    import pathlib
+    import tempfile
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    import bot_runtime
+    import main as server
+
+    with tempfile.TemporaryDirectory() as td:
+        original_workspace_dir = server.WORKSPACES_DIR
+        sid = f"concurrent-project-{pathlib.Path(td).name}"
+        session = Session(sid)
+        previous_session = server.SESSIONS.get(sid)
+        previous_runtime = server.RUNTIMES.get(sid)
+        server.WORKSPACES_DIR = pathlib.Path(td)
+        server.SESSIONS[sid] = session
+        folder = server.WORKSPACES_DIR / "concurrent_project"
+        folder.mkdir()
+        (folder / "main.py").write_text(
+            "import asyncio\nasync def main():\n    await asyncio.Event().wait()\n", encoding="utf-8"
+        )
+        app = server.web.Application()
+        app.router.add_post("/api/session/{sid}/run", server.run_code)
+        client = TestClient(TestServer(app))
+        try:
+            await client.start_server()
+            responses = await asyncio.gather(*(
+                client.post(f"/api/session/{sid}/run", json={"workspace": "concurrent_project"})
+                for _ in range(2)
+            ))
+            assert [response.status for response in responses] == [200, 200]
+            runtimes = [runtime for runtime in bot_runtime._CWD_STACK if runtime.session is session]
+            assert len(runtimes) == 1
+            assert server.RUNTIMES[sid] is runtimes[0]
+            assert runtimes[0]._main_task is not None and not runtimes[0]._main_task.done()
+        finally:
+            await client.close()
+            server.WORKSPACES_DIR = original_workspace_dir
+            runtime = server.RUNTIMES.pop(sid, None)
+            if runtime is not None:
+                await runtime.shutdown()
+            if previous_runtime is not None:
+                server.RUNTIMES[sid] = previous_runtime
+            if previous_session is None:
+                server.SESSIONS.pop(sid, None)
+            else:
+                server.SESSIONS[sid] = previous_session
+            session.close()
+
+
+async def test_project_boot_timeout_cancellation_cleans_runtime():
+    import pathlib
+    import tempfile
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    import bot_runtime
+    import main as server
+
+    with tempfile.TemporaryDirectory() as td:
+        original_workspace_dir = server.WORKSPACES_DIR
+        original_wait_for = server.asyncio.wait_for
+        original_wait = server.asyncio.wait
+        original_bump = server._bump
+        server.WORKSPACES_DIR = pathlib.Path(td)
+        sid = f"boot-timeout-{pathlib.Path(td).name}"
+        session = Session(sid)
+        previous_session = server.SESSIONS.get(sid)
+        previous_runtime = server.RUNTIMES.get(sid)
+        server.SESSIONS[sid] = session
+        folder = server.WORKSPACES_DIR / "slow_project"
+        folder.mkdir()
+        entry = folder / "main.py"
+        cancel_marker = pathlib.Path(td) / "cancel-caught"
+        second_cancel_marker = pathlib.Path(td) / "cancel-caught-again"
+        release_marker = pathlib.Path(td) / "release-cancel-resistant-main"
+        cleanup_marker = pathlib.Path(td) / "cancel-finally"
+        entry.write_text(
+            "import asyncio\n"
+            "from pathlib import Path\n"
+            "async def main():\n"
+            "    try:\n"
+            "        await asyncio.Event().wait()\n"
+            "    except asyncio.CancelledError:\n"
+            f"        Path({str(cancel_marker)!r}).write_text('caught', encoding='utf-8')\n"
+            "        try:\n"
+            "            await asyncio.Event().wait()\n"
+            "        except asyncio.CancelledError:\n"
+            f"            Path({str(second_cancel_marker)!r}).write_text('caught again', encoding='utf-8')\n"
+            f"            while not Path({str(release_marker)!r}).exists():\n"
+            "                await asyncio.sleep(0.01)\n"
+            "    finally:\n"
+            f"        Path({str(cleanup_marker)!r}).write_text('cleaned', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        bumps = []
+        started = asyncio.Event()
+
+        original_run_project = server.bot_runtime.run_project
+
+        async def slow_run_project(target_session, project, on_exception=None):
+            if project == folder:
+                started.set()
+                return await original_run_project(
+                    target_session, project, tag="smoke-timeout", on_exception=on_exception
+                )
+            return await original_run_project(target_session, project, on_exception=on_exception)
+
+        async def short_wait(tasks, timeout=None):
+            if timeout == 90:
+                timeout = 0.3
+            return await original_wait(tasks, timeout=timeout)
+
+        server.asyncio.wait = short_wait
+        server.bot_runtime.run_project = slow_run_project
+        server._bump = lambda changed_sid: bumps.append(changed_sid)
+        app = server.web.Application()
+        app.router.add_post("/api/session/{sid}/run", server.run_code)
+        app.router.add_post("/api/session/{sid}/restart", server.restart)
+        client = TestClient(TestServer(app))
+        try:
+            await client.start_server()
+            run_request = asyncio.create_task(client.post(
+                f"/api/session/{sid}/run", json={"workspace": "slow_project"}
+            ))
+            await original_wait_for(started.wait(), timeout=5)
+            response = await original_wait_for(run_request, timeout=5)
+            data = await response.json()
+            assert response.status == 504 and not data["ok"]
+            assert data["error"] == "project boot exceeded 90s"
+            assert cancel_marker.read_text(encoding="utf-8") == "caught"
+            assert second_cancel_marker.read_text(encoding="utf-8") == "caught again"
+            assert not cleanup_marker.exists()
+            assert session.last_run is None and state(session)["last_run"] is None
+            assert not any(event.get("cls") == "error" for event in session.events)
+            assert bumps == [sid]
+            start = next(event for event in session.events
+                         if event.get("details", {}).get("operation") == "project.run")
+            sandbox = pathlib.Path(bot_runtime._SANDBOX_ROOT) / start["details"]["sandbox"]
+            assert sandbox.is_dir()
+            assert str(sandbox) in bot_runtime.sys.path
+            assert pathlib.Path.cwd() == sandbox
+            assert bot_runtime.asyncio.run is bot_runtime._ORIGINAL_ASYNCIO_RUN
+
+            runtime = next(runtime for runtime in bot_runtime._CWD_STACK if runtime.sandbox == sandbox)
+            assert server.RUNTIMES.get(sid) is None
+            assert server.bot_runtime.project_shutdown_pending(session)
+            rejected_restart = await client.post(f"/api/session/{sid}/restart")
+            assert rejected_restart.status == 503
+            rejected_run = await client.post(
+                f"/api/session/{sid}/run", json={"workspace": "slow_project"}
+            )
+            assert rejected_run.status == 503
+            try:
+                runtime.transport.handle(
+                    bot_runtime.Route("POST", f"/channels/{session.channel.id}/messages"),
+                    payload={"content": "must not post after shutdown"},
+                )
+            except RuntimeError as error:
+                assert "shutting down" in str(error)
+            else:
+                raise AssertionError("shutdown runtime transport still accepts script requests")
+            release_marker.touch()
+            async with asyncio.timeout(5):
+                while runtime._cleanup_task is None:
+                    await asyncio.sleep(0.01)
+                await asyncio.shield(runtime._cleanup_task)
+            assert cleanup_marker.read_text(encoding="utf-8") == "cleaned"
+            assert not sandbox.exists()
+            assert str(sandbox) not in bot_runtime.sys.path
+            assert not bot_runtime.project_shutdown_pending(session)
+
+            server.asyncio.wait_for = original_wait_for
+            server.asyncio.wait = original_wait
+            server.bot_runtime.run_project = original_run_project
+            entry.write_text("async def main():\n    pass\n", encoding="utf-8")
+            retry = await client.post(
+                f"/api/session/{sid}/run", json={"workspace": "slow_project"}
+            )
+            retry_data = await retry.json()
+            assert retry.status == 200 and retry_data["ok"]
+            assert session.last_run is None and state(session)["last_run"] is None
+            assert bumps == [sid, sid]
+        finally:
+            await client.close()
+            release_marker.touch(exist_ok=True)
+            abandoned = next((runtime for runtime in bot_runtime._CWD_STACK
+                              if runtime.sandbox.name == "slow_project-smoke-timeout"), None)
+            if abandoned is not None:
+                async with asyncio.timeout(5):
+                    while abandoned._cleanup_task is None:
+                        await asyncio.sleep(0.01)
+                    await asyncio.shield(abandoned._cleanup_task)
+            server.asyncio.wait_for = original_wait_for
+            server.asyncio.wait = original_wait
+            server.bot_runtime.run_project = original_run_project
+            server._bump = original_bump
+            server.WORKSPACES_DIR = original_workspace_dir
+            runtime = server.RUNTIMES.pop(sid, None)
+            if runtime is not None:
+                await runtime.shutdown()
+            if previous_runtime is not None:
+                server.RUNTIMES[sid] = previous_runtime
+            if previous_session is None:
+                server.SESSIONS.pop(sid, None)
+            else:
+                server.SESSIONS[sid] = previous_session
+            session.close()
+
+
+async def test_project_system_exit_cleanup_through_route():
+    import json
+    import pathlib
+    import tempfile
+
+    import bot_runtime
+    import main as server
+
+    with tempfile.TemporaryDirectory() as td:
+        original_workspace_dir = server.WORKSPACES_DIR
+        server.WORKSPACES_DIR = pathlib.Path(td)
+        sid = f"boot-errors-{pathlib.Path(td).name}"
+        session = Session(sid)
+        previous_session = server.SESSIONS.get(sid)
+        previous_runtime = server.RUNTIMES.get(sid)
+        server.SESSIONS[sid] = session
+        folder = server.WORKSPACES_DIR / "system_exit"
+        folder.mkdir()
+        (folder / "main.py").write_text("raise SystemExit(7)\n", encoding="utf-8")
+        try:
+            response = await server.run_code(_FakeReq(
+                match={"sid": sid}, body={"workspace": "system_exit"}
+            ))
+            data = json.loads(response.body)
+            assert response.status == 500 and not data["ok"]
+            assert data["last_run"]["exception"]["type"] == "SystemExit"
+            start = next(event for event in session.events
+                         if event.get("details", {}).get("operation") == "project.run")
+            sandbox = pathlib.Path(bot_runtime._SANDBOX_ROOT) / start["details"]["sandbox"]
+            assert not sandbox.exists() and str(sandbox) not in bot_runtime.sys.path
+            assert str(sandbox) not in data["last_run"]["error"]
+            assert bot_runtime.asyncio.run is bot_runtime._ORIGINAL_ASYNCIO_RUN
+
+            good = server.WORKSPACES_DIR / "retry"
+            good.mkdir()
+            (good / "main.py").write_text("async def main():\n    pass\n", encoding="utf-8")
+            retry = await server.run_code(_FakeReq(
+                match={"sid": sid}, body={"workspace": "retry"}
+            ))
+            assert retry.status == 200 and json.loads(retry.body)["ok"]
+        finally:
+            server.WORKSPACES_DIR = original_workspace_dir
+            runtime = server.RUNTIMES.pop(sid, None)
+            if runtime is not None:
+                await runtime.shutdown()
+            if previous_runtime is not None:
+                server.RUNTIMES[sid] = previous_runtime
+            if previous_session is None:
+                server.SESSIONS.pop(sid, None)
+            else:
+                server.SESSIONS[sid] = previous_session
+            session.close()
 
 
 async def test_library_test_suite_runs_isolated_scripts():
@@ -1364,6 +1842,7 @@ async def test_data_dir_bootstrap_preserves_user_files():
             server.bootstrap_default_scripts()
             assert {p.name for p in server.SCRIPTS_DIR.glob("*.py")} >= {"demo.py", "poll_bot.py"}
             assert (data / "scenarios" / "Greeting.scenario.json").is_file()
+            assert (data / "scenarios" / "Profile-aware greeting.scenario.json").is_file()
             assert (data / "designs" / "Club Welcome.discordv2proj.json").is_file()
             user_script = server.SCRIPTS_DIR / "demo.py"
             user_script.write_text("# keep my version", encoding="utf-8")
@@ -1479,6 +1958,218 @@ async def test_parallel_session_stress():
     finally:
         for s in sessions:
             s.close()
+
+
+# --- reactions -----------------------------------------------------------------
+
+
+async def test_reaction_toggle_roundtrip():
+    s = Session("t-react")
+    await run_script(s, "async def main():\n    await send('react to me')\n")
+    mid = s.order[-1]
+    my_id = s.user_id
+
+    added = s.toggle_reaction(mid, "🔥", user_id=my_id, actor="user")
+    assert added is True
+    stored = next(m for m in state(s)["messages"] if m["id"] == mid)
+    assert stored["reactions"] == [{"emoji": "🔥", "users": [str(my_id)]}]
+
+    # toggling again removes the user and the empty pill
+    added = s.toggle_reaction(mid, "🔥", user_id=my_id, actor="user")
+    assert added is False
+    stored = next(m for m in state(s)["messages"] if m["id"] == mid)
+    assert stored.get("reactions", []) == []
+
+    # a second user stacks the count; the bot reacts through MockMessage
+    s.toggle_reaction(mid, "🔥", user_id=111111111111111111, actor="user")
+    handle = playground.MockMessage(s, mid)
+    await handle.add_reaction("🔥")
+    stored = next(m for m in state(s)["messages"] if m["id"] == mid)
+    assert stored["reactions"][0]["users"] == ["111111111111111111", str(playground.BOT_ID)]
+
+    # remove_reaction only drops the caller's own reaction
+    await handle.remove_reaction("🔥")
+    stored = next(m for m in state(s)["messages"] if m["id"] == mid)
+    assert stored["reactions"][0]["users"] == ["111111111111111111"]
+    s.close()
+
+
+async def test_reaction_requires_add_reactions_permission():
+    s = Session("t-react-denied")
+    await run_script(s, "async def main():\n    await send('no reactions here')\n")
+    mid = s.order[-1]
+    s.set_user(111111111111111111)  # Alice
+    s.active_user.permission_override = discord.Permissions(view_channel=True, send_messages=True)
+    try:
+        await s.toggle_reaction(mid, "👍", user_id=111111111111111111, actor="user")
+        raise AssertionError("expected discord.Forbidden")
+    except discord.Forbidden:
+        pass
+    denied = next(e for e in reversed(s.events)
+                  if e.get("details", {}).get("status") == "denied"
+                  and e["details"].get("permission") == "add_reactions")
+    assert denied["kind"] == "action"
+    stored = next(m for m in state(s)["messages"] if m["id"] == mid)
+    assert stored.get("reactions", []) == []
+    s.close()
+
+
+# --- discord payload limits (400 Invalid Form Body, code 50035) -----------------
+
+
+async def test_oversize_content_is_rejected_like_real_discord():
+    s = Session("t-limits-content")
+    try:
+        s.add_message("x" * 2001)
+        raise AssertionError("expected discord.HTTPException")
+    except discord.HTTPException as error:
+        assert error.status == 400
+        assert error.code == 50035
+        assert "content" in str(error)
+        assert not s.messages  # nothing was stored
+    await run_script(s, "async def main():\n    await send('ok' * 10)\n")
+    assert len(s.messages) == 1  # normal sends still work
+    s.close()
+
+
+async def test_embed_limit_violations_are_rejected():
+    s = Session("t-limits-embed")
+    try:
+        fat = discord.Embed(title="t" * 257)
+        s.add_message(embed=fat)
+        raise AssertionError("expected discord.HTTPException")
+    except discord.HTTPException as error:
+        assert error.status == 400 and error.code == 50035
+        assert "title" in str(error)
+    try:
+        crowded = discord.Embed()
+        for i in range(26):
+            crowded.add_field(name=f"f{i}", value="v")
+        s.add_message(embed=crowded)
+        raise AssertionError("expected discord.HTTPException")
+    except discord.HTTPException:
+        pass
+    s.add_message(embed=discord.Embed(title="fine", description="d" * 4096))  # at-limit passes
+    assert len(s.messages) == 1
+    s.close()
+
+
+async def test_component_limit_violations_are_rejected():
+    s = Session("t-limits-components")
+    try:
+        view = discord.ui.View()
+        view.add_item(discord.ui.Button(label="L" * 81, custom_id="big"))
+        s.add_message(view=view)
+        raise AssertionError("expected discord.HTTPException")
+    except discord.HTTPException as error:
+        assert error.status == 400 and error.code == 50035
+        assert "label" in str(error)
+    # (6-buttons-per-row is unconstructible through discord.ui.View itself —
+    # discord.py raises "item would not fit at row 0" client-side — so the
+    # mock's row guard only ever fires for hand-built serialized trees.)
+    ok = discord.ui.View()
+    ok.add_item(discord.ui.Button(label="ok", custom_id="ok", row=0))
+    s.add_message(view=ok)
+    assert len(s.messages) == 1
+    s.close()
+
+
+# --- simulated voice / uploads / moderation -------------------------------------
+
+
+async def test_voice_simulation_roundtrip():
+    s = Session("t-voice")
+    try:
+        s.voice_action("join", channel_id="999999")
+        raise AssertionError("expected ValueError for unknown channel")
+    except ValueError:
+        pass
+    s.voice_action("join", channel_id=str(s.channel.id))
+    voice = state(s)["voice"]
+    assert voice["channel"] == str(s.channel.id) and voice["name"] == "playground"
+    s.voice_action("deafen")
+    voice = state(s)["voice"]
+    assert voice["self_deaf"] and voice["self_mute"]
+    s.voice_action("unmute")  # unmute also shows the speaking ring
+    voice = state(s)["voice"]
+    assert not voice["self_mute"] and voice["speaking"] == [str(s.user_id)]
+    joined = [e for e in s.events if e.get("details", {}).get("operation") == "voice.simulate"]
+    assert len(joined) >= 3
+    s.voice_action("leave")
+    voice = state(s)["voice"]
+    assert voice["channel"] is None and voice["speaking"] == []
+    try:
+        s.voice_action("dance")
+        raise AssertionError("expected ValueError for unknown action")
+    except ValueError:
+        pass
+    s.close()
+
+
+async def test_uploads_reach_on_message_attachments():
+    s = Session("t-uploads")
+    await run_script(s, "import json\n"
+                        "async def on_message(message):\n"
+                        "    await send(f\"got {len(message.attachments)} file(s): {message.attachments[0]['name']}\")\n")
+    entry = s.add_upload("photo.png", 1024, "image/png", "data:image/png;base64,AAAA")
+    assert entry["name"] == "photo.png"
+    assert any(e.get("details", {}).get("operation") == "message.attachment" for e in s.events)
+    await dispatch_message(s, "here is my upload",
+                           files=[{"name": "photo.png", "data_uri": "data:image/png;base64,AAAA"}])
+    stored = next(m for m in state(s)["messages"] if m["content"] == "here is my upload")
+    assert stored["files"][0]["name"] == "photo.png"
+    assert stored["files"][0]["data_uri"].startswith("data:image/png")
+    replied = next(m for m in state(s)["messages"] if "got 1 file(s)" in m["content"])
+    assert "photo.png" in replied["content"]
+    assert state(s)["uploads"][0]["size"] == 1024
+    s.close()
+
+
+async def test_moderation_permissions_and_roundtrip():
+    s = Session("t-moderation")
+    carol = 333333333333333333
+    alice = 111111111111111111
+    # a member without moderation perms is refused with a denied log entry
+    s.set_user(alice)
+    s.active_user.permission_override = discord.Permissions(view_channel=True, send_messages=True)
+    try:
+        s.kick_member(carol)
+        raise AssertionError("expected discord.Forbidden")
+    except discord.Forbidden:
+        pass
+    assert s.guild.get_member(carol) is not None
+    # the owner can kick; a kicked member is simply gone (kick ≠ ban)
+    s.set_user(123456789012345678)
+    s.kick_member(carol)
+    assert s.guild.get_member(carol) is None
+    # re-add via the public add path to prove members can come back
+    carol2 = s.add_member("Carol").id
+    assert s.guild.get_member(carol2) is not None
+    # ban removes the member and registers them for unban (unban recreates them)
+    s.ban_member(carol2)
+    assert s.guild.get_member(carol2) is None
+    s.unban_member(carol2)
+    assert s.guild.get_member(carol2) is not None
+    # timeout shows in member_details and clears at zero minutes
+    s.timeout_member(carol2, 10)
+    assert next(m for m in state(s)["member_details"] if m["id"] == str(carol2))["timed_out"] is True
+    s.timeout_member(carol2, 0)
+    assert next(m for m in state(s)["member_details"] if m["id"] == str(carol2))["timed_out"] is False
+    # bots and the owner are protected
+    try:
+        s.ban_member(playground.BOT_ID)
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+    try:
+        s.ban_member(123456789012345678)
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+    kicked = [e for e in s.events if e.get("details", {}).get("operation") in
+              ("member.kick", "member.ban", "member.timeout", "member.unban")]
+    assert len(kicked) >= 5
+    s.close()
 
 
 async def main() -> None:
