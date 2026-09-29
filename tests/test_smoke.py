@@ -9,6 +9,7 @@ Most checks use throwaway Session objects without network access; the OAuth chec
 
 import asyncio
 import os
+import pathlib
 import subprocess
 import sys
 import tempfile
@@ -23,6 +24,7 @@ from playground import (
     dispatch_command,
     dispatch_message,
     dispatch_submit,
+    reload_script,
     run_script,
     state,
 )
@@ -59,6 +61,14 @@ async def new_session_with(code: str) -> Session:
 
 def last_msg(s: Session):
     return s.messages[s.order[-1]] if s.order else None
+
+
+def _write_bot_workspace(root, name, bot_py):
+    """Create a minimal bots/<name>/ with a bot.py entry under a temp root."""
+    folder = root / name
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "bot.py").write_text(bot_py, encoding="utf-8")
+    return folder
 
 
 async def test_run_captures_send():
@@ -424,6 +434,511 @@ async def test_unknown_command_and_reset_on_rerun():
     assert failure["details"]["status"] == "missing_command"
     await run_script(s, "async def main():\n    pass")  # no commands in this script
     assert s.commands == {} and s.cmd_objects == {}
+
+
+# --- live reload (timeline-preserving re-exec) ----------------------------------
+
+
+RELOAD_BASE = """
+import discord
+async def main():
+    v = discord.ui.View()
+    v.add_item(discord.ui.Button(label="Go", custom_id="go"))
+    await send(view=v)
+"""
+
+
+async def test_reload_replaces_env_without_clearing_timeline():
+    s = Session("t-reload-timeline")
+    try:
+        await run_script(s, RELOAD_BASE)
+        assert len(s.order) == 1 and s.env is not None
+        result = await reload_script(s, RELOAD_BASE)
+        assert result["ok"] is True
+        assert len(s.order) == 1  # the welcome message is untouched
+        assert len(s.channels) >= 1  # channels survive too
+        assert s.env is not None
+        assert next(e for e in reversed(s.events) if "reloaded" in e["text"])
+    finally:
+        s.close()
+
+
+async def test_reload_preserves_custom_id_routing_to_new_handler():
+    s = Session("t-reload-routing")
+    try:
+        await run_script(s, RELOAD_BASE + '''
+async def on_click(interaction, custom_id, values):
+    await interaction.response.send_message("old handler", ephemeral=True)
+''')
+        mid = s.order[-1]
+        await dispatch_click(s, mid, "go", [])
+        assert last_msg(s)["content"] == "old handler"
+        await reload_script(s, RELOAD_BASE + '''
+async def on_click(interaction, custom_id, values):
+    await interaction.response.send_message("new handler", ephemeral=True)
+''')
+        assert mid in s.messages  # the ORIGINAL message still exists
+        await dispatch_click(s, mid, "go", [])
+        assert last_msg(s)["content"] == "new handler"
+        assert len(s.order) == 3  # welcome + old reply + new reply
+    finally:
+        s.close()
+
+
+async def test_reload_recalls_commands():
+    s = Session("t-reload-commands")
+    try:
+        await run_script(s, "async def main():\n    pass")
+        await reload_script(s, CMD_SCRIPT)
+        assert set(s.commands) == {"echo", "pick", "who", "need"}
+        assert set(s.cmd_objects) == {"echo", "pick", "who", "need"}
+        await dispatch_command(s, "echo", {"text": "fresh"})
+        assert last_msg(s)["content"] == "fresh"
+    finally:
+        s.close()
+
+
+async def test_reload_syntax_error_preserves_previous_env():
+    s = Session("t-reload-broken")
+    try:
+        await run_script(s, RELOAD_BASE)
+        previous_env = s.env
+        assert previous_env is not None
+        before = len(s.order)
+        result = await reload_script(s, "def broken(:\n")
+        assert result["ok"] is False
+        assert s.env is previous_env  # the old module keeps running
+        assert len(s.order) == before  # timeline untouched
+        assert any(e.get("cls") == "error" for e in s.events)
+        assert s.last_run["exception"]["type"] == "SyntaxError"
+    finally:
+        s.close()
+
+
+async def test_reload_does_not_run_main_unless_asked():
+    s = Session("t-reload-runmain")
+    try:
+        await run_script(s, RELOAD_BASE)
+        before = len(s.order)
+        await reload_script(s, RELOAD_BASE)
+        assert len(s.order) == before  # main() did not re-run
+        await reload_script(s, RELOAD_BASE, run_main=True)
+        assert len(s.order) == before + 1  # main() booted again on the new module
+    finally:
+        s.close()
+
+
+async def test_run_after_reload_still_clears_timeline():
+    s = Session("t-reload-then-run")
+    try:
+        await run_script(s, RELOAD_BASE)
+        await reload_script(s, RELOAD_BASE)
+        assert len(s.order) == 1
+        await run_script(s, "async def main():\n    await send('fresh run')\n")
+        assert [s.messages[mid]["content"] for mid in s.order] == ["fresh run"]
+        assert s.commands == {}
+    finally:
+        s.close()
+
+
+async def test_reload_route_returns_state_and_refuses_hosted_projects():
+    import json
+
+    import main as server
+
+    s = Session("t-reload-route")
+    server.SESSIONS[s.sid] = s
+    try:
+        await run_script(s, RELOAD_BASE)
+        response = await server.reload_code(_FakeReq(
+            match={"sid": s.sid}, body={"code": RELOAD_BASE, "run_main": False}
+        ))
+        data = json.loads(response.body)
+        assert data["ok"] is True
+        assert data["state"]["revision"] == s.revision
+        assert len(data["state"]["messages"]) == 1
+
+        empty = await server.reload_code(_FakeReq(match={"sid": s.sid}, body={"code": "   "}))
+        assert empty.status == 400
+
+        server.RUNTIMES[s.sid] = object()  # a hosted project owns this session
+        try:
+            hosted = await server.reload_code(_FakeReq(
+                match={"sid": s.sid}, body={"code": RELOAD_BASE}
+            ))
+            assert hosted.status == 409
+        finally:
+            server.RUNTIMES.pop(s.sid, None)
+    finally:
+        server.SESSIONS.pop(s.sid, None)
+        s.close()
+
+
+# --- Slice 1: multi-file bot workspaces ----------------------------------------
+
+
+async def test_workspace_two_files_import_and_dispatch():
+    """bot.py imports helpers.py; the command sends the helper's result."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        folder = _write_bot_workspace(pathlib.Path(td), "two_file_bot", '''
+import discord
+from discord import app_commands
+from helpers import greet
+
+@app_commands.command(name="greet_user")
+async def greet_user(interaction):
+    await interaction.response.send_message(greet("Alice"))
+
+async def main():
+    pass
+''')
+        (folder / "helpers.py").write_text("def greet(name):\n    return f'Hello, {name} from helpers!'\n", encoding="utf-8")
+        s = Session("t-ws-two-files")
+        try:
+            result = await run_script(s, "", workspace="two_file_bot", workspace_root=folder)
+            assert result["ok"] is True, s.last_run
+            assert s.workspace == "two_file_bot"
+            assert "greet_user" in s.commands
+            await dispatch_command(s, "greet_user", {})
+            assert last_msg(s)["content"] == "Hello, Alice from helpers!"
+        finally:
+            s.close()
+
+
+async def test_workspace_relative_import_resolves():
+    """`from .helpers import greet` works via the workspace finder."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        folder = _write_bot_workspace(pathlib.Path(td), "relative_import_bot", '''
+from .helpers import greet
+
+async def main():
+    await send(greet("Bob"))
+''')
+        (folder / "helpers.py").write_text("def greet(name):\n    return f'hi {name}'\n", encoding="utf-8")
+        s = Session("t-ws-relative")
+        try:
+            result = await run_script(s, "", workspace="relative_import_bot", workspace_root=folder)
+            assert result["ok"] is True, s.last_run
+            assert last_msg(s)["content"] == "hi Bob"
+        finally:
+            s.close()
+
+
+async def test_workspace_dunder_file_points_inside_workspace():
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        folder = _write_bot_workspace(pathlib.Path(td), "dunder_file_bot", '''
+async def main():
+    await send(__file__)
+''')
+        s = Session("t-ws-dunder")
+        try:
+            result = await run_script(s, "", workspace="dunder_file_bot", workspace_root=folder)
+            assert result["ok"] is True, s.last_run
+            sent = last_msg(s)["content"]
+            assert pathlib.Path(sent).resolve() == (folder / "bot.py").resolve()
+        finally:
+            s.close()
+
+
+async def test_workspace_manifest_and_traversal_are_rejected():
+    """workspace.json allowlist + `..` import attempts fail with clear errors."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        root = pathlib.Path(td)
+        folder = _write_bot_workspace(root, "manifest_bot", '''
+import secret_helper
+
+async def main():
+    pass
+''')
+        (folder / "secret_helper.py").write_text("MARKER = 'outside allowlist'\n", encoding="utf-8")
+        (folder / "workspace.json").write_text('{"files": ["bot.py"]}\n', encoding="utf-8")
+        outside = root / "outside.py"
+        outside.write_text("OUTSIDE_MARKER = 'this must never be read'\n", encoding="utf-8")
+        s = Session("t-ws-manifest")
+        try:
+            await run_script(s, "", workspace="manifest_bot", workspace_root=folder)
+            assert s.last_run["ok"] is False
+            assert "allowlist" in s.last_run["exception"]["message"]
+            assert "outside.py" not in s.last_run["error"]
+            assert outside.read_text(encoding="utf-8") == "OUTSIDE_MARKER = 'this must never be read'\n"
+            assert "OUTSIDE_MARKER" not in sys.modules
+
+            # a symlink that points outside the workspace is rejected on import
+            # (the `..`-equivalent escape vector that actually reaches the finder:
+            # a plain `from ..outside import` fails inside CPython before any
+            # filesystem probe, so the symlink is the real traversable path)
+            escape = _write_bot_workspace(root, "escape_bot", '''
+import sneaky
+
+async def main():
+    pass
+''')
+            try:
+                (escape / "sneaky.py").symlink_to(outside)
+            except OSError:
+                return  # symlinks unavailable on this filesystem; covered above
+            s2 = Session("t-ws-escape")
+            try:
+                result = await run_script(s2, "", workspace="escape_bot", workspace_root=escape)
+                assert result["ok"] is False
+                message = s2.last_run["exception"]["message"]
+                assert "outside the workspace" in message
+                assert "OUTSIDE_MARKER" not in sys.modules
+            finally:
+                s2.close()
+        finally:
+            s.close()
+
+
+async def test_workspace_cog_command_discovered_and_dispatched():
+    """cogs/echo.py: setup(bot) + commands.Cog + app_commands.command."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        folder = _write_bot_workspace(pathlib.Path(td), "cog_bot", '''
+import discord
+from discord.ext import commands
+
+async def setup(bot):
+    await bot.add_cog(Echo(bot))
+
+async def main():
+    pass
+''')
+        cogs = folder / "cogs"
+        cogs.mkdir(exist_ok=True)
+        (cogs / "echo.py").write_text('''
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+class Echo(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    @app_commands.command(name="echo", description="say it back")
+    async def echo(self, interaction: discord.Interaction, text: str):
+        await interaction.response.send_message(f"echo:{text}")
+
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        pass
+''', encoding="utf-8")
+        (folder / "bot.py").write_text('''
+from cogs.echo import Echo
+
+async def setup(bot):
+    await bot.add_cog(Echo(bot))
+
+async def main():
+    pass
+''', encoding="utf-8")
+        s = Session("t-ws-cog")
+        try:
+            result = await run_script(s, "", workspace="cog_bot", workspace_root=folder)
+            assert result["ok"] is True, s.last_run
+            assert "echo" in s.commands, s.commands
+            assert s.client.get_cog("Echo") is not None
+            assert s.client._listeners.get("on_message")
+            await dispatch_command(s, "echo", {"text": "roundtrip"})
+            assert last_msg(s)["content"] == "echo:roundtrip"
+        finally:
+            s.close()
+
+
+async def test_workspace_rerun_isolation_no_stale_modules_or_duplicates():
+    """Re-running the workspace re-imports fresh: no dupes, no stale sys.modules."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        folder = _write_bot_workspace(pathlib.Path(td), "isolation_bot", '''
+import discord
+from discord import app_commands
+import helpers
+from helpers import COUNTER
+
+@app_commands.command(name="count")
+async def count(interaction):
+    await interaction.response.send_message(f"count:{COUNTER}")
+
+async def main():
+    pass
+''')
+        (folder / "helpers.py").write_text("print('importing helpers')\nCOUNTER = 0\n", encoding="utf-8")
+        s = Session("t-ws-isolation")
+        try:
+            first = await run_script(s, "", workspace="isolation_bot", workspace_root=folder)
+            assert first["ok"] is True, s.last_run
+            assert sum(1 for event in s.events if "importing helpers" in event["text"]) == 1
+
+            second = await run_script(s, "", workspace="isolation_bot", workspace_root=folder)
+            assert second["ok"] is True, s.last_run
+            assert list(s.commands) == ["count"]  # no duplicate registration
+            # the second run re-imported helpers fresh (counter reset) and its
+            # modules were unloaded afterwards — no stale entries left behind
+            assert sum(1 for event in s.events if "importing helpers" in event["text"]) == 2
+            assert not any(name.startswith("helpers") for name in sys.modules)
+            await dispatch_command(s, "count", {})
+            assert last_msg(s)["content"] == "count:0"
+        finally:
+            s.close()
+
+
+async def test_workspace_deadline_interrupts_imported_module():
+    """while True: pass in a helper is cut by the deadline, not the outer timeout."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        folder = _write_bot_workspace(pathlib.Path(td), "infinite_bot", '''
+import spin
+
+async def main():
+    pass
+''')
+        (folder / "spin.py").write_text("while True:\n    pass\n", encoding="utf-8")
+        s = Session("t-ws-deadline")
+        try:
+            result = await run_script(s, "", workspace="infinite_bot", workspace_root=folder, timeout=1.0)
+            assert result["ok"] is False
+            assert any("execution deadline" in event["text"] for event in s.events)
+            assert result["ms"] < 10_000  # ScriptStuck, not the outer runner timeout
+        finally:
+            s.close()
+
+
+async def test_single_file_run_has_no_workspace():
+    """Single-file regression: no workspace attrs, no __file__ leakage, same output."""
+    s = Session("t-ws-single-file")
+    try:
+        result = await run_script(s, "async def main():\n    await send('plain')\n")
+        assert result["ok"] is True
+        assert last_msg(s)["content"] == "plain"
+        assert s.workspace is None and s.workspace_root is None
+        assert "__file__" not in s.env
+        assert s.env["__name__"] == "playground"
+        assert s.client.cogs == {}
+        await dispatch_message(s, "hey")
+        assert not s.modals
+    finally:
+        s.close()
+
+
+async def test_restart_clears_workspace_state_and_route_arms_run():
+    """Restart clears workspace import state; /run with a bot.py workspace runs it."""
+    import json
+    import tempfile
+
+    import main as server
+
+    with tempfile.TemporaryDirectory() as td:
+        original = server.WORKSPACES_DIR
+        server.WORKSPACES_DIR = pathlib.Path(td)
+        folder = _write_bot_workspace(
+            server.WORKSPACES_DIR, "route_bot",
+            "async def main():\n    await send('workspace booted')\n")
+        (folder / "helpers.py").write_text("VALUE = 1\n", encoding="utf-8")
+        sid = f"ws-route-{pathlib.Path(td).name}"
+        s = Session(sid)
+        previous_session = server.SESSIONS.get(sid)
+        server.SESSIONS[sid] = s
+        try:
+            response = await server.run_code(_FakeReq(
+                match={"sid": sid}, body={"workspace": "route_bot", "code": ""}
+            ))
+            data = json.loads(response.body)
+            assert data["ok"] is True and data["mode"] == "workspace"
+            assert s.workspace == "route_bot"
+            assert "workspace booted" in s.messages[s.order[-1]]["content"]
+
+            server.RUNTIMES[sid] = object()  # the reload route must still refuse hosted sessions
+            try:
+                hosted = await server.reload_code(_FakeReq(match={"sid": sid}, body={"code": "x = 1\n"}))
+                assert hosted.status == 409
+            finally:
+                server.RUNTIMES.pop(sid, None)
+
+            # Restart clears workspace import state but keeps the folder connected
+            await server.restart(_FakeReq(match={"sid": sid}))
+            assert s.workspace == "route_bot" and s.workspace_root == folder.resolve()
+            assert s.env is None and s.commands == {} and s.client.cogs == {}
+            assert not any(name.startswith("helpers") for name in sys.modules)
+        finally:
+            server.WORKSPACES_DIR = original
+            if previous_session is None:
+                server.SESSIONS.pop(sid, None)
+            else:
+                server.SESSIONS[sid] = previous_session
+            s.close()
+
+
+async def test_workspace_watcher_reloads_saved_file():
+    import json
+    import os
+    import pathlib
+    import tempfile
+
+    import main as server
+
+    with tempfile.TemporaryDirectory() as td:
+        original = server.WORKSPACES_DIR
+        original_interval = server._WORKSPACE_WATCH_INTERVAL
+        server.WORKSPACES_DIR = pathlib.Path(td)
+        server._WORKSPACE_WATCH_INTERVAL = 0.01
+        folder = server.WORKSPACES_DIR / "watched_bot"
+        folder.mkdir()
+        bot_file = folder / "bot.py"
+        bot_file.write_text(RELOAD_BASE, encoding="utf-8")
+        s = Session("t-watcher")
+        previous_session = server.SESSIONS.get(s.sid)
+        server.SESSIONS[s.sid] = s
+        # on_startup only runs under a real server; the poller is started by hand here.
+        watcher = asyncio.create_task(server._watch_workspace_files(None))
+        try:
+            # Boot through the run-file path so the watcher arms on this file.
+            response = await server.run_workspace_file(_FakeReq(
+                match={"sid": s.sid},
+                body={"workspace": "watched_bot", "filename": "bot.py", "code": RELOAD_BASE},
+            ))
+            assert json.loads(response.body)["ok"] is True
+            assert s.sid in server.WORKSPACE_WATCHERS
+            assert len(s.order) == 1
+
+            # External editor saves the file; the poller must pick it up.
+            bot_file.write_text(RELOAD_BASE + '''
+async def on_click(interaction, custom_id, values):
+    await interaction.response.send_message("auto-reloaded", ephemeral=True)
+''', encoding="utf-8")
+            armed = server.WORKSPACE_WATCHERS[s.sid]["mtime"]
+            os.utime(bot_file, ns=(armed + 1_000_000, armed + 1_000_000))  # force a fresh mtime
+            deadline = asyncio.get_running_loop().time() + 5
+            while (not any("reloaded" in e["text"] for e in s.events)
+                   and asyncio.get_running_loop().time() < deadline):
+                await asyncio.sleep(0.01)
+            assert any("reloaded" in e["text"] for e in s.events)
+            assert len(s.order) == 1  # timeline kept — reload adds no message
+            mid = s.order[0]  # the ORIGINAL welcome message
+            await dispatch_click(s, mid, "go", [])
+            assert last_msg(s)["content"] == "auto-reloaded"
+        finally:
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+            server._disarm_workspace_watch(s)
+            server.WORKSPACE_WATCHERS.clear()
+            server.WORKSPACES_DIR = original
+            server._WORKSPACE_WATCH_INTERVAL = original_interval
+            if previous_session is None:
+                server.SESSIONS.pop(s.sid, None)
+            else:
+                server.SESSIONS[s.sid] = previous_session
+            s.close()
 
 
 # --- rich mock surface: files, embed media, expanded selects ---------------------
@@ -1014,25 +1529,44 @@ async def test_workspace_run_actions_use_saved_project_vs_editor_buffer():
                 return {"bot": "saved bot", "cogs": [], "commands": []}
 
         async def fake_run_project(_session, project, on_exception=None):
-            captured["project_entry"] = (project / "bot.py").read_text(encoding="utf-8")
+            captured["project_entry"] = (project / "main.py").read_text(encoding="utf-8")
             captured["on_exception"] = on_exception
             return FakeRuntime()
 
-        async def fake_run_script(_session, code):
+        async def fake_run_script(_session, code, **_kwargs):
             captured["file_buffer"] = code
+            captured["run_kwargs"] = _kwargs
             return {"ok": True, "ms": 1.0}
 
         server.SESSIONS[sid] = session
         server.bot_runtime.run_project = fake_run_project
         server.run_script = fake_run_script
         try:
+            # A bot.py workspace now runs through the playground runtime (the
+            # saved bot.py is the entry; the editor buffer is passed through
+            # but ignored by the real run_script for entry runs).
             project_response = await server.run_code(_FakeReq(
                 match={"sid": sid}, body={"workspace": "run_semantics", "code": "unsaved bot buffer"}
             ))
             project = json.loads(project_response.body)
-            assert project["ok"] and project["mode"] == "project"
-            assert captured["project_entry"] == saved_entry
+            assert project["ok"] and project["mode"] == "workspace"
+            assert captured["file_buffer"] == "unsaved bot buffer"
+            assert captured["run_kwargs"]["workspace"] == "run_semantics"
+            assert captured["run_kwargs"]["workspace_root"] == folder
+            captured.clear()
+
+            # A folder with a different entry (main.py) keeps the hosted boot.
+            main_folder = server.WORKSPACES_DIR / "hosted_semantics"
+            main_folder.mkdir()
+            (main_folder / "main.py").write_text("# hosted entry\n", encoding="utf-8")
+            hosted_response = await server.run_code(_FakeReq(
+                match={"sid": sid}, body={"workspace": "hosted_semantics", "code": "editor text"}
+            ))
+            hosted = json.loads(hosted_response.body)
+            assert hosted["ok"] and hosted["mode"] == "project"
+            assert captured["project_entry"] == "# hosted entry\n"
             assert callable(captured["on_exception"])
+            captured.clear()
 
             file_response = await server.run_workspace_file(_FakeReq(
                 match={"sid": sid}, body={
@@ -1045,7 +1579,7 @@ async def test_workspace_run_actions_use_saved_project_vs_editor_buffer():
             assert file_result["file"] == "cogs/worker.py"
             assert captured["file_buffer"].endswith("unsaved active buffer')\n")
             assert (folder / "cogs" / "worker.py").read_text(encoding="utf-8") == saved_file
-            assert captured["shutdown"] is True
+            assert captured["shutdown"] is True  # the hosted runtime from the main.py boot above
 
             invalid = await server.run_workspace_file(_FakeReq(
                 match={"sid": sid}, body={

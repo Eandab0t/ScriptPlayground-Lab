@@ -38,6 +38,7 @@ from playground import (
     dispatch_command,
     dispatch_message,
     dispatch_submit,
+    reload_script,
     run_scenario,
     run_script,
     state,
@@ -172,6 +173,11 @@ RUNTIMES: dict[str, bot_runtime.ProjectRuntime | bot_runtime.NodeProjectRuntime]
 WS_CLIENTS: dict[str, set[web.WebSocketResponse]] = {}
 OAUTH_STATES: dict[str, float] = {}
 AUTH_SESSIONS: dict[str, dict[str, str | None]] = {}
+# sid -> {"path": Path, "mtime": int} for the workspace file a session last ran
+# via /run-file; the mtime poller live-reloads it when the file changes on disk.
+WORKSPACE_WATCHERS: dict[str, dict] = {}
+_WORKSPACE_WATCH_INTERVAL = 0.5
+_WORKSPACE_WATCH_TASK: asyncio.Task | None = None
 
 
 def _session_project_lock(session: Session) -> asyncio.Lock:
@@ -407,6 +413,16 @@ def _workspace_python_files(folder: Path) -> list[str]:
             continue
         files.append(relative.as_posix())
     return sorted(files)
+
+
+def _workspace_entry(folder: Path) -> Path | None:
+    """The workspace's entry module: bot.py when it exists, else None.
+
+    A folder without bot.py keeps its current behavior (hosted project boot
+    from Run; run-file stays available for main.py-style entries).
+    """
+    entry = folder / "bot.py"
+    return entry if entry.is_file() else None
 
 
 class _ProjectBootDeadline(Exception):
@@ -727,6 +743,16 @@ async def _run_code(session: Session, body: dict) -> web.Response:
             folder = _workspace_dir(workspace)
         except (web.HTTPBadRequest, web.HTTPNotFound):
             return web.json_response({"ok": False, "error": f"unknown workspace {workspace!r}"}, status=404)
+        if _workspace_entry(folder) is not None:
+            # Slice 1: bot.py workspaces run through the playground runtime
+            # (imports, cogs, cog slash commands). Folders with a different
+            # entry (main.py) keep the hosted-project boot below.
+            _disarm_workspace_watch(session)  # editor-driven Run owns the runtime again
+            code = body.get("code") or ""
+            result = await run_script(session, code, workspace=workspace, workspace_root=folder,
+                                      workspace_file=None)
+            _bump(session.sid)
+            return web.json_response({**result, "mode": "workspace"})
         try:
             return web.json_response(await _boot_workspace_project(session, folder))
         except _ProjectBootDeadline:
@@ -739,9 +765,12 @@ async def _run_code(session: Session, body: dict) -> web.Response:
             return web.json_response({
                 "ok": False, "error": f"{type(error).__name__}: {error}", "last_run": last_run or None,
             }, status=500)
+        finally:
+            _disarm_workspace_watch(session)  # hosted projects dispatch through the runtime
     code = body.get("code") or ""
     if not code.strip():
         return web.json_response({"ok": False, "error": "Nothing to run — the editor is empty."}, status=400)
+    _disarm_workspace_watch(session)  # editor-driven Run owns the runtime again
     result = await run_script(session, code)
     _bump(session.sid)
     return web.json_response(result)
@@ -768,7 +797,10 @@ async def _run_workspace_file(session: Session, body: dict) -> web.Response:
             return web.json_response({"ok": False, "error": "Nothing to run — the active file is empty."}, status=400)
         await _shutdown_runtime(session)
         session.restart()
-        result = await run_script(session, code)
+        folder = _workspace_dir(workspace)
+        result = await run_script(session, code, workspace=workspace, workspace_root=folder,
+                                  workspace_file=filename)
+        _arm_workspace_watch(session, _workspace_file(workspace, filename))
         _bump(session.sid)
         result = {**result, "mode": "file", "file": filename}
         return web.json_response(result)
@@ -781,6 +813,61 @@ async def _run_workspace_file(session: Session, body: dict) -> web.Response:
     except Exception as error:  # noqa: BLE001 - script failures remain visible in session state
         return web.json_response({"ok": False, "error": f"{type(error).__name__}: {error}"}, status=500)
 
+
+async def _watch_workspace_files(_app: web.Application) -> None:
+    """Poll armed workspace files; reload the session when one changes on disk."""
+    while True:
+        await asyncio.sleep(_WORKSPACE_WATCH_INTERVAL)
+        for sid, watch in list(WORKSPACE_WATCHERS.items()):
+            session = SESSIONS.get(sid)
+            if session is None:
+                WORKSPACE_WATCHERS.pop(sid, None)
+                continue
+            path: Path = watch["path"]
+            try:
+                mtime = path.stat().st_mtime_ns
+            except OSError:
+                continue  # file briefly missing (editor mid-save); keep watching
+            if mtime == watch["mtime"]:
+                continue
+            watch["mtime"] = mtime
+            try:
+                code = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            try:
+                await reload_script(session, code)
+                _bump(sid)
+            except Exception:  # the poller must survive bad edits
+                log.exception("workspace auto-reload failed for %s", sid)
+
+
+def _arm_workspace_watch(session: Session, path: Path) -> None:
+    """Watch exactly this one file (no recursive folder watching)."""
+    try:
+        WORKSPACE_WATCHERS[session.sid] = {"path": path, "mtime": path.stat().st_mtime_ns}
+    except OSError:
+        WORKSPACE_WATCHERS.pop(session.sid, None)
+
+
+def _disarm_workspace_watch(session: Session) -> None:
+    WORKSPACE_WATCHERS.pop(session.sid, None)
+
+
+async def reload_code(request: web.Request) -> web.Response:
+    """Live-reload the editor buffer into the session without clearing the timeline."""
+    session = _get_session(request)
+    if _runtime(session) is not None:
+        return web.json_response(
+            {"ok": False, "error": "This session is running a hosted project — press Run to boot the saved files."},
+            status=409)
+    body = await request.json()
+    code = body.get("code") or ""
+    if not code.strip():
+        return web.json_response({"ok": False, "error": "Nothing to reload — the editor is empty."}, status=400)
+    result = await reload_script(session, code, run_main=bool(body.get("run_main")))
+    _bump(session.sid)
+    return web.json_response({**result, "state": state(session)})
 
 
 def _runtime(session: Session) -> bot_runtime.ProjectRuntime | bot_runtime.NodeProjectRuntime | None:
@@ -992,9 +1079,29 @@ async def restart(request: web.Request) -> web.Response:
             await _shutdown_runtime(session)
         except _ProjectShutdownPending as error:
             return web.json_response({"ok": False, "error": str(error)}, status=503)
+        connected = session.workspace  # Restart keeps the folder connected for the next Run
         session.restart()
+        if connected:
+            _hold_workspace(session, connected)
+        _disarm_workspace_watch(session)
         _bump(session.sid)
         return web.json_response(state(session))
+
+
+def _hold_workspace(session: Session, workspace: str) -> None:
+    """Re-arm the active workspace on a session after Restart.
+
+    Restart deliberately clears workspace import state; this re-attaches the
+    folder so the next Run boots that same bot ("restart, rerun" keeps the
+    workspace selected). Import isolation (sys.modules/cogs) is reset — Run
+    re-imports everything fresh.
+    """
+    try:
+        folder = _workspace_dir(workspace)
+    except (web.HTTPBadRequest, web.HTTPNotFound):
+        return
+    session.workspace = workspace
+    session.workspace_root = folder
 
 
 async def websocket(request: web.Request) -> web.WebSocketResponse:
@@ -1040,7 +1147,10 @@ def enable_auto_shutdown(app: web.Application) -> None:
 
 
 async def on_startup(app: web.Application) -> None:
+    global _WORKSPACE_WATCH_TASK
     _bump._loop = asyncio.get_running_loop()
+    if _WORKSPACE_WATCH_TASK is None or _WORKSPACE_WATCH_TASK.done():
+        _WORKSPACE_WATCH_TASK = asyncio.create_task(_watch_workspace_files(app))
     if app.get(_AUTO_SHUTDOWN):
         enable_auto_shutdown(app)
 
@@ -1052,6 +1162,7 @@ async def shutdown_sessions(_app: web.Application) -> None:
         except Exception:
             log.exception("Error shutting down project runtime")
     RUNTIMES.clear()
+    WORKSPACE_WATCHERS.clear()
     for session in tuple(SESSIONS.values()):
         try:
             session.close()
@@ -1061,10 +1172,15 @@ async def shutdown_sessions(_app: web.Application) -> None:
 
 
 async def on_cleanup(app: web.Application) -> None:
+    global _WORKSPACE_WATCH_TASK
     watcher = app.get(_DESKTOP_SHUTDOWN_WATCHER)
     if watcher is not None:
         watcher.cancel()
         await asyncio.gather(watcher, return_exceptions=True)
+    if _WORKSPACE_WATCH_TASK is not None:
+        _WORKSPACE_WATCH_TASK.cancel()
+        await asyncio.gather(_WORKSPACE_WATCH_TASK, return_exceptions=True)
+        _WORKSPACE_WATCH_TASK = None
     WS_CLIENTS.clear()
     log.info("ScriptPlayground stopped")
 
@@ -1120,6 +1236,7 @@ def build_app(*, auto_shutdown: bool = False, data_dir: Path | None = None) -> w
     app.router.add_post("/api/session/{sid}/moderate/{action}", moderate)
     app.router.add_post("/api/session/{sid}/command", run_command)
     app.router.add_post("/api/session/{sid}/restart", restart)
+    app.router.add_post("/api/session/{sid}/reload", reload_code)
     app.router.add_post("/api/session/{sid}/project", run_code)
     app.router.add_post("/api/session/{sid}/run-file", run_workspace_file)
     app.router.add_get("/api/session/{sid}/ws", websocket)

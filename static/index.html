@@ -811,6 +811,8 @@
         <span id="run-actions" hidden="">
           <button id="btn-run-file" type="button" disabled="" title="Run the active editor buffer without saving">▶ Run File</button>
         </span>
+        <button id="btn-reload" class="lib-btn" type="button" title="Live-reload the editor into the session; keeps the timeline">⟳ Reload</button>
+        <button id="btn-rerun-main" class="lib-btn" type="button" title="Reload, then re-run main() on the reloaded module; keeps the timeline">⟳ Re-run main</button>
         <button id="btn-run" title="Run the editor buffer as a playground script">▶ Run</button>
         <button id="btn-restart" title="Restart the script runtime">↻</button>
       </span>
@@ -2700,10 +2702,14 @@ function syncWorkspaceUI() {
   $("#btn-apply-blocks").disabled = editorLocked;
   $("#btn-design").disabled = editorLocked;
   $("#btn-run").disabled = editorLocked || runPending;
+  $("#btn-reload").disabled = editorLocked || runPending;
+  $("#btn-rerun-main").disabled = editorLocked || runPending;
   $("#btn-save").disabled = editorLocked;
   $("#workspace-files").hidden = !connected;
   $("#workspace-note").hidden = !connected;
   $("#run-actions").hidden = !connected;
+  $("#btn-reload").hidden = !connected;
+  $("#btn-rerun-main").hidden = !connected;
   $("#btn-run").textContent = "▶ Run";
   $("#btn-run").title = legacyDraftPending
     ? "Choose how to migrate this draft before running it"
@@ -3021,6 +3027,8 @@ async function runRequest(url, payload, source) {
     } else if (data.mode === "project") {
       const status = data.status || {};
       statusText = `— saved bot booted · ${status.bot || "bot"} · cogs: ${(status.cogs || []).join(", ") || "none"} · ${(status.commands || []).length} slash commands`;
+    } else if (data.mode === "workspace") {
+      statusText = `— ran workspace bot.py · ${(data.commands ? Object.keys(data.commands).length : 0)} slash commands`;
     } else {
       const unsaved = workspaceBaseline !== null && $("#code").value !== workspaceBaseline;
       statusText = `— ran editor buffer: ${source}${unsaved ? " (unsaved; disk unchanged)" : ""}`;
@@ -3040,6 +3048,21 @@ async function runRequest(url, payload, source) {
   }
 }
 
+function reloadRequest(runMain) {
+  return runRequest(`/api/session/${SID}/reload`, {
+    code: $("#code").value, run_main: runMain,
+  }, `${loadedScript ? `${loadedScript}.py` : "editor"} (live reload)`);
+}
+$("#btn-reload").onclick = () => {
+  if (legacyDraftPending) return;
+  persistEditorCode($("#code").value);
+  reloadRequest(false);
+};
+$("#btn-rerun-main").onclick = () => {
+  if (legacyDraftPending) return;
+  persistEditorCode($("#code").value);
+  reloadRequest(true);
+};
 $("#btn-run").onclick = async () => {
   if (legacyDraftPending) return;
   const code = $("#code").value;

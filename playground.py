@@ -27,8 +27,11 @@ import asyncio
 import base64
 import contextlib
 import contextvars
+import importlib.abc
+import importlib.util
 import inspect
 import io
+import json
 import logging
 import re
 import sys
@@ -36,6 +39,7 @@ import threading
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import discord
@@ -43,6 +47,7 @@ from discord import app_commands
 
 log = logging.getLogger(__name__)
 _ACTIVE_EVENT: contextvars.ContextVar[str | None] = contextvars.ContextVar("playground_active_event", default=None)
+_CURRENT_SESSION: contextvars.ContextVar[Session | None] = contextvars.ContextVar("playground_current_session", default=None)
 
 USER_ID = 123456789012345678
 USER_NAME = "You"
@@ -408,10 +413,40 @@ class _NullAsyncCtx:
 
 
 class MockClient:
-    """Just enough of discord.Client for scripts to introspect."""
+    """Just enough of discord.Client for scripts to introspect.
+
+    Cogs follow the discord.py convention: ``await bot.add_cog(MyCog(bot))``
+    registers the instance, and its app commands surface in the composer via
+    _collect_commands. Listeners are *stored* here (Slice 1); dispatch is not
+    wired yet.
+    """
 
     def __init__(self, session: Session):
         self._session = session
+        self.cogs: dict[str, object] = {}
+        self._listeners: dict[str, list] = {}
+
+    def _record_cog_listeners(self, cog) -> None:
+        for event_name, attr in getattr(type(cog), "__cog_listeners__", ()):
+            self._listeners.setdefault(event_name, []).append(getattr(cog, attr))
+
+    async def add_cog(self, cog) -> None:
+        name = type(cog).__name__
+        if name in self.cogs:
+            raise RuntimeError(f"Cog named {name!r} is already registered.")
+        self.cogs[name] = cog
+        self._record_cog_listeners(cog)
+        self._session.log("🧩", f"cog loaded: {name}", details={"cog": name})
+
+    def get_cog(self, name: str):
+        return self.cogs.get(name)
+
+    async def remove_cog(self, name: str) -> None:
+        cog = self.cogs.pop(name, None)
+        if cog is not None:
+            for event_name, attr in getattr(type(cog), "__cog_listeners__", ()):
+                self._listeners.get(event_name, []).remove(getattr(cog, attr))
+            self._session.log("🧩", f"cog unloaded: {name}", details={"cog": name})
 
     @property
     def user(self) -> MockMember:
@@ -929,7 +964,12 @@ def _serialize_command(cmd: app_commands.Command) -> dict:
 
 
 def _collect_commands(session: Session, env: dict) -> None:
-    """Gather @app_commands.command() objects defined in the script namespace."""
+    """Gather app commands from the script namespace and registered cogs.
+
+    Module-level @app_commands.command functions land in env.values(); cog
+    commands are bound to their cog instance, so client.cogs is walked too.
+    Cog listeners were already stored by add_cog (dispatch is Slice 2).
+    """
     session.reset_commands()
     seen = set()
     for value in list(env.values()):
@@ -937,8 +977,22 @@ def _collect_commands(session: Session, env: dict) -> None:
             seen.add(value.name)
             session.cmd_objects[value.name] = value
             session.commands[value.name] = _serialize_command(value)
+    for cog in session.client.cogs.values():
+        # get_app_commands() (unlike the class's __cog_app_commands__) returns
+        # the commands rebound to this instance, so cmd.binding is the cog and
+        # dispatch through _do_command calls the callback correctly.
+        for cmd in cog.get_app_commands():
+            if cmd.name in seen:
+                continue
+            seen.add(cmd.name)
+            session.cmd_objects[cmd.name] = cmd
+            session.commands[cmd.name] = _serialize_command(cmd)
     if session.commands:
         session.log("⌨️", f"registered slash commands: {', /'.join(sorted(session.commands))}")
+    listeners = getattr(session.client, "_listeners", {})
+    if listeners:
+        names = sorted(listeners)
+        session.log("🧩", f"cog listeners registered: {', '.join(names)}", details={"listeners": names})
 
 
 def _coerce_arg(session: Session, param: dict, raw):
@@ -1014,7 +1068,13 @@ async def _do_command(session: Session, name: str, args: dict, channel_id=None) 
                 channel_id=channel.id,
             )
             interaction.command = _CommandRef(name)
-            result = cmd._callback(cmd, interaction, **kwargs) if inspect.ismethod(cmd._callback) else cmd._callback(interaction, **kwargs)
+            # Match discord.py's Command._do_call exactly: a bound cog command
+            # passes its binding (the cog instance); a module-level command's
+            # _callback is already rebound and takes no slot self.
+            if getattr(cmd, "binding", None) is not None:
+                result = cmd._callback(cmd.binding, interaction, **kwargs)
+            else:
+                result = cmd._callback(interaction, **kwargs)
             if inspect.isawaitable(result):
                 await result
             if not interaction.is_done():
@@ -1093,6 +1153,9 @@ class Session:
         self.revision = 0  # monotonic state key for cheap browser render checks
         self.channel = self.make_channel("playground")
         self.client = MockClient(self)
+        self.workspace: str | None = None       # active workspace name (None = single-file)
+        self.workspace_root: Path | None = None  # resolved absolute path, or None
+        self.workspace_file: str | None = None  # relative file Run File executed (None = entry bot.py)
         self.user_id = USER_ID
         self.voice_channel: str | None = None   # MockChannel.id of the joined voice room
         self.voice_self_mute = False
@@ -1672,12 +1735,194 @@ class Session:
         self.next_event_id = 1
         self.next_action_id = 1
         self.last_run = None
+        _unload_workspace_modules(self)
+        self.client.cogs.clear()
+        self.client._listeners.clear()
+        self.workspace = None
+        self.workspace_root = None
+        self.workspace_file = None
 
     def close(self) -> None:
         self.runner.shutdown()
 
 
 # --------------------------------------------------------------- script running
+
+
+def _unload_workspace_modules(session: Session) -> None:
+    """Remove workspace-derived entries from sys.modules (re-run isolation)."""
+    root = getattr(session, "workspace_root", None)
+    if root is None:
+        return
+    prefix = str(Path(root))
+    for name in [name for name, module in sys.modules.items()
+                 if getattr(module, "__file__", None)
+                 and str(Path(module.__file__).resolve()).startswith(prefix)]:
+        sys.modules.pop(name, None)
+
+
+def _workspace_allowlist(root: Path) -> set[str] | None:
+    """Relative posix paths allowed by an optional workspace.json manifest.
+
+    Returns None when no manifest exists (any non-hidden .py under the folder
+    is importable). Rejects malformed manifests with a clear error.
+    """
+    manifest = root / "workspace.json"
+    if not manifest.is_file():
+        return None
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        files = data["files"]
+    except (OSError, ValueError, KeyError) as error:
+        raise ImportError(f"invalid workspace.json: {error}") from error
+    if not isinstance(files, list) or not all(isinstance(entry, str) for entry in files):
+        raise ImportError("workspace.json: 'files' must be an array of relative paths")
+    for entry in files:
+        rel = Path(entry)
+        if (entry != rel.as_posix() or rel.is_absolute() or rel.suffix != ".py"
+                or any(part in {"", ".", ".."} for part in rel.parts)):
+            raise ImportError(f"workspace.json rejects entry {entry!r}: "
+                              "use relative posix paths ending in .py")
+    return set(files)
+
+
+def _resolve_importable(session: Session, relative: str) -> Path:
+    """Resolve a workspace-relative import target, enforcing the manifest.
+
+    Raises ImportError (a catchable import-time error) with a clear message
+    for absolute paths, `..` escapes, symlinks leaving the workspace,
+    non-.py files, and files outside an allowlist.
+    """
+    rel = Path(relative)
+    root = Path(session.workspace_root)
+    if rel.is_absolute() or any(part in {"", ".", ".."} for part in rel.parts):
+        raise ImportError(f"workspace import rejected: {relative!r} escapes the workspace folder")
+    if rel.suffix != ".py":
+        raise ImportError(f"workspace import rejected: {relative!r} is not a .py file")
+    resolved = (root / rel).resolve()
+    if not resolved.is_relative_to(root) or (resolved.exists() and resolved.is_symlink()):
+        raise ImportError(f"workspace import rejected: {relative!r} points outside the workspace")
+    allowlist = _workspace_allowlist(root)
+    posix = rel.as_posix()
+    if allowlist is not None and posix not in allowlist:
+        raise ImportError(f"workspace import rejected: {relative!r} is not in the workspace.json allowlist")
+    return resolved
+
+
+def _install_workspace_import_hook(session: Session) -> None:
+    """Route workspace-file imports through the manifest checks.
+
+    Every import in the entry module resolves through this finder first; it
+    only handles paths inside the workspace folder, so discord.py and the
+    standard library are untouched. Rejections are raised only when the
+    workspace actually contains a file for the module being probed — a miss
+    for discord.py etc. must stay a silent None so normal imports proceed.
+    The synthetic parent package prefix (playground_ws_<sid>) is stripped so
+    `from .helpers import greet` resolves to helpers.py in the workspace.
+    """
+    root = Path(session.workspace_root)
+    package_name = f"playground_ws_{session.sid}"
+
+    class _WorkspaceFinder(importlib.abc.MetaPathFinder):
+        @staticmethod
+        def find_spec(fullname, path=None, target=None):
+            if session.workspace_root is None:
+                return None
+            parts = fullname.split(".")
+            if parts[0] == package_name:
+                parts = parts[1:]
+            candidates = ["/".join(parts[:i + 1]) + ".py" for i in range(len(parts))]
+            rejection = None
+            for candidate in candidates:
+                if not (root / candidate).exists():
+                    continue
+                try:
+                    resolved = _resolve_importable(session, candidate)
+                except ImportError as error:
+                    rejection = rejection or error
+                    continue
+                if resolved.is_file():
+                    return importlib.util.spec_from_file_location(fullname, resolved)
+            if rejection is not None:
+                raise rejection
+            return None
+
+    sys.meta_path.insert(0, _WorkspaceFinder())
+
+
+def _run_entry_module(session: Session, env: dict, buffer: io.StringIO,
+                      code: str | None = None, rel_file: str | None = None) -> None:
+    """Exec the workspace's bot.py (or a workspace buffer) as `__main__`.
+
+    `__package__` is set to the workspace package name so `from .helpers
+    import greet` resolves like a package-style entry (manifest-supported).
+    With `code`, the given buffer runs instead of bot.py (Run File / watcher
+    reload); its compile filename is the saved file when `rel_file` is known,
+    else `<playground>` so error mapping stays on the editor buffer.
+    """
+    root = Path(session.workspace_root)
+    entry = root / "bot.py"
+    resolved_entry = entry.resolve()
+    if code is None:
+        source, filename = entry.read_text(encoding="utf-8"), str(resolved_entry)
+        dunder_file = str(resolved_entry)
+    elif rel_file:
+        source = code
+        filename = dunder_file = str((root / rel_file).resolve())
+    else:
+        source, filename = code, "<playground>"
+        dunder_file = str(resolved_entry)
+    package_name = f"playground_ws_{session.sid}"
+    for finder in list(sys.meta_path):
+        if type(finder).__name__ == "_WorkspaceFinder":
+            sys.meta_path.remove(finder)
+    _install_workspace_import_hook(session)
+    previous_path = list(sys.path)
+    modules_before = set(sys.modules)
+    sys.path.insert(0, str(root))
+    parent = importlib.util.module_from_spec(
+        importlib.machinery.ModuleSpec(package_name, None, is_package=True))
+    parent.__path__ = [str(root)]  # relative imports resolve against the workspace
+    sys.modules[package_name] = parent
+    previous_trace = sys.gettrace()
+    sys.settrace(_script_trace(getattr(session, "user_deadline", time.monotonic() + 20)))
+    try:
+        with contextlib.redirect_stdout(buffer):
+            env["__file__"] = dunder_file
+            env["__name__"] = "__main__"
+            env["__package__"] = package_name
+            env["__spec__"] = None
+            exec(compile(source, filename, "exec"), env)  # noqa: S102 - the whole point
+    finally:
+        sys.settrace(previous_trace)
+        for finder in list(sys.meta_path):
+            if type(finder).__name__ == "_WorkspaceFinder":
+                sys.meta_path.remove(finder)
+        sys.path[:] = previous_path
+        sys.modules.pop(package_name, None)
+        for name in set(sys.modules) - modules_before:
+            module = sys.modules.get(name)
+            module_file = getattr(module, "__file__", None)
+            if module_file and str(Path(module_file).resolve()).startswith(str(root)):
+                sys.modules.pop(name, None)
+
+
+async def _scan_setup(session: Session, env: dict) -> None:
+    """Await the cog-convention `setup(bot)` once: module namespace, then cogs."""
+    client = session.client
+    seen = []
+    setup = env.get("setup")
+    if inspect.iscoroutinefunction(setup):
+        seen.append("bot.py")
+        await setup(client)
+    for cog in client.cogs.values():
+        setup = getattr(cog, "setup", None)
+        if inspect.iscoroutinefunction(setup) and not getattr(setup, "_playground_ran", False):
+            setup._playground_ran = True
+            seen.append(type(cog).__name__)
+            await setup(client)
+    if seen:
+        session.log("🧩", f"setup() ran for: {', '.join(seen)}")
 
 
 def _build_env(session: Session) -> dict:
@@ -1704,10 +1949,21 @@ def _flush_stdout(buffer: io.StringIO, session: Session) -> None:
 
 
 def _script_trace(deadline: float):
-    """Interrupt CPU-bound user code; asyncio cancellation cannot stop a busy loop."""
+    """Interrupt CPU-bound user code; asyncio cancellation cannot stop a busy loop.
+
+    Applies to the entry exec (<playground>) and to frames whose code lives
+    under the active workspace, so an infinite loop in an imported helper is
+    interrupted by the deadline instead of wedging the session thread.
+    """
+    workspace_root = getattr(_CURRENT_SESSION.get(), "workspace_root", None)
+    prefix = str(Path(workspace_root)) if workspace_root else None
+
     def trace(frame, event, _arg):
-        if event == "line" and frame.f_code.co_filename == "<playground>" \
-                and time.monotonic() >= deadline:
+        filename = frame.f_code.co_filename
+        if event == "line" and (
+            filename == "<playground>"
+            or (prefix is not None and filename.startswith(prefix))
+        ) and time.monotonic() >= deadline:
             raise ScriptStuck("The script exceeded its execution deadline; hit Restart to recover.")
         return trace
 
@@ -1737,15 +1993,23 @@ async def _stop_main(session: Session) -> None:
 
 def _script_error_details(error: BaseException) -> dict:
     """Map a script exception to the last user-code frame for editor navigation."""
+    session = _CURRENT_SESSION.get()
+    roots = ["<playground>"]
+    if getattr(session, "workspace_root", None) is not None:
+        roots.append(str(Path(session.workspace_root)))
     filename = None
     line = None
-    if isinstance(error, SyntaxError) and error.filename == "<playground>":
+    if isinstance(error, SyntaxError) and error.filename in roots:
         filename, line = error.filename, error.lineno
     else:
         frame = next((frame for frame in reversed(traceback.extract_tb(error.__traceback__ or None))
-                      if frame.filename == "<playground>"), None)
+                      if frame.filename in roots), None)
         if frame is not None:
             filename, line = frame.filename, frame.lineno
+            if roots[-1] != "<playground>" and filename.startswith(roots[-1]):
+                # Workspace file: report the workspace-relative path so the
+                # Problems panel can open workspace/file:line directly.
+                filename = Path(filename).relative_to(roots[-1]).as_posix()
     message = error.msg if isinstance(error, SyntaxError) else str(error)
     return {"type": type(error).__name__, "message": message, "file": filename, "line": line}
 
@@ -1771,15 +2035,24 @@ async def _do_run(session: Session, code: str) -> None:
     session.reset_commands()
     session.last_run = None
     session.clear_timeline()
-    session.reset_channels()  # a fresh Run bootstraps its own channels
+    session.reset_channels()  # a fresh Run boots the saved bot.py; Run File re-runs the buffer
+    _unload_workspace_modules(session)  # a re-run must not see the last run's modules
+    session.client.cogs.clear()  # re-running a cog bot must not hit duplicate-cog errors
+    session.client._listeners.clear()
     env = _build_env(session)
     buffer = io.StringIO()
     started = time.perf_counter()
+    token = _CURRENT_SESSION.set(session)
     previous_trace = sys.gettrace()
     sys.settrace(_script_trace(getattr(session, "user_deadline", time.monotonic() + 20)))
     try:
-        with contextlib.redirect_stdout(buffer):
-            exec(compile(code, "<playground>", "exec"), env)  # noqa: S102 - the whole point
+        if session.workspace_root is not None:
+            rel_file = getattr(session, "workspace_file", None)
+            _run_entry_module(session, env, buffer,
+                              code if rel_file else None, rel_file)
+        else:
+            with contextlib.redirect_stdout(buffer):
+                exec(compile(code, "<playground>", "exec"), env)  # noqa: S102 - the whole point
     except BaseException as error:  # noqa: BLE001 - user code may raise anything, incl. SystemExit
         _flush_stdout(buffer, session)
         tb = traceback.format_exc(limit=6)
@@ -1789,8 +2062,17 @@ async def _do_run(session: Session, code: str) -> None:
         return
     finally:
         sys.settrace(previous_trace)
+        _CURRENT_SESSION.reset(token)
     _flush_stdout(buffer, session)
 
+    try:
+        await _scan_setup(session, env)
+    except BaseException as error:  # noqa: BLE001 - setup() is user code too
+        tb = traceback.format_exc(limit=6)
+        session.log("💥", tb, "error")
+        session.last_run = {"ok": False, "error": tb, "exception": _script_error_details(error),
+                            "ms": (time.perf_counter() - started) * 1000}
+        return
     session.env = env
     _collect_commands(session, env)
     main_fn = env.get("main")
@@ -2014,7 +2296,15 @@ async def _gated(session: Session, coro_fn) -> None:
         await coro_fn()
 
 
-async def run_script(session: Session, code: str, timeout: float = 20.0) -> dict:
+async def run_script(session: Session, code: str, timeout: float = 20.0,
+                     *, workspace: str | None = None, workspace_root=None,
+                     workspace_file: str | None = None) -> dict:
+    """Run a bot: `code` as a single-file module, or the workspace's bot.py.
+
+    With `workspace` set, the saved bot.py on disk is the entry point and
+    `code` is advisory (run-file keeps passing the editor buffer; Run passes
+    the loaded file). Missing bot.py falls back to single-file exec of `code`.
+    """
     if len(code) > 1_000_000:
         message = "Script is too large (maximum 1 MB)."
         session.log("⚠️", message, "error")
@@ -2022,6 +2312,14 @@ async def run_script(session: Session, code: str, timeout: float = 20.0) -> dict
                             "exception": {"type": "ScriptLimitError", "message": message,
                                           "file": None, "line": None}, "ms": 0.0}
         return {"ok": False, "ms": 0.0}
+    if workspace is not None and workspace_root is not None and (Path(workspace_root) / "bot.py").is_file():
+        session.workspace = workspace
+        session.workspace_root = Path(workspace_root).resolve()
+        session.workspace_file = workspace_file  # None = boot the saved entry
+    else:
+        session.workspace = None
+        session.workspace_root = None
+        session.workspace_file = None
     started = time.perf_counter()
     session.user_deadline = time.monotonic() + timeout
     try:
@@ -2034,8 +2332,107 @@ async def run_script(session: Session, code: str, timeout: float = 20.0) -> dict
             "ms": round(session.last_run["ms"], 1) if session.last_run else 0.0}
 
 
+def _restore_cogs(session: Session, cogs: dict, listeners: dict) -> None:
+    """Roll cogs/listeners back after a failed exec so the old env stays coherent."""
+    session.client.cogs.clear()
+    session.client.cogs.update(cogs)
+    session.client._listeners.clear()
+    session.client._listeners.update(listeners)
+
+
+async def _do_reload(session: Session, code: str, run_main: bool) -> None:
+    """Exec `code` into a fresh namespace and swap session.env; keep the timeline.
+
+    On any exec failure the previous session.env stays in place, so the running
+    bot and its timeline survive a broken edit. Workspace sessions reload
+    through the same import machinery as Run, so a watcher reload of a file
+    that imports helpers resolves them instead of failing.
+    """
+    await _stop_main(session)  # a running main() belongs to the old module
+    env = _build_env(session)
+    buffer = io.StringIO()
+    started = time.perf_counter()
+    rel_file = getattr(session, "workspace_file", None)  # file-mode reload (Run File / watcher)
+    cogs_before = dict(session.client.cogs)
+    listeners_before = {name: list(hooks) for name, hooks in session.client._listeners.items()}
+    previous_trace = sys.gettrace()
+    sys.settrace(_script_trace(getattr(session, "user_deadline", time.monotonic() + 20)))
+    try:
+        if session.workspace_root is not None:
+            _run_entry_module(session, env, buffer, code, rel_file)
+        else:
+            with contextlib.redirect_stdout(buffer):
+                exec(compile(code, "<playground>", "exec"), env)  # noqa: S102 - the whole point
+    except BaseException as error:  # noqa: BLE001 - user code may raise anything, incl. SystemExit
+        _flush_stdout(buffer, session)
+        _restore_cogs(session, cogs_before, listeners_before)
+        tb = traceback.format_exc(limit=6)
+        session.log("💥", tb, "error")
+        session.last_run = {"ok": False, "error": tb, "exception": _script_error_details(error),
+                            "ms": (time.perf_counter() - started) * 1000}
+        return  # previous session.env untouched
+    finally:
+        sys.settrace(previous_trace)
+    _flush_stdout(buffer, session)
+
+    try:
+        await _scan_setup(session, env)
+    except BaseException as error:  # noqa: BLE001 - setup() is user code too
+        _restore_cogs(session, cogs_before, listeners_before)
+        tb = traceback.format_exc(limit=6)
+        session.log("💥", tb, "error")
+        session.last_run = {"ok": False, "error": tb, "exception": _script_error_details(error),
+                            "ms": (time.perf_counter() - started) * 1000}
+        return  # previous session.env untouched
+    session.env = env
+    _collect_commands(session, env)
+    session.log("🔄", "script reloaded — timeline, channels, and events kept")
+    main_fn = env.get("main")
+    if run_main and main_fn is not None:
+        began = asyncio.Event()
+        session.main_task = session.runner.loop.create_task(
+            _run_main(main_fn, session, began)
+        )
+        await began.wait()
+        if not (session.last_run and not session.last_run["ok"]):
+            session.last_run = {"ok": True, "error": None, "ms": (time.perf_counter() - started) * 1000}
+            session.log("✅", "main() re-run complete.")
+    else:
+        if main_fn is None:
+            session.log("ℹ️", "Reloaded; define `async def main():` to boot startup logic.")
+        session.last_run = {"ok": True, "error": None, "ms": (time.perf_counter() - started) * 1000}
+
+
+async def reload_script(session: Session, code: str, *, run_main: bool = False,
+                        timeout: float = 20.0) -> dict:
+    """Live-reload: same exec path as Run, but nothing is cleared.
+
+    Handlers are looked up from session.env on every dispatch, so messages
+    already on the timeline route to the newly loaded callbacks.
+    """
+    if len(code) > 1_000_000:
+        message = "Script is too large (maximum 1 MB)."
+        session.log("⚠️", message, "error")
+        session.last_run = {"ok": False, "error": message,
+                            "exception": {"type": "ScriptLimitError", "message": message,
+                                          "file": None, "line": None}, "ms": 0.0}
+        return {"ok": False, "ms": 0.0}
+    started = time.perf_counter()
+    session.user_deadline = time.monotonic() + timeout
+    try:
+        await session.runner.run(
+            lambda: _gated(session, lambda: _do_reload(session, code, run_main)), timeout)
+    except ScriptStuck as exc:
+        session.log("🛑", str(exc), "error")
+        session.last_run = {"ok": False, "error": str(exc), "exception": _script_error_details(exc),
+                            "ms": (time.perf_counter() - started) * 1000}
+    return {"ok": bool(session.last_run and session.last_run["ok"]),
+            "ms": round(session.last_run["ms"], 1) if session.last_run else 0.0}
+
+
 async def _dispatch(session: Session, callback, timeout: float) -> dict:
     started = time.perf_counter()
+    token = _CURRENT_SESSION.set(session)
     try:
         await session.runner.run(lambda: _gated(session, callback), timeout)
     except ScriptStuck as error:
@@ -2052,6 +2449,8 @@ async def _dispatch(session: Session, callback, timeout: float) -> dict:
         }
     except Exception as error:  # noqa: BLE001 - report callback errors to the workbench
         _record_script_error(session, error, started)
+    finally:
+        _CURRENT_SESSION.reset(token)
     return state(session)
 
 

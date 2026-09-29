@@ -12,11 +12,11 @@ The following baseline work is complete: bridge round-trip fixtures, vendored Em
 - Assertions cover messages, embed fields, components, channels, and events; replay stops at the first failure with a bounded runtime snapshot.
 - The runner reuses existing dispatch functions rather than introducing a broad event bus.
 
-### 2. Improve workspace editing deliberately
+### 2. Improve workspace editing deliberately (started)
 
-- Decide whether the product needs multiple files before adding them.
-- If yes, define a safe workspace manifest and explicit file allowlist.
-- Keep execution local and prevent path traversal.
+- Multi-file workspaces now run through the playground runtime: `bots/<name>/bot.py` is the entry point, workspace modules import normally (plain and relative), a `sys.settrace` deadline covers imported files, and cogs register via `setup(bot)` / `add_cog`.
+- An optional `workspace.json` `files` allowlist restricts imports; path escapes (absolute paths, `..`, outside symlinks) are rejected either way.
+- Keep execution local and prevent path traversal as this surface grows.
 
 ### 3. Reduce concentrated ownership when a change demands it
 
