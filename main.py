@@ -34,8 +34,10 @@ import bridge
 import env_discovery
 from playground import (
     Session,
+    _member_before_snapshot,
     dispatch_click,
     dispatch_command,
+    dispatch_event,
     dispatch_message,
     dispatch_submit,
     reload_script,
@@ -262,6 +264,27 @@ def _bump(sid: str) -> None:
     loop = getattr(_bump, "_loop", None)
     if loop is not None and loop.is_running():
         asyncio.run_coroutine_threadsafe(_sse_broadcast(sid, {"type": "update"}), loop)
+
+
+_PENDING_EVENT_TASKS: set[asyncio.Task] = set()
+
+
+def _notify_event(session: Session, kind: str, payload: dict) -> None:
+    """Fire-and-notify: dispatch a gateway event without delaying the response.
+
+    Management mutations (join/leave/roles/channels) return instantly; the
+    handler's effects reach the browser through the normal _bump/WS channel.
+    User code still runs only on the session runner via runner.gate. Tasks are
+    pinned in a module set so they are not garbage-collected mid-await.
+    """
+
+    async def _run() -> None:
+        await dispatch_event(session, kind, payload)
+        _bump(session.sid)
+
+    task = asyncio.create_task(_run())
+    _PENDING_EVENT_TASKS.add(task)
+    task.add_done_callback(_PENDING_EVENT_TASKS.discard)
 
 
 async def index(_request: web.Request) -> web.FileResponse:
@@ -710,6 +733,7 @@ async def add_member(request: web.Request) -> web.Response:
         session.set_user(member.id)
     except (AttributeError, TypeError, ValueError) as error:
         return web.json_response({"ok": False, "error": str(error)}, status=400)
+    _notify_event(session, "member_join", {"user_id": member.id})
     _bump(session.sid)
     return web.json_response(state(session))
 
@@ -718,9 +742,14 @@ async def update_member_profile(request: web.Request) -> web.Response:
     session = _get_session(request)
     body = await request.json()
     try:
-        session.update_member_profile(int(request.match_info["user_id"]), body)
+        user_id = int(request.match_info["user_id"])
+        before = _member_before_snapshot(session.guild.get_member(user_id)
+                                         or session.guild.me)
+        session.update_member_profile(user_id, body)
     except (AttributeError, TypeError, ValueError) as error:
         return web.json_response({"ok": False, "error": str(error)}, status=400)
+    if before.display_name != session.guild.get_member(user_id).display_name:
+        _notify_event(session, "member_update", {"user_id": user_id, "_before": before})
     _bump(session.sid)
     return web.json_response(state(session))
 
@@ -888,6 +917,11 @@ async def react(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": str(error)}, status=400)
     except discord.Forbidden as error:
         return web.json_response({"ok": False, "error": str(error)}, status=403)
+    # Reactions are interaction-class: await the handler so the response is
+    # deterministic, exactly like the click/command routes.
+    await dispatch_event(session, "raw_reaction_add" if added else "raw_reaction_remove",
+                         {"message_id": str(body.get("message_id") or ""),
+                          "user_id": session.user_id, "emoji": str(body.get("emoji") or "")})
     _bump(session.sid)
     return web.json_response({"ok": True, "added": added, "state": state(session)})
 
@@ -939,6 +973,7 @@ async def create_channel(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": str(error)}, status=403)
     except ValueError as error:
         return web.json_response({"ok": False, "error": str(error)}, status=400)
+    _notify_event(session, "guild_channel_create", {"channel_id": channel.id})
     _bump(session.sid)
     return web.json_response({"ok": True, "channel": {"id": str(channel.id), "name": channel.name},
                               "state": state(session)})
@@ -955,9 +990,14 @@ async def moderate(request: web.Request) -> web.Response:
     user_id = str(body.get("user_id") or "")
     if not user_id.isdigit():
         return web.json_response({"ok": False, "error": "user_id required"}, status=400)
+    member_before = session.guild.get_member(int(user_id))
     try:
         if action == "kick":
             session.kick_member(int(user_id))
+            _notify_event(session, "member_remove", {"_member": member_before, "via": "kick"})
+        elif action == "leave":
+            session.remove_member(int(user_id))
+            _notify_event(session, "member_remove", {"_member": member_before})
         elif action == "ban":
             session.ban_member(int(user_id))
         elif action == "unban":
@@ -972,6 +1012,91 @@ async def moderate(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": str(error)}, status=400)
     _bump(session.sid)
     return web.json_response({"ok": True, "state": state(session)})
+
+
+async def leave(request: web.Request) -> web.Response:
+    """A simulated member leaves voluntarily (fires on_member_remove)."""
+    session = _get_session(request)
+    body = await request.json()
+    user_id = str(body.get("user_id") or "")
+    if not user_id.isdigit():
+        return web.json_response({"ok": False, "error": "user_id required"}, status=400)
+    try:
+        member = session.remove_member(int(user_id))
+    except ValueError as error:
+        return web.json_response({"ok": False, "error": str(error)}, status=400)
+    _notify_event(session, "member_remove", {"_member": member})
+    _bump(session.sid)
+    return web.json_response({"ok": True, "state": state(session)})
+
+
+async def member_roles(request: web.Request) -> web.Response:
+    """Grant/revoke a role on a simulated member (fires on_member_update)."""
+    session = _get_session(request)
+    body = await request.json()
+    try:
+        user_id = int(body.get("user_id"))
+        role_id = int(body.get("role_id"))
+        before = _member_before_snapshot(session.guild.get_member(user_id)
+                                         or session.guild.me)
+        if body.get("op") == "revoke":
+            session.revoke_role(user_id, role_id)
+        else:
+            session.grant_role(user_id, role_id)
+    except (AttributeError, TypeError, ValueError) as error:
+        return web.json_response({"ok": False, "error": str(error)}, status=400)
+    _notify_event(session, "member_update", {"user_id": user_id, "_before": before})
+    _bump(session.sid)
+    return web.json_response({"ok": True, "state": state(session)})
+
+
+async def guild_roles(request: web.Request) -> web.Response:
+    """Create/delete a guild role (fires on_guild_role_create/delete)."""
+    session = _get_session(request)
+    body = await request.json()
+    action = str(body.get("op") or "create")
+    try:
+        if action == "delete":
+            role = session.delete_role(int(body.get("role_id")))
+            _notify_event(session, "guild_role_delete", {"_role": role})
+        else:
+            role = session.create_role(str(body.get("name") or ""))
+            _notify_event(session, "guild_role_create", {"_role": role})
+    except (AttributeError, TypeError, ValueError) as error:
+        return web.json_response({"ok": False, "error": str(error)}, status=400)
+    _bump(session.sid)
+    return web.json_response({"ok": True, "role": {"id": str(role.id), "name": role.name},
+                              "state": state(session)})
+
+
+async def delete_channel(request: web.Request) -> web.Response:
+    """User-driven channel deletion (fires on_guild_channel_delete)."""
+    session = _get_session(request)
+    body = await request.json()
+    try:
+        channel = session.delete_channel_ui(str(body.get("channel_id") or ""))
+    except discord.Forbidden as error:
+        return web.json_response({"ok": False, "error": str(error)}, status=403)
+    except ValueError as error:
+        return web.json_response({"ok": False, "error": str(error)}, status=400)
+    _notify_event(session, "guild_channel_delete", {"_channel": channel})
+    _bump(session.sid)
+    return web.json_response({"ok": True, "state": state(session)})
+
+
+async def simulate_event(request: web.Request) -> web.Response:
+    """Generic gateway-event entry (tests/scenarios): awaited, deterministic."""
+    session = _get_session(request)
+    body = await request.json()
+    kind = str(body.get("kind") or "")
+    if not kind:
+        return web.json_response({"ok": False, "error": "kind required"}, status=400)
+    payload = body.get("payload") or {}
+    if not isinstance(payload, dict):
+        return web.json_response({"ok": False, "error": "payload must be an object"}, status=400)
+    result = await dispatch_event(session, kind, payload)
+    _bump(session.sid)
+    return web.json_response(result)
 
 
 async def click(request: web.Request) -> web.Response:
@@ -1156,6 +1281,9 @@ async def on_startup(app: web.Application) -> None:
 
 
 async def shutdown_sessions(_app: web.Application) -> None:
+    for task in list(_PENDING_EVENT_TASKS):
+        task.cancel()
+    _PENDING_EVENT_TASKS.clear()
     for runtime in list(RUNTIMES.values()):
         try:
             await runtime.shutdown()
@@ -1239,6 +1367,11 @@ def build_app(*, auto_shutdown: bool = False, data_dir: Path | None = None) -> w
     app.router.add_post("/api/session/{sid}/reload", reload_code)
     app.router.add_post("/api/session/{sid}/project", run_code)
     app.router.add_post("/api/session/{sid}/run-file", run_workspace_file)
+    app.router.add_post("/api/session/{sid}/events", simulate_event)
+    app.router.add_post("/api/session/{sid}/members/leave", leave)
+    app.router.add_post("/api/session/{sid}/members/roles", member_roles)
+    app.router.add_post("/api/session/{sid}/roles", guild_roles)
+    app.router.add_post("/api/session/{sid}/channels/delete", delete_channel)
     app.router.add_get("/api/session/{sid}/ws", websocket)
     if STATIC_DIR.exists():
         app.router.add_static("/static/", STATIC_DIR)

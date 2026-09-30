@@ -130,6 +130,11 @@
   #profile-status { display: inline-block; margin: 10px 0; padding: 3px 8px; border-radius: 12px; background: var(--bg3); color: var(--txt); font-size: 11px; text-transform: capitalize; }
   #profile-bio { border-top: 1px solid var(--border); padding-top: 10px; margin-top: 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
   #profile-controls { display: flex; gap: 8px; margin-top: 12px; }
+  #profile-nickname-row { display: flex; gap: 6px; margin-top: 10px; }
+  #profile-nickname-row.open { display: flex; }
+  #profile-nickname-row[hidden] { display: none; }
+  #profile-nickname { flex: 1; min-width: 0; background: var(--background-tertiary); border: none; border-radius: 3px; color: var(--txt); font: inherit; padding: 8px; }
+  #profile-nickname:focus { outline: none; box-shadow: 0 0 0 1px var(--blurple); }
   #profile-controls button { flex: 1; }
   #settings-overlay { position: fixed; inset: 0; z-index: 70; display: none; background: rgba(0,0,0,.7); }
   #settings-overlay.open { display: block; }
@@ -835,7 +840,7 @@
 </div>
 
 <div id="profile-card" role="dialog" aria-label="Member profile" aria-modal="false">
-  <div id="profile-banner"><img id="profile-banner-image" alt=""></div><div id="profile-card-body"><img id="profile-avatar" class="avatar" alt=""><div id="profile-name"></div><div id="profile-user"></div><span id="profile-status"></span><div id="profile-bio"></div><div id="profile-controls"></div></div>
+  <div id="profile-banner"><img id="profile-banner-image" alt=""></div><div id="profile-card-body"><img id="profile-avatar" class="avatar" alt=""><div id="profile-name"></div><div id="profile-user"></div><span id="profile-status"></span><div id="profile-bio"></div><div id="profile-controls"></div><div id="profile-nickname-row" hidden><label for="profile-nickname" class="sr-only">Nickname</label><input id="profile-nickname" maxlength="32" placeholder="Nickname (fires on_member_update)" autocomplete="off"><button id="profile-nickname-save" class="lib-btn" type="button">Save</button></div></div>
 </div>
 <div id="settings-overlay" role="presentation">
   <section id="profile-settings" role="dialog" aria-modal="true" aria-labelledby="settings-head">
@@ -2163,6 +2168,10 @@ function showProfile(member, anchor) {
   $("#profile-status").textContent = member.bot ? "Bot" : (member.status || "online");
 
   $("#profile-bio").textContent = member.bio || "No bio yet.";
+  const nickRow = $("#profile-nickname-row"), nickInput = $("#profile-nickname");
+  nickRow.hidden = !(member.custom && !member.bot);
+  nickInput.value = member.display_name || member.name;
+  nickInput.onkeydown = (event) => { if (event.key === "Enter") { event.preventDefault(); $("#profile-nickname-save").click(); } };
   const controls = $("#profile-controls"); controls.replaceChildren();
   if (!member.bot && member.custom) {
     const edit = document.createElement("button"); edit.className = "lib-btn"; edit.textContent = "Edit profile";
@@ -2177,6 +2186,16 @@ function showProfile(member, anchor) {
   card.style.top = `${Math.min(rect.top, innerHeight - 280)}px`;
 }
 function closeProfile() { $("#profile-card").classList.remove("open"); profileTarget = null; }
+$("#profile-nickname-save").onclick = async () => {
+  if (!profileTarget) return;
+  const value = $("#profile-nickname").value.trim();
+  const res = await fetch(`/api/session/${SID}/members/${profileTarget.id}/profile`, {
+    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ display_name: value }),
+  });
+  const data = await res.json();
+  if (res.ok) { closeProfile(); render(data); playSound("success"); showToast("Nickname saved", "success"); }
+  else showToast(data.error || "Could not save nickname", "error");
+};
 window.addEventListener("click", (event) => { if (!$("#profile-card").contains(event.target) && !event.target.closest(".member-row,.msg-avatar,.msg-author-button")) closeProfile(); });
 window.addEventListener("keydown", (event) => { if (event.key === "Escape") { closeProfile(); closeProfileSettings(); closeEmojiPicker(); closeUserSettings(); closeCtxMenu(); closeQuickSwitcher(); } });
 
@@ -2449,6 +2468,13 @@ function renderChannels(st) {
     }
     unreadCounts[c.id] = total - (seenCounts[c.id] || 0);
     row.onclick = () => { currentChannel = c.id; lastRevision = ""; render(lastState); };
+    row.oncontextmenu = (event) => {
+      event.preventDefault();
+      openCtxMenu(event.currentTarget, [{
+        label: "Delete channel (simulates on_guild_channel_delete)", danger: true,
+        run: () => post("channels/delete", { channel_id: c.id }),
+      }]);
+    };
     channelItems.appendChild(row);
   }
   const channel = (st.channels || []).find((item) => item.id == currentChannel) || st.channel;
@@ -3689,15 +3715,25 @@ async function moderatePost(action, userId, extra = {}) {
   return result;
 }
 function memberModerationItems(member) {
+  const roles = (lastState && lastState.roles) || [];
+  const myRoles = new Set((member.roles || []).map((r) => r.id));
   const items = [
     { label: "Profile", run: () => showProfile(member, $("#member-list")) },
     { label: "Switch to this user", run: () => setActiveUser(member.id), disabled: member.bot },
     "-",
+    ...roles.map((role) => ({
+      label: myRoles.has(role.id) ? `Remove role: ${role.name}` : `Add role: ${role.name}`,
+      run: () => post("members/roles", { user_id: member.id, role_id: role.id,
+                                         op: myRoles.has(role.id) ? "revoke" : "grant" }),
+    })),
+    roles.length ? "-" : null,
+    { label: "Leave (simulates on_member_remove)", disabled: member.bot || member.id == lastState?.user?.id && false,
+      run: () => post("members/leave", { user_id: member.id }) },
     { label: "Kick", danger: true, run: () => moderatePost("kick", member.id) },
     { label: "Ban", danger: true, run: () => moderatePost("ban", member.id) },
     { label: "Timeout 10 min", danger: true, run: () => moderatePost("timeout", member.id, { minutes: 10 }) },
     { label: "Clear timeout", run: () => moderatePost("timeout", member.id, { minutes: 0 }) },
-  ];
+  ].filter(Boolean);
   return items;
 }
 function openNewChannelDialog() { $("#new-channel-overlay").classList.add("open"); $("#nc-name").value = ""; $("#nc-topic").value = ""; $("#nc-name").focus(); }

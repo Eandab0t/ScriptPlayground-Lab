@@ -22,6 +22,7 @@ from playground import (
     Session,
     dispatch_click,
     dispatch_command,
+    dispatch_event,
     dispatch_message,
     dispatch_submit,
     reload_script,
@@ -2704,6 +2705,241 @@ async def test_moderation_permissions_and_roundtrip():
               ("member.kick", "member.ban", "member.timeout", "member.unban")]
     assert len(kicked) >= 5
     s.close()
+
+
+async def test_gateway_member_join_reaches_module_handler():
+    """Add-user mutation + dispatch_event -> on_member_join gets the MockMember."""
+    s = Session("t-gw-join")
+    try:
+        result = await run_script(s, '''
+SEEN = []
+async def on_member_join(member):
+    SEEN.append(member.name)
+    await send(f"welcome {member.name}")
+''')
+        assert result["ok"], s.last_run
+        member = s.add_member("Newbie")
+        await dispatch_event(s, "member_join", {"user_id": member.id})
+        assert "Newbie" in s.env["SEEN"]
+        actions = [e for e in s.events if e["kind"] == "action"]
+        assert any(a["details"].get("content") == "welcome Newbie" for a in actions)
+        event = [e for e in s.events if e.get("details", {}).get("event") == "member_join"][-1]
+        assert event["kind"] == "event" and event["details"]["status"] == "success"
+        for key in ("actor", "target", "channel", "summary"):
+            assert key in event["details"], event["details"]
+    finally:
+        s.close()
+
+
+async def test_gateway_member_remove_receives_captured_member():
+    """on_member_remove fires with the stale member object (leave via mutation)."""
+    s = Session("t-gw-leave")
+    try:
+        result = await run_script(s, '''
+NAMES = []
+async def on_member_remove(member):
+    NAMES.append(member.name)
+''')
+        assert result["ok"], s.last_run
+        member = s.add_member("Leaver")
+        captured = s.remove_member(member.id)
+        await dispatch_event(s, "member_remove", {"_member": captured})
+        assert s.env["NAMES"] == ["Leaver"]
+        assert s.guild.get_member(member.id) is None  # really gone from the guild
+    finally:
+        s.close()
+
+
+async def test_gateway_channel_and_role_create_events():
+    """Channel/role creation dispatches the matching on_guild_* handlers."""
+    s = Session("t-gw-create")
+    try:
+        result = await run_script(s, '''
+CHANNELS = []
+ROLES = []
+async def on_guild_channel_create(channel):
+    CHANNELS.append(channel.name)
+async def on_guild_role_create(role):
+    ROLES.append(role.name)
+''')
+        assert result["ok"], s.last_run
+        channel = s.create_text_channel_ui("event-bus")
+        role = s.create_role("Boosters")
+        await dispatch_event(s, "guild_channel_create", {"channel_id": channel.id})
+        await dispatch_event(s, "guild_role_create", {"_role": role})
+        assert s.env["CHANNELS"] == ["event-bus"]
+        assert s.env["ROLES"] == ["Boosters"]
+    finally:
+        s.close()
+
+
+async def test_gateway_raw_reaction_payload_fields():
+    """RawReactionActionEvent carries the right message_id, emoji, user_id, event_type."""
+    s = Session("t-gw-react")
+    try:
+        result = await run_script(s, '''
+PAYLOADS = []
+async def on_raw_reaction_add(payload):
+    PAYLOADS.append((payload.message_id, payload.user_id, str(payload.emoji), payload.event_type))
+async def on_raw_reaction_remove(payload):
+    PAYLOADS.append((payload.message_id, payload.user_id, str(payload.emoji), payload.event_type))
+''')
+        assert result["ok"], s.last_run
+        member = s.add_member("Reactor")
+        handle = await s.channel.send("react here")
+        mid = handle.id
+        await dispatch_event(s, "raw_reaction_add", {"message_id": mid, "user_id": member.id, "emoji": "🔥"})
+        await dispatch_event(s, "raw_reaction_remove", {"message_id": mid, "user_id": member.id, "emoji": "🔥"})
+        adds, removes = s.env["PAYLOADS"]
+        assert adds == (int(mid[1:]), member.id, "🔥", "REACTION_ADD"), adds
+        assert removes[3] == "REACTION_REMOVE" and removes[:3] == adds[:3]
+        assert adds[0] == 1 and adds[1] == member.id
+    finally:
+        s.close()
+
+
+async def test_gateway_event_without_handler_logs_and_survives():
+    """A no-handler event logs a clear no_handler action and does not raise."""
+    s = Session("t-gw-noop")
+    try:
+        result = await run_script(s, "x = 1")
+        assert result["ok"], s.last_run
+        role = s.create_role("Doomed")
+        await dispatch_event(s, "guild_role_delete", {"_role": role})
+        last = s.events[-1]
+        assert last["kind"] == "action" and last["details"]["status"] == "no_handler"
+        assert "no handler defined" in last["text"]
+        assert s.last_run["ok"]  # nothing raised
+    finally:
+        s.close()
+
+
+async def test_gateway_cog_listener_fires_for_member_join():
+    """Slice 1's registered cog listeners now receive gateway events."""
+    s = Session("t-gw-cog")
+    try:
+        result = await run_script(s, '''
+import discord
+from discord.ext import commands
+
+class Greeter(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+    @commands.Cog.listener()
+    async def on_member_join(self, member):
+        await send(f"cog greets {member.name}")
+
+async def setup(bot):
+    await bot.add_cog(Greeter(bot))
+''')
+        assert result["ok"], s.last_run
+        member = s.add_member("CogJoiner")
+        await dispatch_event(s, "member_join", {"user_id": member.id})
+        actions = [e for e in s.events if e["kind"] == "action"]
+        assert any(a["details"].get("content") == "cog greets CogJoiner" for a in actions)
+        assert not any(a["details"].get("status") == "no_handler" for a in actions)
+    finally:
+        s.close()
+
+
+async def test_gateway_member_update_roles_snapshot():
+    """on_member_update receives (before, after) role states around a mutation."""
+    s = Session("t-gw-update")
+    try:
+        result = await run_script(s, '''
+CHANGES = []
+async def on_member_update(before, after):
+    CHANGES.append(([r.name for r in before.roles], [r.name for r in after.roles]))
+''')
+        assert result["ok"], s.last_run
+        member = s.add_member("RoleTarget")
+        from playground import _member_before_snapshot
+        moderators = next(r for r in s.guild.roles if r.name == "Moderators")
+        before = _member_before_snapshot(member)
+        s.grant_role(member.id, moderators.id)
+        await dispatch_event(s, "member_update", {"user_id": member.id, "_before": before})
+        before_names, after_names = s.env["CHANGES"][-1]
+        assert "Moderators" not in before_names and "Moderators" in after_names
+        event = [e for e in s.events if e.get("details", {}).get("event") == "member_update"][-1]
+        assert event["details"]["roles_before"] == []
+        assert event["details"]["roles_after"] == ["Moderators"]
+    finally:
+        s.close()
+
+
+async def test_gateway_profile_nickname_edit_fires_member_update():
+    """PUT members/{id}/profile with a new display_name fires on_member_update."""
+    s = Session("t-gw-nickname")
+    import main as server
+
+    server.SESSIONS[s.sid] = s
+    try:
+        result = await run_script(s, '''
+CHANGES = []
+async def on_member_update(before, after):
+    CHANGES.append((before.display_name, after.display_name))
+''')
+        assert result["ok"], s.last_run
+        member = s.add_member("NickTarget")
+        request = _FakeReq(match={"sid": s.sid, "user_id": str(member.id)},
+                           body={"display_name": "NickChanged"})
+        response = await server.update_member_profile(request)
+        import json
+
+        body = json.loads(response.body)
+        assert body["ok"], body
+        import time
+
+        deadline = time.monotonic() + 1.0
+        while server._PENDING_EVENT_TASKS and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert s.env["CHANGES"] == [("NickTarget", "NickChanged")], s.env["CHANGES"]
+        event = [e for e in s.events if e.get("details", {}).get("event") == "member_update"][-1]
+        assert event["details"]["nickname_before"] == "NickTarget"
+        assert event["details"]["nickname_after"] == "NickChanged"
+        assert event["details"]["status"] == "success"
+        # Unchanged display_name must NOT fire the event again.
+        request2 = _FakeReq(match={"sid": s.sid, "user_id": str(member.id)},
+                            body={"display_name": "NickChanged"})
+        response2 = await server.update_member_profile(request2)
+        assert json.loads(response2.body)["ok"]
+        updates = [e for e in s.events if e.get("details", {}).get("event") == "member_update"]
+        assert len(updates) == 1
+    finally:
+        server.SESSIONS.pop(s.sid, None)
+        s.close()
+
+
+async def test_gateway_reaction_route_fires_raw_event_end_to_end():
+    """HTTP reaction route: toggle -> awaited raw event -> handler -> state."""
+    s = Session("t-gw-route")
+    import main as server
+
+    server.SESSIONS[s.sid] = s
+    try:
+        result = await run_script(s, '''
+REACTIONS = []
+async def on_raw_reaction_add(payload):
+    REACTIONS.append((str(payload.emoji), payload.user_id))
+''')
+        assert result["ok"], s.last_run
+        handle = await s.channel.send("route target")
+        import main as server
+
+        request = _FakeReq(match={"sid": s.sid},
+                           body={"message_id": handle.id, "emoji": "🎉"})
+        response = await server.react(request)
+        import json
+
+        body = json.loads(response.body)
+        assert body["ok"], body
+        assert body["added"] is True
+        assert s.env["REACTIONS"] == [("🎉", s.user_id)]
+        event = [e for e in s.events if e.get("details", {}).get("event") == "raw_reaction_add"][-1]
+        assert event["details"]["status"] == "success"
+    finally:
+        server.SESSIONS.pop(s.sid, None)
+        s.close()
 
 
 async def main() -> None:

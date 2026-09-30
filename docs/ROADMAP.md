@@ -12,6 +12,13 @@ The following baseline work is complete: bridge round-trip fixtures, vendored Em
 - Assertions cover messages, embed fields, components, channels, and events; replay stops at the first failure with a bounded runtime snapshot.
 - The runner reuses existing dispatch functions rather than introducing a broad event bus.
 
+### 1b. Gateway events (done)
+
+- `dispatch_event` delivers member join/leave/update, channel create/delete, role create/delete, and raw reaction add/remove to module handlers and cog listeners through the existing runner gate.
+- Interaction-class events (reactions) await the handler; management mutations (join/leave/roles/channels) return instantly and notify via the normal update channel.
+- Reaction events use real `discord.RawReactionActionEvent` payloads; non-raw `Reaction` events are unsupported (see COMPATIBILITY.md for the reason).
+- Nickname edits from the profile card (changed `display_name`) fire `on_member_update` with before/after snapshots and a nickname summary/details.
+
 ### 2. Improve workspace editing deliberately (started)
 
 - Multi-file workspaces now run through the playground runtime: `bots/<name>/bot.py` is the entry point, workspace modules import normally (plain and relative), a `sys.settrace` deadline covers imported files, and cogs register via `setup(bot)` / `add_cog`.

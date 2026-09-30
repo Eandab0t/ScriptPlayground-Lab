@@ -1165,6 +1165,7 @@ class Session:
         self.banned: dict[int, str] = {}        # banned member ids -> names (absent from the guild)
         self.user_name = USER_NAME
         self.next_custom_user_id = CUSTOM_USER_ID
+        self.next_role_id = GUILD_ID + len(ROLE_NAMES) + 1  # fixture roles keep their ids
         self.events: list[dict] = []
         self.messages: dict[str, dict] = {}
         self.order: list[str] = []
@@ -1489,6 +1490,96 @@ class Session:
                           "channel": channel.name, "status": "success"})
         self._touch()
         return channel
+
+    def remove_member(self, user_id: int) -> MockMember:
+        """A member leaving voluntarily (no moderation permission needed).
+
+        Returns the captured member so member_remove receives the stale object,
+        exactly like real gateway leave events.
+        """
+        member = self.guild.get_member(int(user_id))
+        if member is None or member.bot:
+            raise ValueError("unknown simulated user")
+        if member.id == USER_ID:
+            raise ValueError("the server owner cannot leave")
+        self.guild.members.remove(member)
+        if self.user_id == member.id:
+            self.user_id = USER_ID  # acting-as falls back to the owner
+        self.log("👋", f"{member.name} left the server", kind="event",
+                 details={"operation": "member.remove", "actor": member.name,
+                          "target": member.name, "status": "success"})
+        self._touch()
+        return member
+
+    def grant_role(self, user_id: int, role_id: int) -> MockRole:
+        """Give a member one of the guild's roles; returns the granted role."""
+        member = self.guild.get_member(int(user_id))
+        role = self.guild.get_role(int(role_id))
+        if member is None or member.bot or role is None or role.name == "@everyone":
+            raise ValueError("unknown simulated user or role")
+        if role not in member.roles:
+            member.roles.append(role)
+            self.log("🏷️", f"{member.name} was given the {role.name} role", kind="event",
+                     details={"operation": "member.role_grant", "actor": self.active_user.name,
+                              "target": member.name, "role": role.name, "status": "success"})
+            self._touch()
+        return role
+
+    def revoke_role(self, user_id: int, role_id: int) -> MockRole:
+        """Take a role back from a member; returns the revoked role."""
+        member = self.guild.get_member(int(user_id))
+        role = self.guild.get_role(int(role_id))
+        if member is None or member.bot or role is None or role.name == "@everyone":
+            raise ValueError("unknown simulated user or role")
+        if role in member.roles:
+            member.roles.remove(role)
+            self.log("🏷️", f"{member.name} lost the {role.name} role", kind="event",
+                     details={"operation": "member.role_revoke", "actor": self.active_user.name,
+                              "target": member.name, "role": role.name, "status": "success"})
+            self._touch()
+        return role
+
+    def create_role(self, name: str) -> MockRole:
+        """Create a guild role (ids continue past the fixture roles)."""
+        role = MockRole(self.next_role_id, name.strip()[:100] or "New Role")
+        self.next_role_id += 1
+        self.guild.roles.append(role)
+        self.log("🏷️", f"the {role.name} role was created", kind="event",
+                 details={"operation": "guild.role_create", "actor": self.active_user.name,
+                          "role": role.name, "status": "success"})
+        self._touch()
+        return role
+
+    def delete_role(self, role_id: int) -> MockRole:
+        """Delete a non-fixture role, removing it from every member."""
+        role = self.guild.get_role(int(role_id))
+        if role is None or role.name == "@everyone" or role.name in ROLE_NAMES:
+            raise ValueError("that role cannot be deleted")
+        self.guild.roles.remove(role)
+        for member in self.guild.members:
+            if role in member.roles:
+                member.roles.remove(role)
+        self.log("🏷️", f"the {role.name} role was deleted", kind="event",
+                 details={"operation": "guild.role_delete", "actor": self.active_user.name,
+                          "role": role.name, "status": "success"})
+        self._touch()
+        return role
+
+    def delete_channel_ui(self, channel_id) -> MockChannel:
+        """User-driven channel deletion; returns the captured channel object."""
+        actor = self._moderator_check("manage_channels")
+        channel = self.channels.get(str(channel_id))
+        if channel is None:
+            raise ValueError("unknown channel")
+        if channel.id == self.channel.id:
+            raise ValueError("the default channel cannot be deleted")
+        captured = channel
+        self.channels.pop(str(channel_id), None)
+        self.log("🗑️", f"#{channel.name} was deleted by {actor.name}", kind="event",
+                 details={"operation": "channel.delete", "actor": actor.name,
+                          "channel": channel.name, "status": "success"})
+        self._touch()
+        return captured
 
     def delete_message(self, message_id: str | None, *, actor_id: int | None = None) -> None:
         msg = self.messages.get(message_id or "")
@@ -2474,6 +2565,172 @@ async def dispatch_command(session: Session, name: str, args: dict, channel_id=N
     return await _dispatch(session, lambda: _do_command(session, name, args, channel_id), timeout)
 
 
+# --------------------------------------------------------------- gateway events
+
+
+_GATEWAY_EVENT_ICONS = {
+    "member_join": "👋", "member_remove": "👢", "member_update": "🧑",
+    "raw_reaction_add": "➕", "raw_reaction_remove": "➖",
+    "guild_channel_create": "📋", "guild_channel_delete": "🗑️",
+    "guild_role_create": "🏷️", "guild_role_delete": "🏷️",
+}
+
+
+def _member_before_snapshot(member: MockMember) -> MockMember:
+    """Shallow before-copy for on_member_update (roles + nickname only)."""
+    before = MockMember(member.guild, member.id, member.name)
+    before.roles = list(member.roles)
+    before.display_name = member.display_name
+    return before
+
+
+def _build_raw_reaction(session: Session, message_id: str, user_id: int, emoji: str, *, add: bool):
+    """A real discord.RawReactionActionEvent for a simulator message.
+
+    The simulator stores "m1"-style message ids; RawReactionActionEvent wants
+    int snowflakes, so the numeric part becomes the id. All other fields are
+    real ints already (channels, members, guild). event_type is the plain
+    string the library itself passes (state.py:747/783); .member stays None
+    exactly like real guild REACTION_ADD payloads.
+    """
+    msg = session.messages.get(message_id or "") or {}
+    channel_id = int(msg.get("channel") or session.channel.id)
+    data = {"message_id": int(str(message_id).lstrip("m")), "channel_id": channel_id,
+            "user_id": int(user_id), "type": 0, "guild_id": session.guild.id}
+    emoji_obj = discord.PartialEmoji(name=str(emoji), animated=False, id=None)
+    from discord.raw_models import (
+        RawReactionActionEvent,
+    )
+    return RawReactionActionEvent(data, emoji_obj, "REACTION_ADD" if add else "REACTION_REMOVE")
+
+
+def _event_targets(session: Session, kind: str, payload: dict):
+    """Resolve payload ids to the objects the handler receives (or raise)."""
+    guild = session.guild
+    if kind == "member_join":
+        member = guild.get_member(int(payload.get("user_id") or 0))
+        if member is None:
+            raise ValueError("member no longer exists")
+        return [member]
+    if kind == "member_remove":
+        member = payload.get("_member")  # captured before removal
+        if member is None:
+            raise ValueError("member no longer exists")
+        return [member]
+    if kind == "member_update":
+        before, after = payload.get("_before"), guild.get_member(int(payload.get("user_id") or 0))
+        if before is None or after is None:
+            change = payload.get("change") or "roles"
+            raise ValueError(f"member no longer exists for {change} change")
+        return [before, after]
+    if kind in ("raw_reaction_add", "raw_reaction_remove"):
+        raw = _build_raw_reaction(session, str(payload.get("message_id") or ""),
+                                  int(payload.get("user_id") or 0),
+                                  str(payload.get("emoji") or ""), add=kind == "raw_reaction_add")
+        return [raw]
+    if kind == "guild_channel_create":
+        channel = session.channels.get(str(payload.get("channel_id") or ""))
+        if channel is None:
+            raise ValueError("channel no longer exists")
+        return [channel]
+    if kind == "guild_channel_delete":
+        channel = payload.get("_channel")  # captured before deletion
+        if channel is None:
+            raise ValueError("channel no longer exists")
+        return [channel]
+    if kind in ("guild_role_create", "guild_role_delete"):
+        role = payload.get("_role") or guild.get_role(int(payload.get("role_id") or 0))
+        if role is None:
+            raise ValueError("role no longer exists")
+        return [role]
+    raise ValueError(f"unknown gateway event kind {kind!r}")
+
+
+def _event_summary(session: Session, kind: str, targets: list) -> str:
+    if kind == "member_join":
+        return f"{targets[0].name} joined the server"
+    if kind == "member_remove":
+        return f"{targets[0].name} left the server"
+    if kind == "member_update":
+        before, after = targets
+        roles = [r.name for r in after.roles if r not in before.roles]
+        lost = [r.name for r in before.roles if r not in after.roles]
+        if roles:
+            return f"{after.name} gained the {roles[0]} role"
+        if lost:
+            return f"{after.name} lost the {lost[0]} role"
+        if before.display_name != after.display_name:
+            return f"{after.name} changed their nickname to {after.display_name}"
+        return f"{after.name} was updated"
+    if kind.startswith("raw_reaction"):
+        raw = targets[0]
+        index = next((m["index"] for m in session.messages.values()
+                      if int(str(m["id"]).lstrip("m")) == raw.message_id), None)
+        return f"{raw.emoji} reaction {raw.event_type.removeprefix('REACTION_').lower()} on message #{index}"
+    if kind == "guild_channel_create":
+        return f"#{targets[0].name} was created"
+    if kind == "guild_channel_delete":
+        return f"#{targets[0].name} was deleted"
+    if kind == "guild_role_create":
+        return f"the {targets[0].name} role was created"
+    return f"the {targets[0].name} role was deleted"
+
+
+async def _do_event(session: Session, kind: str, payload: dict) -> None:
+    """Fire on_<kind>: module handler first, then cog listeners (registration order)."""
+    env = session.env
+    if not env:
+        raise RuntimeError("Nothing is running yet — press Run first.")
+    try:
+        targets = _event_targets(session, kind, payload)
+    except ValueError as error:
+        session.log("⚠️", f"{kind}: {error}", "warn", kind="event",
+                    details={"event": kind, "status": "missing_target"})
+        return
+    summary = _event_summary(session, kind, targets)
+    details = {"event": kind, "actor": session.active_user.name,
+               "channel": session.channel.name, "summary": summary, "status": "attempted"}
+    if kind == "member_update":
+        before, after = targets
+        details["target"] = after.name
+        details["roles_before"] = [r.name for r in before.roles if r.name != "@everyone"]
+        details["roles_after"] = [r.name for r in after.roles if r.name != "@everyone"]
+        if before.display_name != after.display_name:
+            details["nickname_before"] = before.display_name
+            details["nickname_after"] = after.display_name
+    elif kind.startswith("raw_reaction"):
+        raw = targets[0]
+        details["target"] = f"message {raw.message_id}"
+        details["emoji"] = str(raw.emoji)
+        details["user_id"] = str(raw.user_id)
+    else:
+        details["target"] = targets[0].name
+    event = session.log(_GATEWAY_EVENT_ICONS.get(kind, "📡"), summary, kind="event", details=details)
+    event_token = _ACTIVE_EVENT.set(event["id"])
+    try:
+        handler_name = f"on_{kind}"
+        handler = env.get(handler_name)
+        handlers = ([handler] if callable(handler) else []) \
+            + list(session.client._listeners.get(handler_name, []))
+        if not handlers:
+            session.log("⚠️", f"no handler defined for {handler_name} (define it in your script or a cog)",
+                        "warn", kind="action", details={"event": kind, "status": "no_handler"})
+            return
+        for handler in handlers:
+            result = _call(handler, *targets)
+            if inspect.isawaitable(result):
+                await result
+        event["details"]["status"] = "success"
+    finally:
+        _ACTIVE_EVENT.reset(event_token)
+
+
+async def dispatch_event(session: Session, kind: str, payload: dict | None = None,
+                         timeout: float = 10.0) -> dict:
+    """Deliver a simulated gateway event to on_<kind> handlers and cog listeners."""
+    return await _dispatch(session, lambda: _do_event(session, kind, dict(payload or {})), timeout)
+
+
 # --------------------------------------------------------------- state
 
 
@@ -2505,6 +2762,9 @@ def _member_details_json(session: Session) -> list[dict]:
             "banned": member.banned,
             "timed_out": bool(member.timeout_until and member.timeout_until > datetime.now(timezone.utc)),
             "role": role.name if role else None,
+            "role_id": str(role.id) if role else None,
+            "roles": [{"id": str(item.id), "name": item.name}
+                      for item in member.roles if item.name != "@everyone"],
             "role_color": f"#{color:06x}" if color is not None else None,
         })
     return details
@@ -2540,6 +2800,8 @@ def state(session: Session) -> dict:
         # ids as strings: 18-digit snowflakes lose precision as JS numbers
         "channels": [{"id": str(c.id), "name": c.name, "topic": c.topic}
                      for c in session.channels.values()],
+        "roles": [{"id": str(r.id), "name": r.name}
+                  for r in session.guild.roles if r.name != "@everyone"],
         "bot": {"id": session.guild.me.id, "name": session.guild.me.name},
         "permissions": permissions,
         "members": _members_json(session),
