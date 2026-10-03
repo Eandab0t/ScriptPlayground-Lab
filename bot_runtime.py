@@ -594,7 +594,7 @@ class ProjectTransport:
     def _message_payload(self, stored: dict) -> dict:
         author = stored.get("author") or {}
         member = self.session.guild.get_member(int(author.get("id") or BOT_ID))
-        return {
+        payload = {
             "id": _wire_message_id(stored["id"]),
             "channel_id": str(stored.get("channel") or CHANNEL_ID),
             "guild_id": str(GUILD_ID),
@@ -607,6 +607,24 @@ class ProjectTransport:
             "mentions": [], "mention_roles": [], "attachments": [], "embeds": stored.get("embeds") or [],
             "pinned": False, "type": 0, "flags": 64 if stored.get("ephemeral") else 0,
         }
+        if stored.get("reference"):
+            payload["message_reference"] = {"message_id": _wire_message_id(str(stored["reference"])),
+                                            "channel_id": payload["channel_id"], "type": 0}
+            ref_stored = self.session.messages.get(str(stored["reference"]))
+            if ref_stored is not None and not ref_stored.get("deleted"):
+                payload["referenced_message"] = self._message_payload(ref_stored)
+                payload["type"] = 19  # MessageType.reply
+            else:
+                payload["referenced_message"] = None
+        reactions = stored.get("reactions") or []
+        if reactions:
+            payload["reactions"] = [
+                {"count": len(entry.get("users", [])), "me": str(self.session.guild.me.id) in entry.get("users", []),
+                 "count_details": {"burst": 0, "normal": len(entry.get("users", []))},
+                 "emoji": {"name": entry["emoji"], "animated": False, "id": None}}
+                for entry in reactions
+            ]
+        return payload
 
     def _store(self, channel: pg.MockChannel, payload: dict, *, ephemeral: bool = False,
                ephemeral_user_id: int | None = None) -> dict:

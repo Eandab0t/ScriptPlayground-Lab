@@ -3094,7 +3094,7 @@ $("#btn-run").onclick = async () => {
   const code = $("#code").value;
   persistEditorCode(code);
   const url = activeWorkspace ? `/api/session/${SID}/project` : `/api/session/${SID}/run`;
-  const payload = activeWorkspace ? { workspace: activeWorkspace } : { code };
+  const payload = activeWorkspace ? { workspace: activeWorkspace } : { code, name: loadedScript || undefined };
   await runRequest(url, payload, activeWorkspace ? `${activeWorkspace} (saved project)`
     : loadedScript ? `${loadedScript}.py` : "editor");
 };

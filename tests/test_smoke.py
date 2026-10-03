@@ -2942,6 +2942,144 @@ async def on_raw_reaction_add(payload):
         s.close()
 
 
+async def test_gateway_reaction_add_remove_constructed_event():
+    """UI reaction toggle fires on_reaction_add/remove with a real discord.Reaction."""
+    s = Session("t-gw-rx-nonraw")
+    import main as server
+
+    server.SESSIONS[s.sid] = s
+    try:
+        result = await run_script(s, '''
+SEEN = []
+async def on_reaction_add(reaction, user):
+    SEEN.append(("add", str(reaction.emoji), reaction.count, reaction.me, user.name,
+                 reaction.message.content, type(reaction).__name__))
+async def on_reaction_remove(reaction, user):
+    SEEN.append(("remove", str(reaction.emoji), user.name))
+''')
+        assert result["ok"], s.last_run
+        handle = await s.channel.send("reaction target")
+        await server.react(_FakeReq(match={"sid": s.sid},
+                                    body={"message_id": handle.id, "emoji": "⭐"}))
+        await _drain_event_tasks(server)
+        assert s.env["SEEN"] == [("add", "⭐", 1, False, "You", "reaction target", "Reaction")], s.env["SEEN"]
+        await server.react(_FakeReq(match={"sid": s.sid},
+                                    body={"message_id": handle.id, "emoji": "⭐"}))
+        await _drain_event_tasks(server)
+        assert s.env["SEEN"][-1] == ("remove", "⭐", "You"), s.env["SEEN"]
+        event = [e for e in s.events if e.get("details", {}).get("event") == "reaction_add"][-1]
+        assert event["details"]["status"] == "success"
+    finally:
+        server.SESSIONS.pop(s.sid, None)
+        s.close()
+
+
+async def test_message_payload_includes_reactions_and_references():
+    """REST message payloads carry reaction state; replies resolve their reference."""
+    s = Session("t-slice3-payloads")
+    try:
+        assert (await run_script(s, "READY = 1"))["ok"], s.last_run
+        handle = await s.channel.send("base message")
+        await handle.add_reaction("🎉")
+        s.add_member("Replier")
+        s.add_message("the reply", reference=handle.id,
+                      author=s.guild.get_member(s.next_custom_user_id - 1))
+
+        from bot_runtime import ProjectRuntime, ProjectTransport
+        runtime = ProjectRuntime.__new__(ProjectRuntime)
+        runtime.session = s
+        transport = ProjectTransport.__new__(ProjectTransport)
+        transport.runtime = runtime
+        payload = transport._message_payload(s.messages[handle.id])
+        assert payload["reactions"] == [{"count": 1, "me": True,
+                                         "count_details": {"burst": 0, "normal": 1},
+                                         "emoji": {"name": "🎉", "animated": False, "id": None}}]
+        reply_stored = next(m for m in s.messages.values() if m.get("reference"))
+        reply_payload = transport._message_payload(reply_stored)
+        assert reply_payload["type"] == 19
+        assert reply_payload["referenced_message"]["content"] == "base message"
+
+        # The real constructed Message resolves the reply through the shim state.
+        from playground import _real_message
+        real_reply = _real_message(s, reply_stored)
+        assert real_reply.type.name == "reply"
+        assert real_reply.reference.resolved.content == "base message"
+        # The mock handle exposes the same reference through MockMessage.referenced_message.
+        from playground import MockMessage
+        mock_reply = MockMessage(s, reply_stored["id"], reply_stored.get("author_obj"))
+        assert mock_reply.referenced_message is not None
+        assert mock_reply.referenced_message.content == "base message"
+    finally:
+        s.close()
+
+
+async def _drain_event_tasks(server, timeout: float = 2.0) -> None:
+    """Wait until fire-and-notify event tasks finish (they hop threads)."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while server._PENDING_EVENT_TASKS and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+
+
+async def test_v2_component_own_callback_and_modal():
+    """V2 section buttons fire their own callback; ui.Modal subclasses own submits."""
+    s = Session("t-v2-advanced")
+    try:
+        result = await run_script(s, '''
+import discord
+from discord import ui
+
+class TicketModal(ui.Modal, title="Open a ticket"):
+    topic = ui.TextInput(label="Topic", max_length=60)
+    async def on_submit(self, interaction):
+        await interaction.response.send_message(f"ticket: {self.topic.value}", ephemeral=True)
+
+class OpenButton(ui.Button):
+    async def callback(self, interaction):
+        await interaction.response.send_modal(TicketModal())
+
+class Panel(ui.LayoutView):
+    def __init__(self):
+        super().__init__(timeout=None)
+        container = ui.Container(accent_colour=0x5865f2)
+        container.add_item(ui.Section(ui.TextDisplay("Own cb"),
+            accessory=ui.Button(label="Ping", style=discord.ButtonStyle.primary, custom_id="ping")))
+        container.add_item(ui.Section(ui.TextDisplay("Modal"),
+                                       accessory=OpenButton(label="Modal", custom_id="modal")))
+        self.add_item(container)
+
+async def main():
+    await send(view=Panel())
+
+async def on_click(interaction, custom_id, values):
+    await interaction.response.send_message(f"fallback {custom_id}", ephemeral=True)
+''')
+        assert result["ok"], s.last_run
+        msg = last_msg(s)
+        assert msg["v2"][0]["v2"] == "container"
+        assert msg["v2"][0]["children"][1]["accessory"]["kind"] == "button"
+
+        # A plain v2 button with no own callback still goes through on_click.
+        await dispatch_click(s, msg["id"], "ping", [])
+        actions = [a for a in s.events if a["kind"] == "action"]
+        assert actions[-1]["details"].get("content") == "fallback ping"
+
+        # A subclassed v2 section accessory fires ITS callback -> opens the modal.
+        await dispatch_click(s, msg["id"], "modal", [])
+        modal = next(m for m in s.modals if not m.get("dismissed"))
+        assert modal["title"] == "Open a ticket"
+        cid = modal["items"][0]["custom_id"]
+
+        # Submitting runs the ui.Modal subclass's on_submit with the value on
+        # the TextInput child, exactly like real discord.py.
+        await dispatch_submit(s, modal["id"], {cid: "linux crash"})
+        actions = [a for a in s.events if a["kind"] == "action"]
+        assert actions[-1]["details"].get("content") == "ticket: linux crash"
+    finally:
+        s.close()
+
+
 async def main() -> None:
     tests = [
         (name, fn) for name, fn in sorted(globals().items())

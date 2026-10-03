@@ -228,6 +228,64 @@ def _invalid_form_body(errors: list[str]) -> discord.HTTPException:
     return _MockHTTPException("In " + "\nIn ".join(errors))
 
 
+class _MessageStateShim:
+    """A real discord.state.ConnectionState bound to the mock layer.
+
+    Built lazily per session and reused; store_user routes through the real
+    library so discord.Message objects are genuine.
+    """
+
+    def __init__(self, session: Session) -> None:
+        from discord.http import HTTPClient
+        from discord.state import ConnectionState
+
+        client = session.client
+        self._session = session
+        self.http = HTTPClient(loop=asyncio.get_running_loop())
+        self._connection = ConnectionState(dispatch=lambda *args, **kwargs: None,
+                                           handlers=None, hooks=None, syncer=None,
+                                           client=client, connectargs=(),
+                                           voice_connect_kwargs={}, http=self.http)
+        self.user = self._connection.user = session.guild.me
+        self._users: dict[int, object] = {}
+
+    def store_user(self, data, cache=None):  # type: ignore[no-untyped-def]
+        from discord.user import BaseUser
+
+        user_id = int(data["id"])
+        existing = self._users.get(user_id)
+        if existing is not None:
+            existing._update(data)
+            return existing
+        user = BaseUser(state=self, data=data)
+        self._users[user_id] = user
+        return user
+
+    @property
+    def member_cache_flags(self):  # type: ignore[no-untyped-def]
+        from discord.flags import MemberCacheFlags
+
+        return MemberCacheFlags.all()
+
+    def get_member(self, user_id):  # type: ignore[no-untyped-def]
+        return self._session.guild.get_member(int(user_id))
+
+    def get_user(self, user_id):  # type: ignore[no-untyped-def]
+        return self._session.guild.get_member(int(user_id))
+
+    def is_self(self, user_id):  # type: ignore[no-untyped-def]
+        return int(user_id) == int(self._session.guild.me.id)
+
+    def get_emoji_from_partial_payload(self, payload):  # type: ignore[no-untyped-def]
+        """Resolve a partial emoji payload (unicode or custom) like the real state."""
+        from discord.partial_emoji import PartialEmoji
+
+        emoji = PartialEmoji(name=payload.get("name") or "",
+                             animated=payload.get("animated", False), id=payload.get("id"))
+        emoji._state = self
+        return emoji
+
+
 class MockMessage:
     """Handle returned from sends; edits/deletes go through the session."""
 
@@ -239,7 +297,10 @@ class MockMessage:
         self.guild = session.guild
         self.author = author or session.guild.me
         self.created_at = datetime.now(timezone.utc)
-        self.referenced_message = None
+        stored_ref = (session.messages.get(message_id) or {}).get("reference")
+        ref_stored = session.messages.get(str(stored_ref)) if stored_ref else None
+        self.referenced_message = (MockMessage(session, str(stored_ref), ref_stored.get("author_obj"))
+                                   if ref_stored is not None and not ref_stored.get("deleted") else None)
 
     @property
     def content(self) -> str:
@@ -692,6 +753,9 @@ def _emoji(value) -> str | None:
 
 def _item_to_json(item: discord.ui.Item) -> dict:
     kind = _KINDS.get(type(item).__name__)
+    if kind is None:  # subclasses (OpenButton(...) etc.) keep their kind
+        kind = next((k for base, k in _KINDS.items()
+                     if any(c.__name__ == base for c in type(item).__mro__)), None)
     row = getattr(item, "row", None) or 0
     if kind == "button":
         return {
@@ -834,6 +898,9 @@ def _v2_item_to_json(item) -> dict:
     if name == "ActionRow":
         return {"v2": "actionrow", "children": [_v2_item_to_json(c) for c in item.children]}
     kind = _KINDS.get(name)
+    if kind is None:  # subclasses (OpenButton(...) etc.) keep their kind
+        kind = next((k for base, k in _KINDS.items()
+                     if any(c.__name__ == base for c in type(item).__mro__)), None)
     if kind is not None:  # buttons/selects — including Section accessory buttons
         return _item_to_json(item)
     return {"v2": "unknown", "label": _label_of(item) or name}
@@ -1153,9 +1220,11 @@ class Session:
         self.revision = 0  # monotonic state key for cheap browser render checks
         self.channel = self.make_channel("playground")
         self.client = MockClient(self)
+        self._msg_state = None  # lazily-built real ConnectionState shim (_message_state)
         self.workspace: str | None = None       # active workspace name (None = single-file)
         self.workspace_root: Path | None = None  # resolved absolute path, or None
         self.workspace_file: str | None = None  # relative file Run File executed (None = entry bot.py)
+        self.script_file: Path | None = None    # saved script backing an editor run (env __file__)
         self.user_id = USER_ID
         self.voice_channel: str | None = None   # MockChannel.id of the joined voice room
         self.voice_self_mute = False
@@ -1213,6 +1282,12 @@ class Session:
             del self.events[:-_MAX_EVENTS]
         return event
 
+    def _message_state(self):
+        """The lazily-built real ConnectionState shim backing discord.Message objects."""
+        if self._msg_state is None:
+            self._msg_state = _MessageStateShim(self)
+        return self._msg_state
+
     def add_message(self, content=None, **kwargs) -> dict:
         if content is not None and len(str(content)) > _CONTENT_LIMIT:
             raise _invalid_form_body([f"content: Must be {_CONTENT_LIMIT} or fewer in length"])
@@ -1242,6 +1317,8 @@ class Session:
             if kwargs.get("ephemeral") and kwargs.get("ephemeral_user_id") is not None else None,
             "banner_url": author.banner_url, "bio": author.bio,
             "files": [_file_info(f) for f in files],
+            "reference": kwargs.get("reference"),
+            "view_obj": kwargs.get("view"),  # live view object, not serialized
             "revision": 0,
             "deleted": False,
             "timestamp": _now(),
@@ -1272,6 +1349,7 @@ class Session:
         if "view" in kwargs:
             classic, v2 = _stash_view(kwargs.get("view"))
             msg["components"], msg["v2"] = classic, v2
+            msg["view_obj"] = kwargs.get("view")
         msg["revision"] += 1
         self._touch()
         self.log("✏️", f"message #{msg['index']} edited", kind="action",
@@ -1606,17 +1684,19 @@ class Session:
         items = [_item_to_json(child) for child in modal.children]
         return self.open_modal_payload(
             title, items, source_message_id, channel_id=channel_id, user_id=user_id,
-            custom_id=custom_id or getattr(modal, "custom_id", None),
+            custom_id=custom_id or getattr(modal, "custom_id", None), modal_obj=modal,
         )
 
     def open_modal_payload(self, title: str, items: list[dict], source_message_id: str | None,
-                           *, channel_id=None, custom_id=None, user_id=None) -> dict:
+                           *, channel_id=None, custom_id=None, user_id=None,
+                           modal_obj=None) -> dict:
         modal = {
             "id": f"mo{self.next_modal_id}", "title": title,
             "items": items, "source": source_message_id,
             "channel_id": str(channel_id or (self.messages.get(source_message_id or "") or {}).get("channel")
                                or self.channel.id),
             "user_id": str(self.active_user.id if user_id is None else user_id),
+            "modal_obj": modal_obj,  # live ui.Modal object; not serialized
         }
         if custom_id:
             modal["custom_id"] = str(custom_id)
@@ -2023,7 +2103,7 @@ def _build_env(session: Session) -> dict:
     async def playground_send(content=None, **kwargs):
         return await session.channel.send(content, **kwargs)
 
-    return {
+    env = {
         "discord": discord,
         "Session": session,
         "client": session.client,
@@ -2031,6 +2111,9 @@ def _build_env(session: Session) -> dict:
         "send": playground_send,
         "__name__": "playground",
     }
+    if session.script_file:  # editor run of a saved script: __file__ points at the saved file
+        env["__file__"] = str(session.script_file)
+    return env
 
 
 def _flush_stdout(buffer: io.StringIO, session: Session) -> None:
@@ -2199,6 +2282,22 @@ async def _run_main(main_fn, session: Session, started: asyncio.Event) -> None:
         session.last_run = {"ok": False, "error": tb, "exception": _script_error_details(error), "ms": 0.0}
 
 
+def _find_view_item(view, custom_id: str):
+    """Locate the live ui item with this custom_id anywhere in a view tree."""
+    if view is None:
+        return None
+    stack = list(getattr(view, "children", []) or [])
+    while stack:
+        item = stack.pop()
+        if getattr(item, "custom_id", None) == custom_id:
+            return item
+        stack.extend(getattr(item, "children", []) or [])
+        accessory = getattr(item, "accessory", None)
+        if accessory is not None:
+            stack.append(accessory)
+    return None
+
+
 def _find_component(components: list[dict], v2: list[dict], custom_id: str) -> dict | None:
     for item in components:
         if item.get("custom_id") == custom_id:
@@ -2242,7 +2341,11 @@ async def _do_click(session: Session, message_id: str, custom_id: str, values: l
         session.log("⚠️", f"component {custom_id!r} is not available on this message", "warn", kind="event",
                     details={**click_details, "status": "invalid_component"})
         return
-    if not callable(handler):
+    view_item = _find_view_item(message.get("view_obj"), custom_id)
+    own_callback = getattr(view_item, "callback", None)
+    if own_callback is not None and own_callback.__func__ is discord.ui.Item.callback:
+        own_callback = None  # default no-op; let on_click own the interaction
+    if not callable(handler) and not callable(own_callback):
         session.log("⚠️", f"clicked {custom_id!r} but no `on_click` handler is defined", "warn",
                     kind="event", details={**click_details, "status": "missing_handler"})
         return
@@ -2251,7 +2354,12 @@ async def _do_click(session: Session, message_id: str, custom_id: str, values: l
         interaction = session.build_interaction(
             message_id, custom_id, values, discord.InteractionType.component
         )
-        result = _call(handler, interaction, custom_id, values)
+        if callable(own_callback):
+            # The component's own callback (ui.Button subclass or .callback
+            # assignment) owns the interaction, exactly like real discord.py.
+            result = _call(own_callback, interaction)
+        else:
+            result = _call(handler, interaction, custom_id, values)
         if inspect.isawaitable(result):
             await result
         if not interaction.is_done():
@@ -2319,7 +2427,10 @@ async def _do_submit(session: Session, modal_id: str, values: dict) -> None:
                         details={**submit_details, "status": "attempted"})
     session.modals.remove(modal)
     session._touch()
-    if not callable(handler):
+    own_submit = getattr(modal.get("modal_obj"), "on_submit", None)
+    if callable(own_submit) and getattr(own_submit, "__func__", None) is discord.ui.Modal.on_submit:
+        own_submit = None  # inherited no-op; keep the on_submit handler fallback
+    if not callable(handler) and not callable(own_submit):
         session.log("⚠️", f"modal {modal_id} submitted but no `on_submit` handler is defined", "warn",
                     kind="event", details={**submit_details, "status": "missing_handler"})
         return
@@ -2329,7 +2440,24 @@ async def _do_submit(session: Session, modal_id: str, values: dict) -> None:
             modal["source"], interaction_type=discord.InteractionType.modal_submit,
             channel_id=channel.id,
         )
-        result = _call(handler, interaction, values, modal_id)
+        if callable(own_submit):
+            # The ui.Modal subclass owns its submit, exactly like real discord.py:
+            # values land on the TextInput children before on_submit runs.
+            for child in modal.get("modal_obj").children:
+                cid = getattr(child, "custom_id", None)
+                match = str(values.get(cid, "")) if cid is not None else ""
+                if not match:
+                    stored = next((i for i in modal.get("items", [])
+                                   if i.get("custom_id") == cid), None)
+                    if stored is not None:
+                        match = _modal_value(values, stored)
+                try:
+                    child._value = match
+                except AttributeError:
+                    pass
+            result = _call(own_submit, interaction)
+        else:
+            result = _call(handler, interaction, values, modal_id)
         if inspect.isawaitable(result):
             await result
         if not interaction.is_done():
@@ -2389,7 +2517,8 @@ async def _gated(session: Session, coro_fn) -> None:
 
 async def run_script(session: Session, code: str, timeout: float = 20.0,
                      *, workspace: str | None = None, workspace_root=None,
-                     workspace_file: str | None = None) -> dict:
+                     workspace_file: str | None = None,
+                     script_file: Path | None = None) -> dict:
     """Run a bot: `code` as a single-file module, or the workspace's bot.py.
 
     With `workspace` set, the saved bot.py on disk is the entry point and
@@ -2407,10 +2536,12 @@ async def run_script(session: Session, code: str, timeout: float = 20.0,
         session.workspace = workspace
         session.workspace_root = Path(workspace_root).resolve()
         session.workspace_file = workspace_file  # None = boot the saved entry
+        session.script_file = None
     else:
         session.workspace = None
         session.workspace_root = None
         session.workspace_file = None
+        session.script_file = script_file  # a saved editor script gets a real __file__
     started = time.perf_counter()
     session.user_deadline = time.monotonic() + timeout
     try:
@@ -2571,6 +2702,7 @@ async def dispatch_command(session: Session, name: str, args: dict, channel_id=N
 _GATEWAY_EVENT_ICONS = {
     "member_join": "👋", "member_remove": "👢", "member_update": "🧑",
     "raw_reaction_add": "➕", "raw_reaction_remove": "➖",
+    "reaction_add": "➕", "reaction_remove": "➖",
     "guild_channel_create": "📋", "guild_channel_delete": "🗑️",
     "guild_role_create": "🏷️", "guild_role_delete": "🏷️",
 }
@@ -2628,6 +2760,20 @@ def _event_targets(session: Session, kind: str, payload: dict):
                                   int(payload.get("user_id") or 0),
                                   str(payload.get("emoji") or ""), add=kind == "raw_reaction_add")
         return [raw]
+    if kind in ("reaction_add", "reaction_remove"):
+        msg = session.messages.get(str(payload.get("message_id") or ""))
+        if msg is None:
+            raise ValueError("message no longer exists")
+        emoji = str(payload.get("emoji") or "")
+        reaction = next((r for r in msg.get("reactions", []) if r["emoji"] == emoji), None)
+        if reaction is None:
+            if kind == "reaction_add":
+                raise ValueError("reaction no longer exists")
+            # The last removal empties the reactions list; still deliver the
+            # event with count 0, exactly like the real MESSAGE_REACTION_REMOVE.
+            reaction = {"emoji": emoji, "users": []}
+        actor = guild.get_member(int(payload.get("user_id") or 0))
+        return [_real_reaction(session, msg, reaction), actor]
     if kind == "guild_channel_create":
         channel = session.channels.get(str(payload.get("channel_id") or ""))
         if channel is None:
@@ -2644,6 +2790,84 @@ def _event_targets(session: Session, kind: str, payload: dict):
             raise ValueError("role no longer exists")
         return [role]
     raise ValueError(f"unknown gateway event kind {kind!r}")
+
+
+def _author_payload(member: MockMember | None) -> dict:
+    """The user payload discord.Message._handle_author expects."""
+    if member is None:
+        member = MockMember(MockGuild.__new__(MockGuild), BOT_ID, "Playground Bot", bot=True)
+    return {
+        "id": str(member.id), "username": member.name,
+        "global_name": getattr(member, "global_name", None) or member.name,
+        "discriminator": "0", "avatar": member.avatar_url,
+        "bot": bool(member.bot), "public_flags": 0,
+    }
+
+
+def _message_data(session: Session, stored: dict, *, type_override: int = 0) -> dict:
+    """Build the gateway MESSAGE payload for a stored simulator message."""
+    author = stored.get("author") or {}
+    member = session.guild.get_member(int(author.get("id") or BOT_ID))
+    reference = stored.get("reference")
+    data = {
+        "id": int(stored["id"].lstrip("m")),
+        "channel_id": int(stored.get("channel") or session.channel.id),
+        "guild_id": session.guild.id,
+        "author": _author_payload(member),
+        "content": stored.get("content") or "",
+        "timestamp": stored.get("timestamp") or _now(),
+        "edited_timestamp": None, "tts": False, "mention_everyone": False,
+        "mentions": [], "mention_roles": [], "attachments": [],
+        "embeds": stored.get("embeds") or [], "pinned": False,
+        "type": type_override, "flags": 64 if stored.get("ephemeral") else 0,
+    }
+    if reference is not None:
+        ref_stored = session.messages.get(str(reference))
+        if ref_stored is not None and not ref_stored.get("deleted"):
+            ref_member = session.guild.get_member(int((ref_stored.get("author") or {}).get("id") or BOT_ID))
+            data["message_reference"] = {"message_id": int(str(reference).lstrip("m")),
+                                         "channel_id": int(ref_stored.get("channel") or session.channel.id),
+                                         "guild_id": session.guild.id, "type": 0}
+            data["referenced_message"] = _message_data(session, ref_stored)
+            data["referenced_message"]["author"] = _author_payload(ref_member)
+            data["type"] = 19  # MessageType.reply
+        else:
+            data["message_reference"] = {"message_id": int(str(reference).lstrip("m")),
+                                         "channel_id": int(stored.get("channel") or session.channel.id),
+                                         "guild_id": session.guild.id, "type": 0}
+    return data
+
+
+def _real_message(session: Session, stored: dict):
+    """A genuine discord.Message for a stored simulator message (best effort).
+
+    Built through a real ConnectionState shim, so handlers can read
+    message.author, message.channel, message.reference, and message.reactions.
+    If the library internals drift, the mock handle is returned instead of
+    failing the event.
+    """
+    try:
+        from discord.message import Message
+    except ImportError:
+        return MockMessage(session, str(stored.get("id") or ""), stored.get("author_obj"))
+    state = session._message_state()
+    channel = session.channels.get(str(stored.get("channel") or ""), session.channel)
+    type_override = 19 if stored.get("reference") else 0
+    return Message(state=state, channel=channel,
+                   data=_message_data(session, stored, type_override=type_override))
+
+
+def _real_reaction(session: Session, stored: dict, reaction: dict):
+    """A genuine discord.Reaction (message + count + me) for a stored reaction."""
+    from discord.reaction import Reaction
+
+    message = _real_message(session, stored)
+    users = [u for u in reaction.get("users", []) if str(u) != ""]
+    me = str(session.guild.me.id) in users
+    payload = {"count": len(users), "me": me,
+               "count_details": {"burst": 0, "normal": len(users)},
+               "emoji": {"name": reaction["emoji"], "animated": False, "id": None}}
+    return Reaction(message=message, data=payload)
 
 
 def _event_summary(session: Session, kind: str, targets: list) -> str:
@@ -2667,6 +2891,10 @@ def _event_summary(session: Session, kind: str, targets: list) -> str:
         index = next((m["index"] for m in session.messages.values()
                       if int(str(m["id"]).lstrip("m")) == raw.message_id), None)
         return f"{raw.emoji} reaction {raw.event_type.removeprefix('REACTION_').lower()} on message #{index}"
+    if kind in ("reaction_add", "reaction_remove"):
+        reaction, actor = targets
+        label = "added" if kind == "reaction_add" else "removed"
+        return f"{actor.name if actor else 'someone'} {label} a {reaction.emoji} reaction"
     if kind == "guild_channel_create":
         return f"#{targets[0].name} was created"
     if kind == "guild_channel_delete":
@@ -2703,6 +2931,11 @@ async def _do_event(session: Session, kind: str, payload: dict) -> None:
         details["target"] = f"message {raw.message_id}"
         details["emoji"] = str(raw.emoji)
         details["user_id"] = str(raw.user_id)
+    elif kind in ("reaction_add", "reaction_remove"):
+        reaction, actor = targets
+        details["target"] = f"message {reaction.message.id}"
+        details["emoji"] = str(reaction.emoji)
+        details["user_id"] = str(actor.id) if actor is not None else None
     else:
         details["target"] = targets[0].name
     event = session.log(_GATEWAY_EVENT_ICONS.get(kind, "📡"), summary, kind="event", details=details)
@@ -2773,7 +3006,7 @@ def _member_details_json(session: Session) -> list[dict]:
 def state(session: Session) -> dict:
     msgs = []
     for mid in session.order:
-        msg = {k: v for k, v in session.messages[mid].items() if k != "author_obj"}
+        msg = {k: v for k, v in session.messages[mid].items() if k not in ("author_obj", "view_obj")}
         msgs.append(msg)
     permission_names = ("view_channel", "send_messages", "manage_messages", "manage_channels")
     events = session.events[-300:]
@@ -2808,7 +3041,8 @@ def state(session: Session) -> dict:
         "member_details": _member_details_json(session),
         "messages": [msg for msg in msgs if not msg.get("ephemeral")
                      or msg.get("ephemeral_user_id") == str(session.active_user.id)],
-        "modals": [modal for modal in session.modals
+        "modals": [{k: v for k, v in modal.items() if k != "modal_obj"}
+                   for modal in session.modals
                    if modal.get("user_id") in (None, str(session.active_user.id))],
         "commands": session.commands,
         "events": events,

@@ -18,6 +18,7 @@ The following baseline work is complete: bridge round-trip fixtures, vendored Em
 - Interaction-class events (reactions) await the handler; management mutations (join/leave/roles/channels) return instantly and notify via the normal update channel.
 - Reaction events use real `discord.RawReactionActionEvent` payloads; non-raw `Reaction` events are unsupported (see COMPATIBILITY.md for the reason).
 - Nickname edits from the profile card (changed `display_name`) fire `on_member_update` with before/after snapshots and a nickname summary/details.
+- Reaction toggles fire raw events first, then constructed `on_reaction_add/remove` with a genuine `discord.Reaction` (count/me/message) built from per-message reaction state; replies are stored with a `reference` and delivered through the transport as `type: 19` with a resolvable `message_reference`/`referenced_message` (`message.referenced_message` works on the mock handle too).
 
 ### 2. Improve workspace editing deliberately (started)
 

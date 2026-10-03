@@ -569,7 +569,7 @@ async def test_scripts(_request: web.Request) -> web.Response:
     async def run_file(path: Path) -> dict:
         session = Session(path.stem)
         try:
-            result = await run_script(session, path.read_text(encoding="utf-8"))
+            result = await run_script(session, path.read_text(encoding="utf-8"), script_file=path)
             return {"name": path.stem, "ok": result["ok"], "ms": result["ms"],
                     "messages": len(session.order),
                     "error": next((event["text"] for event in reversed(session.events)
@@ -781,7 +781,7 @@ async def _run_code(session: Session, body: dict) -> web.Response:
             result = await run_script(session, code, workspace=workspace, workspace_root=folder,
                                       workspace_file=None)
             _bump(session.sid)
-            return web.json_response({**result, "mode": "workspace"})
+            return web.json_response({**result, "mode": "workspace", "commands": session.commands})
         try:
             return web.json_response(await _boot_workspace_project(session, folder))
         except _ProjectBootDeadline:
@@ -800,7 +800,9 @@ async def _run_code(session: Session, body: dict) -> web.Response:
     if not code.strip():
         return web.json_response({"ok": False, "error": "Nothing to run — the editor is empty."}, status=400)
     _disarm_workspace_watch(session)  # editor-driven Run owns the runtime again
-    result = await run_script(session, code)
+    name = (body.get("name") or "").strip()
+    script_file = _script_path(name) if name and _script_path(name).is_file() else None
+    result = await run_script(session, code, script_file=script_file)
     _bump(session.sid)
     return web.json_response(result)
 
@@ -918,10 +920,16 @@ async def react(request: web.Request) -> web.Response:
     except discord.Forbidden as error:
         return web.json_response({"ok": False, "error": str(error)}, status=403)
     # Reactions are interaction-class: await the handler so the response is
-    # deterministic, exactly like the click/command routes.
+    # deterministic, exactly like the click/command routes. Both the raw and
+    # the constructed (Reaction, member) events fire, in Discord's order:
+    # raw first, then on_reaction_add/remove (component-style handlers, in
+    # registration order).
+    reaction_payload = {"message_id": str(body.get("message_id") or ""),
+                        "user_id": session.user_id, "emoji": str(body.get("emoji") or "")}
     await dispatch_event(session, "raw_reaction_add" if added else "raw_reaction_remove",
-                         {"message_id": str(body.get("message_id") or ""),
-                          "user_id": session.user_id, "emoji": str(body.get("emoji") or "")})
+                         reaction_payload)
+    await dispatch_event(session, "reaction_add" if added else "reaction_remove",
+                         reaction_payload)
     _bump(session.sid)
     return web.json_response({"ok": True, "added": added, "state": state(session)})
 
