@@ -63,6 +63,15 @@ class ScriptStuck(Exception):
     """The script's thread never answered within the timeout (likely a wedged loop)."""
 
 
+# The trace watchdog is the primary interrupt and fires exactly on the script
+# deadline. SessionRunner's own timeout only has to cover what tracing cannot
+# reach (a wedged C call, a blocked await), so it is armed this much *past* the
+# deadline. Arming both at `timeout` made them a coin flip: on a loaded runner
+# the safety net won, and a busy loop the watchdog was about to cut got reported
+# as "did not respond in time" instead.
+_WATCHDOG_GRACE = 2.0
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -2056,7 +2065,7 @@ def _run_entry_module(session: Session, env: dict, buffer: io.StringIO,
     parent.__path__ = [str(root)]  # relative imports resolve against the workspace
     sys.modules[package_name] = parent
     previous_trace = sys.gettrace()
-    sys.settrace(_script_trace(getattr(session, "user_deadline", time.monotonic() + 20)))
+    sys.settrace(_script_trace(session, getattr(session, "user_deadline", time.monotonic() + 20)))
     try:
         with contextlib.redirect_stdout(buffer):
             env["__file__"] = dunder_file
@@ -2122,14 +2131,19 @@ def _flush_stdout(buffer: io.StringIO, session: Session) -> None:
         session.log("🖨️", text)
 
 
-def _script_trace(deadline: float):
+def _script_trace(session: Session, deadline: float):
     """Interrupt CPU-bound user code; asyncio cancellation cannot stop a busy loop.
 
     Applies to the entry exec (<playground>) and to frames whose code lives
     under the active workspace, so an infinite loop in an imported helper is
     interrupted by the deadline instead of wedging the session thread.
+
+    The session is passed in rather than read from `_CURRENT_SESSION` because
+    the watcher-reload path never sets that contextvar: there the workspace
+    prefix came back None and the trace covered nothing at all, so a busy loop
+    in a reloaded workspace file could only be caught by the outer safety net.
     """
-    workspace_root = getattr(_CURRENT_SESSION.get(), "workspace_root", None)
+    workspace_root = getattr(session, "workspace_root", None)
     prefix = str(Path(workspace_root)) if workspace_root else None
 
     def trace(frame, event, _arg):
@@ -2240,7 +2254,7 @@ async def _do_run(session: Session, code: str) -> None:
     started = time.perf_counter()
     token = _CURRENT_SESSION.set(session)
     previous_trace = sys.gettrace()
-    sys.settrace(_script_trace(getattr(session, "user_deadline", time.monotonic() + 20)))
+    sys.settrace(_script_trace(session, getattr(session, "user_deadline", time.monotonic() + 20)))
     try:
         if session.workspace_root is not None:
             rel_file = getattr(session, "workspace_file", None)
@@ -2567,7 +2581,8 @@ async def run_script(session: Session, code: str, timeout: float = 20.0,
     started = time.perf_counter()
     session.user_deadline = time.monotonic() + timeout
     try:
-        await session.runner.run(lambda: _gated(session, lambda: _do_run(session, code)), timeout)
+        await session.runner.run(lambda: _gated(session, lambda: _do_run(session, code)),
+                                 timeout + _WATCHDOG_GRACE)
     except ScriptStuck as exc:
         session.log("🛑", str(exc), "error")
         session.last_run = {"ok": False, "error": str(exc), "exception": _script_error_details(exc),
@@ -2600,7 +2615,7 @@ async def _do_reload(session: Session, code: str, run_main: bool) -> None:
     cogs_before = dict(session.client.cogs)
     listeners_before = {name: list(hooks) for name, hooks in session.client._listeners.items()}
     previous_trace = sys.gettrace()
-    sys.settrace(_script_trace(getattr(session, "user_deadline", time.monotonic() + 20)))
+    sys.settrace(_script_trace(session, getattr(session, "user_deadline", time.monotonic() + 20)))
     try:
         if session.workspace_root is not None:
             _run_entry_module(session, env, buffer, code, rel_file)

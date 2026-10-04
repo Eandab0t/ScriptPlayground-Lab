@@ -20,7 +20,10 @@ env:
 jobs:
   python:
     name: Python suites
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest migrates to Ubuntu 26 on 2026-10-19 and the script
+    # watchdog depends on Linux thread scheduling, so an unpinned image turns a
+    # platform move into an unexplained test failure.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -57,8 +60,11 @@ jobs:
       - name: Real-bot acceptance suite (compatibility matrix proof)
         run: python -X utf8 -m pytest tests/test_acceptance.py -q
 
-      - name: Full suite (everything pytest collects)
-        run: python -X utf8 -m pytest -q
+      # `--ignore` because `testpaths = tests` already collects the acceptance
+      # module: without it these 33 tests run twice in the same job. The gate
+      # above is the authoritative run.
+      - name: Full suite (everything except the acceptance gate above)
+        run: python -X utf8 -m pytest -q --ignore=tests/test_acceptance.py
 
       - name: Clean session artifacts
         if: always()
@@ -66,7 +72,7 @@ jobs:
 
   browser:
     name: Browser (Playwright)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 

@@ -431,16 +431,20 @@ test('a transient workspace-list failure preserves saved workspace recovery stat
 });
 
 test('a transient workspace-file failure preserves saved recovery state for retry', async ({ page }) => {
+  const name = `retry-file-${process.pid}-${Date.now()}`;
+  workspacePath = fs.mkdtempSync(path.join(__dirname, '..', '..', 'bots', `${name}-`));
+  const workspaceName = path.basename(workspacePath);
   const diskSource = ['async def main():', '    await send("SAVED_WORKSPACE_DISK_SOURCE")', ''].join(String.fromCharCode(10));
+  fs.writeFileSync(path.join(workspacePath, 'bot.py'), diskSource);
   const unsavedBuffer = ['async def main():', '    await send("UNSAVED_WORKSPACE_BUFFER")', ''].join(String.fromCharCode(10));
-  const savedState = { version: 1, workspace: 'showcase_bot', filename: 'bot.py', baseline: diskSource };
+  const savedState = { version: 1, workspace: workspaceName, filename: 'bot.py', baseline: diskSource };
   const { page: appPage } = await openPageWithStorage(page, {
     'pg-code': unsavedBuffer,
     'pg-code-context': 'workspace',
     'pg-workspace-state': JSON.stringify(savedState),
   });
   let failFileRead = true;
-  await appPage.route('**/api/workspaces/showcase_bot/files/bot.py', (route) => {
+  await appPage.route(`**/api/workspaces/${workspaceName}/files/bot.py`, (route) => {
     if (failFileRead) return route.fulfill({ status: 503, body: 'temporarily unavailable' });
     return route.continue();
   });
@@ -460,7 +464,7 @@ test('a transient workspace-file failure preserves saved recovery state for retr
 
   failFileRead = false;
   await appPage.reload();
-  await expect(appPage.locator('#workspace-select')).toHaveValue('showcase_bot');
+  await expect(appPage.locator('#workspace-select')).toHaveValue(workspaceName);
   await expect(appPage.locator('#code')).toHaveValue(unsavedBuffer);
   await expect(appPage.locator('#workspace-dirty')).toBeVisible();
   await expect(appPage.locator('#btn-run')).toBeEnabled();

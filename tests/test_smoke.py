@@ -806,14 +806,20 @@ async def main():
 ''')
         (folder / "spin.py").write_text("while True:\n    pass\n", encoding="utf-8")
         s = Session("t-ws-deadline")
+        deadline = 1.0
         try:
-            result = await run_script(s, "", workspace="infinite_bot", workspace_root=folder, timeout=1.0)
+            result = await run_script(s, "", workspace="infinite_bot", workspace_root=folder, timeout=deadline)
             assert result["ok"] is False, result
             deadline_events = [event for event in s.events if "execution deadline" in event["text"]]
             assert deadline_events, [event["text"] for event in s.events]
-            # ScriptStuck must win, not the outer runner timeout: a spinning
-            # worker on a loaded CI runner can take longer than it does locally.
-            assert result["ms"] < 10_000, f"took {result['ms']}ms: {result}"
+            # The trace watchdog has to win, not SessionRunner's safety net. The
+            # net only exists for what tracing cannot reach and is armed a grace
+            # period past the deadline, so finishing inside that window is the
+            # proof: re-arm both at `timeout` and this goes back to a coin flip
+            # that loses on a loaded CI runner.
+            safety_net_ms = (deadline + playground._WATCHDOG_GRACE) * 1000
+            assert result["ms"] < safety_net_ms, (
+                f"took {result['ms']}ms, past the {safety_net_ms:g}ms safety net: {result}")
         finally:
             s.close()
 
@@ -2388,6 +2394,10 @@ async def test_cpu_bound_startup_is_interrupted():
         result = await run_script(s, "while True:\n    pass\n", timeout=1.0)
         assert result["ok"] is False
         assert any("execution deadline" in event["text"] for event in s.events)
+        # Same invariant as the workspace variant: the watchdog cut the loop
+        # before the outer safety net was armed (see playground._WATCHDOG_GRACE).
+        safety_net_ms = (1.0 + playground._WATCHDOG_GRACE) * 1000
+        assert result["ms"] < safety_net_ms, f"took {result['ms']}ms, past the {safety_net_ms:g}ms safety net"
     finally:
         s.close()
 
