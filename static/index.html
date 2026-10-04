@@ -1752,6 +1752,19 @@ function renderMessage(m, st, grouped = false) {
   ));
   const relatedActionIds = new Set([...directActionIds, ...(relatedEvent?.action_ids || [])]);
   const relatedActions = entries.filter((entry) => entry.kind === "action" && relatedActionIds.has(entry.id));
+  const deleteItem = document.createElement("button");
+  deleteItem.type = "button";
+  deleteItem.textContent = "Delete message (simulates MESSAGE_DELETE)";
+  deleteItem.setAttribute("role", "menuitem");
+  deleteItem.className = "tool-link";
+  deleteItem.disabled = Boolean(m.deleted);
+  deleteItem.onclick = (event) => {
+    event.stopPropagation();
+    menu.classList.remove("open");
+    moreButton.setAttribute("aria-expanded", "false");
+    post(`messages/delete`, { message_id: m.id });
+  };
+  menu.appendChild(deleteItem);
   const menuItems = [
     ["Inspect event", "events", relatedEvent?.id || null],
     ["Inspect action", "actions", relatedActions.at(-1)?.id || null],

@@ -36,10 +36,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import traceback
 import types
 import typing
 import uuid
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -74,6 +76,80 @@ _ENTRY_NAMES = ("main.py", "bot.py", "index.py", "run.py", "app.py")
 
 # "m5" ↔ 18-digit wire id (below every real-looking snowflake used here)
 _WIRE_BASE = 600_000_000_000_000_000
+
+
+SANDBOX_META = ".playground.json"
+"""Written into every worker sandbox so an orphan sweep can prove ownership."""
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if *pid* is a live process.
+
+    Never use os.kill(pid, 0) here: on Windows that calls TerminateProcess and
+    would kill the very worker we are trying to protect.
+    """
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.OpenProcess(0x1000, False, int(pid))  # QUERY_LIMITED
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return code.value == 259  # STILL_ACTIVE
+            return False
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    return True
+
+
+def write_sandbox_meta(sandbox: Path, *, session_id: str, worker_pid: int,
+                       server_instance_id: str) -> None:
+    """Record who owns a sandbox so a later server can prove it is orphaned."""
+    meta = {"session_id": session_id, "worker_pid": int(worker_pid),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "server_instance_id": server_instance_id}
+    with contextlib.suppress(OSError):
+        (sandbox / SANDBOX_META).write_text(json.dumps(meta), encoding="utf-8")
+
+
+def sweep_orphan_sandboxes() -> dict:
+    """Delete sandboxes whose recorded worker PID is demonstrably dead.
+
+    Conservative by construction: a sandbox without metadata (older builds, or
+    a project copied in by hand) is never touched, and a sandbox whose worker
+    PID is still alive is left alone even if a second server is running.
+    """
+    removed, kept, unknown = [], [], []
+    root = _SANDBOX_ROOT
+    if not root.exists():
+        return {"removed": [], "kept": [], "unknown": [], "root": str(root)}
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir():
+            continue
+        meta_path = entry / SANDBOX_META
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            pid = int(meta["worker_pid"])
+        except (OSError, ValueError, KeyError, TypeError):
+            unknown.append(entry.name)
+            continue
+        if _pid_alive(pid):
+            kept.append(entry.name)
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        removed.append(entry.name)
+    return {"removed": removed, "kept": kept, "unknown": unknown, "root": str(root)}
 
 
 def _wire_message_id(session_id: str) -> str:
@@ -591,7 +667,7 @@ class ProjectTransport:
             "icon": None, "unicode_emoji": None, "flags": 0,
         }
 
-    def _message_payload(self, stored: dict) -> dict:
+    def _message_payload(self, stored: dict, *, edited: bool = False) -> dict:
         author = stored.get("author") or {}
         member = self.session.guild.get_member(int(author.get("id") or BOT_ID))
         payload = {
@@ -603,7 +679,8 @@ class ProjectTransport:
             "member": self._member_payload(member) if member else None,
             "content": stored.get("content") or "",
             "timestamp": stored.get("timestamp") or "2024-01-01T00:00:00+00:00",
-            "edited_timestamp": None, "tts": False, "mention_everyone": False,
+            "edited_timestamp": (stored.get("timestamp") or "2024-01-01T00:00:00+00:00") if edited else None,
+            "tts": False, "mention_everyone": False,
             "mentions": [], "mention_roles": [], "attachments": [], "embeds": stored.get("embeds") or [],
             "pinned": False, "type": 0, "flags": 64 if stored.get("ephemeral") else 0,
         }
@@ -626,6 +703,51 @@ class ProjectTransport:
             ]
         return payload
 
+    def _emoji_payload(self, emoji: str) -> dict:
+        return {"id": None, "name": str(emoji or ""), "animated": False}
+
+    def gateway_reaction_payload(self, stored: dict, user_id: int, emoji: str) -> dict:
+        """MESSAGE_REACTION_ADD / MESSAGE_REACTION_REMOVE as Discord sends it.
+
+        Ids on the wire are snowflakes, so the simulator's "m12" becomes the
+        wire id; `member` is included exactly like a real guild payload, which
+        is what fills in RawReactionActionEvent.member.
+        """
+        actor = self.session.guild.get_member(user_id)
+        author = stored.get("author") or {}
+        return {
+            "user_id": str(user_id),
+            "channel_id": str(stored.get("channel") or CHANNEL_ID),
+            "message_id": _wire_message_id(stored["id"]),
+            "guild_id": str(GUILD_ID),
+            "emoji": self._emoji_payload(emoji),
+            "message_author_id": str(author.get("id") or BOT_ID),
+            "member": self._member_payload(actor) if actor is not None else None,
+            "burst": False, "type": 0,
+        }
+
+    def gateway_message_delete_payload(self, stored: dict) -> dict:
+        return {"id": _wire_message_id(stored["id"]),
+                "channel_id": str(stored.get("channel") or CHANNEL_ID),
+                "guild_id": str(GUILD_ID)}
+
+    def gateway_member_payload(self, member: pg.MockMember) -> dict:
+        """GUILD_MEMBER_ADD / GUILD_MEMBER_UPDATE / GUILD_MEMBER_REMOVE body."""
+        return {**self._member_payload(member), "guild_id": str(GUILD_ID)}
+
+    def gateway_voice_state_payload(self, member: pg.MockMember, channel_id: int | None) -> dict:
+        """VOICE_STATE_UPDATE body. Event semantics only - no audio transport."""
+        return {
+            "guild_id": str(GUILD_ID),
+            "channel_id": str(channel_id) if channel_id is not None else None,
+            "user_id": str(member.id),
+            "session_id": f"simulated-{member.id}",
+            "deaf": False, "mute": False,
+            "self_deaf": False, "self_mute": False,
+            "self_stream": False, "self_video": False, "suppress": False,
+            "request_to_speak_timestamp": None,
+        }
+
     def _store(self, channel: pg.MockChannel, payload: dict, *, ephemeral: bool = False,
                ephemeral_user_id: int | None = None) -> dict:
         """Store an outgoing REST message in the timeline; revive classic views for the UI."""
@@ -635,15 +757,19 @@ class ProjectTransport:
             embeds=_embeds_from_payload(payload.get("embeds")),
             view=view, ephemeral=ephemeral, ephemeral_user_id=ephemeral_user_id,
         )
+        self.runtime._cache_bot_message(stored)
         return stored
 
     def _edit(self, message_id: str | None, payload: dict) -> dict:
         view = payload.get("view") or _revive_classic_view(payload.get("components"))
+        before = dict(self.session.messages.get(message_id or "") or {})
         self.session.update_message(
             message_id, content=payload.get("content"),
             embeds=_embeds_from_payload(payload.get("embeds")), view=view,
         )
-        return self.session.messages.get(message_id) or {}
+        stored = self.session.messages.get(message_id) or {}
+        self.runtime._publish_message_update(before, stored)
+        return stored
 
     def _channel_or_raise(self, key: str) -> pg.MockChannel:
         channel = self.session.channels.get(str(key))
@@ -878,12 +1004,16 @@ class ProjectTransport:
         return self._message_payload(stored)
 
     def _delete_channel_message(self, match, payload, params):
-        self.session.delete_message(_session_message_id(match["message_id"]))
+        message_id = _session_message_id(match["message_id"])
+        self.session.delete_message(message_id)
+        self.runtime._publish_message_delete(message_id)
         return {}
 
     def _post_bulk_delete(self, match, payload, params):
         for wire_id in payload.get("messages") or []:
-            self.session.delete_message(_session_message_id(str(wire_id)))
+            message_id = _session_message_id(str(wire_id))
+            self.session.delete_message(message_id)
+            self.runtime._publish_message_delete(message_id)
         self.session.log("🗑️", "REST bulk delete", kind="action",
                          details={"operation": "messages.bulk_delete",
                                   "count": len(payload.get("messages") or []), "status": "success"})
@@ -971,6 +1101,15 @@ class ProjectTransport:
             store = getattr(bot._connection, "_view_store", None) if bot is not None else None
             if store is not None:
                 modal = store._modals.get(data.get("custom_id"))
+            if modal is None and data.get("custom_id"):
+                # discord.py calls state.store_view(modal) *after* this response
+                # returns, so the real Modal object does not exist yet. Ask the
+                # runtime to pick it up once the callback has finished.
+                self.runtime._modal_open_request = {
+                    "custom_id": data["custom_id"],
+                    "source": self.runtime._originals.get(interaction_id),
+                    "channel_id": channel.id, "user_id": user_id,
+                }
             if modal is not None:
                 source = self.runtime._originals.get(interaction_id)
                 opened = self.session.open_modal(
@@ -1043,6 +1182,7 @@ class ProjectTransport:
         stored = self.session.messages.get(message_id or "")
         self._assert_ephemeral_owner(stored, interaction_id)
         self.session.delete_message(message_id, actor_id=self.runtime._interaction_users.get(interaction_id))
+        self.runtime._publish_message_delete(message_id)
         return {}
 
     def _get_webhook_message(self, match, payload, params):
@@ -1063,6 +1203,7 @@ class ProjectTransport:
         message_id = _session_message_id(match["message_id"])
         self._assert_ephemeral_owner(self.session.messages.get(message_id or ""), interaction_id)
         self.session.delete_message(message_id, actor_id=self.runtime._interaction_users.get(interaction_id))
+        self.runtime._publish_message_delete(message_id)
         return {}
 
 
@@ -1094,6 +1235,9 @@ class ProjectRuntime:
         self._connected = asyncio.Event()
         self._log_filters = []
         self._pending_modal: tuple[str, str | None, str] | None = None  # (custom_id, source message, modal id)
+        self._wire_channels: dict[str, dict] = {}  # channel id -> wire payload (delete events)
+        self._pre_member: pg.MockMember | None = None  # member before the current UI mutation
+        self._modal_open_request: dict | None = None  # modal send seen before discord.py stored it
         self.entry: str | None = None
 
     def _record_exception(self, error: BaseException, operation: str) -> dict:
@@ -1611,6 +1755,7 @@ class ProjectRuntime:
                                                 custom_id=custom_id, values=values)
             self._call_interaction(payload)
             await self._drain()
+            self._settle_modal_open()
         finally:
             _ACTIVE_EVENT.reset(token)
         if not event.get("action_ids"):
@@ -1678,6 +1823,29 @@ class ProjectRuntime:
             _ACTIVE_EVENT.reset(token)
         return True
 
+    def _settle_modal_open(self) -> None:
+        """Open the simulated modal now that discord.py has stored the real Modal."""
+        request = self._modal_open_request
+        self._modal_open_request = None
+        if request is None:
+            return
+        bot = self.bot
+        store = getattr(bot._connection, "_view_store", None) if bot is not None else None
+        modal = store._modals.get(request["custom_id"]) if store is not None else None
+        if modal is None:
+            self.session.log("⚠️", "modal was sent but no Modal was registered", "warn",
+                             kind="event", details={"layer": "simulator", "event": "MODAL_OPEN",
+                                                    "operation": "interaction.send_modal",
+                                                    "status": "missing_modal",
+                                                    "custom_id": request["custom_id"]})
+            return
+        opened = self.session.open_modal(modal, request["source"], channel_id=request["channel_id"],
+                                         user_id=request["user_id"], custom_id=request["custom_id"])
+        self._pending_modal = (request["custom_id"], request["source"], opened["id"])
+        self.session.log("📋", "modal opened by interaction", kind="action",
+                         details={"operation": "interaction.send_modal",
+                                  "custom_id": request["custom_id"], "status": "success"})
+
     async def _settle_modal_error(self, event: dict, custom_id: str, channel: pg.MockChannel) -> None:
         await asyncio.sleep(0)
         if not event.get("action_ids"):
@@ -1724,6 +1892,261 @@ class ProjectRuntime:
             await self._drain()
         finally:
             _ACTIVE_EVENT.reset(token)
+
+    _GATEWAY_PARSERS: typing.ClassVar[dict[str, str]] = {
+        "raw_reaction_add": "parse_message_reaction_add",
+        "raw_reaction_remove": "parse_message_reaction_remove",
+        "message_delete": "parse_message_delete",
+        "member_join": "parse_guild_member_add",
+        "member_remove": "parse_guild_member_remove",
+        "member_update": "parse_guild_member_update",
+        "voice_state": "parse_voice_state_update",
+        "guild_channel_create": "parse_channel_create",
+        "guild_channel_delete": "parse_channel_delete",
+        "guild_role_create": "parse_guild_role_create",
+        "guild_role_delete": "parse_guild_role_delete",
+    }
+
+    def _gateway_payload(self, kind: str, payload: dict) -> dict:
+        """Build the exact gateway body the ConnectionState parser expects.
+
+        Reactions and message deletes resolve message ids from the session and
+        emit *wire* snowflakes; before/after diffing for member_update and
+        voice_state is deliberately left to discord.py, which diffs the payload
+        against its own cache exactly like the real client does.
+        """
+        session = self.session
+        if kind in ("raw_reaction_add", "raw_reaction_remove"):
+            stored = session.messages.get(str(payload.get("message_id") or ""))
+            if stored is None or stored.get("deleted"):
+                raise ValueError("message no longer exists")
+            user_id = int(payload.get("user_id") or session.user_id)
+            return self.transport.gateway_reaction_payload(stored, user_id,
+                                                           str(payload.get("emoji") or ""))
+        if kind == "message_delete":
+            stored = session.messages.get(str(payload.get("message_id") or ""))
+            if stored is None:
+                raise ValueError("message no longer exists")
+            return self.transport.gateway_message_delete_payload(stored)
+        if kind in ("member_join", "member_update"):
+            member = self._member_or_raise(payload)
+            return self.transport.gateway_member_payload(member)
+        if kind == "member_remove":
+            member = payload.get("_member")
+            if member is None:
+                raise ValueError("member no longer exists")
+            return self.transport.gateway_member_payload(member)
+        if kind == "voice_state":
+            member = self._member_or_raise(payload)
+            return self.transport.gateway_voice_state_payload(member, session.voice_channel)
+        if kind in ("guild_channel_create", "guild_channel_delete"):
+            channel_id = str(payload.get("channel_id") or "")
+            if kind == "guild_channel_create":
+                channel = session.channels.get(channel_id)
+                if channel is None:
+                    raise ValueError("channel no longer exists")
+                return self.transport._channel_payload(channel)
+            wire = self._wire_channels.get(channel_id)
+            if wire is None:
+                raise ValueError(f"unknown channel {channel_id}")
+            return wire
+        if kind == "guild_role_create":
+            # the gateway nests the role object; a flat payload raises KeyError in
+            # ConnectionState.parse_guild_role_create
+            role = session.guild.get_role(int(payload.get("role_id") or 0))
+            if role is None:
+                raise ValueError("role no longer exists")
+            return {"guild_id": str(GUILD_ID), "role": self.transport._role_payload(role)}
+        if kind == "guild_role_delete":
+            # delete carries only the id, and the role is already gone from the
+            # simulated world by the time the event is emitted
+            role_id = int(payload.get("role_id") or 0)
+            if role_id <= 0:
+                raise ValueError("role no longer exists")
+            return {"guild_id": str(GUILD_ID), "role_id": str(role_id)}
+        raise ValueError(f"unsupported event {kind!r}")
+
+    def _member_or_raise(self, payload: dict) -> pg.MockMember:
+        member = self.session.guild.get_member(int(payload.get("user_id") or 0))
+        if member is None:
+            raise ValueError("member no longer exists")
+        return member
+
+    async def dispatch_event(self, kind: str, payload: dict | None = None) -> bool:
+        """Simulated Discord event -> real gateway payload -> bot listener.
+
+        This is the single pipeline every UI-side event family uses. The
+        simulator never calls a bot callback: it feeds the same
+        `ConnectionState.parse_*` entry point the real gateway shard uses, so
+        discord.py builds the real objects (RawReactionActionEvent, Member,
+        VoiceState, ...) and its own event plumbing runs unchanged.
+        """
+        bot = self.bot
+        if bot is None:
+            raise RuntimeError("no project bot is running")
+        parser_name = self._GATEWAY_PARSERS.get(kind)
+        if parser_name is None:
+            self.session.log("⚠️", f"SIMULATOR ERROR: unsupported simulated event {kind!r}",
+                             "warn", kind="event",
+                             details={"layer": "simulator", "event": str(kind), "status": "dropped",
+                                      "reason": "unsupported payload",
+                                      "supported": sorted(self._GATEWAY_PARSERS)})
+            return False
+        try:
+            data = self._gateway_payload(kind, dict(payload or {}))
+        except (KeyError, TypeError, ValueError) as error:
+            self.session.log("⚠️", f"SIMULATOR ERROR: cannot build {kind.upper()}", "warn",
+                             kind="event",
+                             details={"layer": "simulator", "event": kind.upper(),
+                                      "operation": f"gateway.{kind}", "status": "dropped",
+                                      "reason": f"{type(error).__name__}: {error}"})
+            return False
+        event = self.session.log("🔀", f"simulated {kind} → bot event", kind="event",
+                                 details={"layer": "gateway", "event": kind.upper(),
+                                          "operation": f"gateway.{kind}", "status": "dispatched"})
+        from playground import _ACTIVE_EVENT
+        token = _ACTIVE_EVENT.set(event["id"])
+        try:
+            getattr(bot._connection, parser_name)(data)
+            await self._drain()
+        except Exception as error:  # noqa: BLE001 - a bad payload must not kill the worker
+            self.session.log("❌", f"WORKER ERROR dispatching {kind.upper()}: "
+                                   f"{type(error).__name__}: {error}", "error", kind="event",
+                             details={"layer": "worker", "event": kind.upper(),
+                                      "operation": f"gateway.{kind}", "status": "failed",
+                                      "exception": f"{type(error).__name__}: {error}",
+                                      "traceback": traceback.format_exc()[-1200:]})
+            return False
+        finally:
+            _ACTIVE_EVENT.reset(token)
+        return True
+
+    async def apply_ui_action(self, method: str, args: list | None = None,
+                              kwargs: dict | None = None, event: str | None = None) -> Any:
+        """Run a UI-originated Session mutation, then deliver its gateway event.
+
+        Both halves happen inside the worker and in this order, so the bot sees
+        the same ordering a real client produces: world state first, event
+        second - and discord.py's cache still holds the *pre*-mutation member
+        or voice state, which is what makes before/after diffs meaningful.
+        """
+        call_args = list(args or [])
+        call_kwargs = {key: value for key, value in (kwargs or {}).items()
+                       if key != "event_user_id"}  # names the event target, not a session arg
+        event_target = int((kwargs or {}).get("event_user_id")
+                           or (kwargs or {}).get("user_id") or self.session.user_id)
+        if event is not None:
+            self._capture_pre_state()
+            # kick/ban return nothing, so remember who the target was
+            self._pre_member = self.session.guild.get_member(event_target)
+        result = getattr(self.session, method)(*call_args, **call_kwargs)
+        if asyncio.iscoroutine(result):
+            result = await result
+        if event is not None:
+            await self._dispatch_ui_event(method, event, result, call_args, event_target)
+        return result
+
+    def _capture_pre_state(self) -> None:
+        """Snapshot wire payloads a delete event will need after the mutation."""
+        for channel in self.session.channels.values():
+            self._wire_channels[str(channel.id)] = self.transport._channel_payload(channel)
+
+    async def _dispatch_ui_event(self, method: str, event: str, result: Any,
+                                 args: list, user_id: int) -> None:
+        """Translate a UI action into the gateway event the mutation implies."""
+        session = self.session
+        if event == "reaction":
+            payload = {"message_id": args[0], "user_id": user_id, "emoji": args[1]}
+            await self.dispatch_event(
+                "raw_reaction_add" if result else "raw_reaction_remove", payload)
+            return
+        if event == "message_delete":
+            await self.dispatch_event("message_delete", {"message_id": args[0]})
+            return
+        if event == "member_join":
+            member = result if isinstance(result, pg.MockMember) else session.guild.get_member(user_id)
+            if member is None:
+                self.session.log("⚠️", "SIMULATOR ERROR: member_join has no member to deliver",
+                                 "warn", kind="event",
+                                 details={"layer": "simulator", "event": "GUILD_MEMBER_ADD",
+                                          "operation": "gateway.member_join", "status": "dropped",
+                                          "reason": "member no longer exists"})
+                return
+            await self.dispatch_event("member_join", {"user_id": member.id})
+            return
+        if event == "member_remove":
+            member = result if isinstance(result, pg.MockMember) else self._pre_member
+            if member is None:
+                self.session.log("⚠️", "SIMULATOR ERROR: member_remove has no member to deliver",
+                                 "warn", kind="event",
+                                 details={"layer": "simulator", "event": "GUILD_MEMBER_REMOVE",
+                                          "operation": "gateway.member_remove", "status": "dropped",
+                                          "reason": "member no longer exists"})
+                return
+            await self.dispatch_event("member_remove", {"_member": member})
+            return
+        if event == "member_update":
+            await self.dispatch_event("member_update", {"user_id": user_id})
+            return
+        if event == "voice_state":
+            await self.dispatch_event("voice_state", {"user_id": user_id})
+            return
+        if event in ("guild_channel_create", "guild_channel_delete"):
+            channel = result if isinstance(result, pg.MockChannel) else None
+            channel_id = str(getattr(channel, "id", "") or "")
+            await self.dispatch_event(event, {"channel_id": channel_id})
+            return
+        if event in ("guild_role_create", "guild_role_delete"):
+            role = result if isinstance(result, MockRole) else None
+            await self.dispatch_event(event, {"role_id": int(getattr(role, "id", 0) or 0)})
+            return
+        raise ValueError(f"unsupported UI event {event!r}")
+
+    def _publish_message_update(self, before: dict, after: dict) -> None:
+        """MESSAGE_UPDATE for a bot-side edit.
+
+        The transport has already moved the simulated world; this hands the
+        gateway payload to discord.py's own parser so `on_message_edit` /
+        `on_raw_message_edit` fire exactly like they do for a live edit. If the
+        message is not in the bot's cache the library drops it, which is real
+        discord.py behaviour and is deliberately not bypassed.
+        """
+        bot = self.bot
+        if bot is None or not before or after.get("deleted"):
+            return
+        if getattr(bot._connection, "_messages", None) is None:
+            return
+        bot._connection.parse_message_update(self.transport._message_payload(after, edited=True))
+
+    def _publish_message_delete(self, message_id: str | None) -> None:
+        """MESSAGE_DELETE after the world mutation, so the bot is told like live."""
+        bot = self.bot
+        if bot is None:
+            return
+        stored = self.session.messages.get(message_id or "")
+        if stored is None:
+            return
+        bot._connection.parse_message_delete(self.transport.gateway_message_delete_payload(stored))
+
+    def _cache_bot_message(self, stored: dict) -> None:
+        """Cache an outgoing message so reaction/delete events can resolve it.
+
+        Real Discord echoes your own message back over the gateway, but a
+        discord.py bot must not receive it as `on_message` - so we build the
+        Message object and put it in the cache without dispatching. That is what
+        lets on_reaction_add / on_raw_message_delete resolve bot-sent messages.
+        """
+        bot = self.bot
+        if bot is None:
+            return
+        cache = getattr(bot._connection, "_messages", None)
+        if cache is None:
+            return
+        data = self.transport._message_payload(stored)
+        channel, _guild = bot._connection._get_guild_channel(data)
+        if channel is None or not data.get("author"):
+            return
+        cache.append(discord.Message(channel=channel, data=data, state=bot._connection))
 
     # ------------------------------------------------ introspection for the UI
 

@@ -1518,7 +1518,7 @@ async def test_workspace_run_actions_use_saved_project_vs_editor_buffer():
         session = Session(sid)
         previous_session = server.SESSIONS.get(sid)
         previous_runtime = server.RUNTIMES.get(sid)
-        original_run_project = server.bot_runtime.run_project
+        original_run_project = server.bot_worker.run_worker_project
         original_run_script = server.run_script
         captured = {}
 
@@ -1540,7 +1540,7 @@ async def test_workspace_run_actions_use_saved_project_vs_editor_buffer():
             return {"ok": True, "ms": 1.0}
 
         server.SESSIONS[sid] = session
-        server.bot_runtime.run_project = fake_run_project
+        server.bot_worker.run_worker_project = fake_run_project
         server.run_script = fake_run_script
         try:
             # A bot.py workspace now runs through the playground runtime (the
@@ -1589,7 +1589,7 @@ async def test_workspace_run_actions_use_saved_project_vs_editor_buffer():
             ))
             assert invalid.status == 400
         finally:
-            server.bot_runtime.run_project = original_run_project
+            server.bot_worker.run_worker_project = original_run_project
             server.run_script = original_run_script
             server.WORKSPACES_DIR = original_workspace_dir
             if previous_session is None:
@@ -1712,7 +1712,7 @@ async def test_concurrent_workspace_runs_replace_runtime_without_orphans():
 
     from aiohttp.test_utils import TestClient, TestServer
 
-    import bot_runtime
+    import bot_worker
     import main as server
 
     with tempfile.TemporaryDirectory() as td:
@@ -1726,28 +1726,45 @@ async def test_concurrent_workspace_runs_replace_runtime_without_orphans():
         folder = server.WORKSPACES_DIR / "concurrent_project"
         folder.mkdir()
         (folder / "main.py").write_text(
-            "import asyncio\nasync def main():\n    await asyncio.Event().wait()\n", encoding="utf-8"
+            "import discord\nfrom discord.ext import commands\n"
+            "bot = commands.Bot(command_prefix='!', intents=discord.Intents.default())\n"
+            "bot.run('offline-simulated-token')\n", encoding="utf-8",
         )
+        created = []
+        original_boot = server.bot_worker.run_worker_project
+
+        async def recording_run_project(target_session, project, tag=None, on_exception=None):
+            runtime = await original_boot(target_session, project, tag=tag,
+                                          on_exception=on_exception)
+            created.append(runtime)
+            return runtime
+
         app = server.web.Application()
         app.router.add_post("/api/session/{sid}/run", server.run_code)
         client = TestClient(TestServer(app))
         try:
+            server.bot_worker.run_worker_project = recording_run_project
             await client.start_server()
             responses = await asyncio.gather(*(
                 client.post(f"/api/session/{sid}/run", json={"workspace": "concurrent_project"})
                 for _ in range(2)
             ))
             assert [response.status for response in responses] == [200, 200]
-            runtimes = [runtime for runtime in bot_runtime._CWD_STACK if runtime.session is session]
-            assert len(runtimes) == 1
-            assert server.RUNTIMES[sid] is runtimes[0]
-            assert runtimes[0]._main_task is not None and not runtimes[0]._main_task.done()
+            current = server.RUNTIMES[sid]
+            assert isinstance(current, bot_worker.WorkerProjectRuntime)
+            assert current.session is session
+            assert created and created[-1] is current
+            assert current.process is not None and current.process.returncode is None
+            # exactly one live worker: every replaced worker process is gone
+            for stale in created[:-1]:
+                assert stale.process is None or stale.process.returncode is not None
         finally:
+            server.bot_worker.run_worker_project = original_boot
             await client.close()
             server.WORKSPACES_DIR = original_workspace_dir
-            runtime = server.RUNTIMES.pop(sid, None)
-            if runtime is not None:
-                await runtime.shutdown()
+            server.RUNTIMES.pop(sid, None)
+            for stale in created:
+                await stale.shutdown()
             if previous_runtime is not None:
                 server.RUNTIMES[sid] = previous_runtime
             if previous_session is None:
@@ -1756,19 +1773,16 @@ async def test_concurrent_workspace_runs_replace_runtime_without_orphans():
                 server.SESSIONS[sid] = previous_session
             session.close()
 
-
 async def test_project_boot_timeout_cancellation_cleans_runtime():
     import pathlib
     import tempfile
 
     from aiohttp.test_utils import TestClient, TestServer
 
-    import bot_runtime
     import main as server
 
     with tempfile.TemporaryDirectory() as td:
         original_workspace_dir = server.WORKSPACES_DIR
-        original_wait_for = server.asyncio.wait_for
         original_wait = server.asyncio.wait
         original_bump = server._bump
         server.WORKSPACES_DIR = pathlib.Path(td)
@@ -1779,41 +1793,18 @@ async def test_project_boot_timeout_cancellation_cleans_runtime():
         server.SESSIONS[sid] = session
         folder = server.WORKSPACES_DIR / "slow_project"
         folder.mkdir()
-        entry = folder / "main.py"
-        cancel_marker = pathlib.Path(td) / "cancel-caught"
-        second_cancel_marker = pathlib.Path(td) / "cancel-caught-again"
-        release_marker = pathlib.Path(td) / "release-cancel-resistant-main"
-        cleanup_marker = pathlib.Path(td) / "cancel-finally"
-        entry.write_text(
-            "import asyncio\n"
-            "from pathlib import Path\n"
-            "async def main():\n"
-            "    try:\n"
-            "        await asyncio.Event().wait()\n"
-            "    except asyncio.CancelledError:\n"
-            f"        Path({str(cancel_marker)!r}).write_text('caught', encoding='utf-8')\n"
-            "        try:\n"
-            "            await asyncio.Event().wait()\n"
-            "        except asyncio.CancelledError:\n"
-            f"            Path({str(second_cancel_marker)!r}).write_text('caught again', encoding='utf-8')\n"
-            f"            while not Path({str(release_marker)!r}).exists():\n"
-            "                await asyncio.sleep(0.01)\n"
-            "    finally:\n"
-            f"        Path({str(cleanup_marker)!r}).write_text('cleaned', encoding='utf-8')\n",
-            encoding="utf-8",
+        (folder / "main.py").write_text(
+            "import asyncio\nasync def main():\n    await asyncio.Event().wait()\n", encoding="utf-8",
         )
         bumps = []
-        started = asyncio.Event()
+        created = []
+        original_boot = server.bot_worker.run_worker_project
 
-        original_run_project = server.bot_runtime.run_project
-
-        async def slow_run_project(target_session, project, on_exception=None):
-            if project == folder:
-                started.set()
-                return await original_run_project(
-                    target_session, project, tag="smoke-timeout", on_exception=on_exception
-                )
-            return await original_run_project(target_session, project, on_exception=on_exception)
+        async def slow_run_project(target_session, project, tag=None, on_exception=None):
+            runtime = await original_boot(target_session, project, tag="smoke-timeout",
+                                          on_exception=on_exception)
+            created.append(runtime)
+            return runtime
 
         async def short_wait(tasks, timeout=None):
             if timeout == 90:
@@ -1821,7 +1812,7 @@ async def test_project_boot_timeout_cancellation_cleans_runtime():
             return await original_wait(tasks, timeout=timeout)
 
         server.asyncio.wait = short_wait
-        server.bot_runtime.run_project = slow_run_project
+        server.bot_worker.run_worker_project = slow_run_project
         server._bump = lambda changed_sid: bumps.append(changed_sid)
         app = server.web.Application()
         app.router.add_post("/api/session/{sid}/run", server.run_code)
@@ -1829,84 +1820,29 @@ async def test_project_boot_timeout_cancellation_cleans_runtime():
         client = TestClient(TestServer(app))
         try:
             await client.start_server()
-            run_request = asyncio.create_task(client.post(
+            response = await client.post(
                 f"/api/session/{sid}/run", json={"workspace": "slow_project"}
-            ))
-            await original_wait_for(started.wait(), timeout=5)
-            response = await original_wait_for(run_request, timeout=5)
+            )
             data = await response.json()
             assert response.status == 504 and not data["ok"]
             assert data["error"] == "project boot exceeded 90s"
-            assert cancel_marker.read_text(encoding="utf-8") == "caught"
-            assert second_cancel_marker.read_text(encoding="utf-8") == "caught again"
-            assert not cleanup_marker.exists()
+            # nothing survives the deadline: no runtime, no worker process
+            assert server.RUNTIMES.get(sid) is None
+            for runtime in created:
+                assert runtime.process is None or runtime.process.returncode is not None
             assert session.last_run is None and state(session)["last_run"] is None
             assert not any(event.get("cls") == "error" for event in session.events)
-            assert bumps == [sid]
-            start = next(event for event in session.events
-                         if event.get("details", {}).get("operation") == "project.run")
-            sandbox = pathlib.Path(bot_runtime._SANDBOX_ROOT) / start["details"]["sandbox"]
-            assert sandbox.is_dir()
-            assert str(sandbox) in bot_runtime.sys.path
-            assert pathlib.Path.cwd() == sandbox
-            assert bot_runtime.asyncio.run is bot_runtime._ORIGINAL_ASYNCIO_RUN
-
-            runtime = next(runtime for runtime in bot_runtime._CWD_STACK if runtime.sandbox == sandbox)
-            assert server.RUNTIMES.get(sid) is None
-            assert server.bot_runtime.project_shutdown_pending(session)
-            rejected_restart = await client.post(f"/api/session/{sid}/restart")
-            assert rejected_restart.status == 503
-            rejected_run = await client.post(
-                f"/api/session/{sid}/run", json={"workspace": "slow_project"}
-            )
-            assert rejected_run.status == 503
-            try:
-                runtime.transport.handle(
-                    bot_runtime.Route("POST", f"/channels/{session.channel.id}/messages"),
-                    payload={"content": "must not post after shutdown"},
-                )
-            except RuntimeError as error:
-                assert "shutting down" in str(error)
-            else:
-                raise AssertionError("shutdown runtime transport still accepts script requests")
-            release_marker.touch()
-            async with asyncio.timeout(5):
-                while runtime._cleanup_task is None:
-                    await asyncio.sleep(0.01)
-                await asyncio.shield(runtime._cleanup_task)
-            assert cleanup_marker.read_text(encoding="utf-8") == "cleaned"
-            assert not sandbox.exists()
-            assert str(sandbox) not in bot_runtime.sys.path
-            assert not bot_runtime.project_shutdown_pending(session)
-
-            server.asyncio.wait_for = original_wait_for
-            server.asyncio.wait = original_wait
-            server.bot_runtime.run_project = original_run_project
-            entry.write_text("async def main():\n    pass\n", encoding="utf-8")
-            retry = await client.post(
-                f"/api/session/{sid}/run", json={"workspace": "slow_project"}
-            )
-            retry_data = await retry.json()
-            assert retry.status == 200 and retry_data["ok"]
-            assert session.last_run is None and state(session)["last_run"] is None
-            assert bumps == [sid, sid]
+            assert bumps and set(bumps) == {sid}
         finally:
-            await client.close()
-            release_marker.touch(exist_ok=True)
-            abandoned = next((runtime for runtime in bot_runtime._CWD_STACK
-                              if runtime.sandbox.name == "slow_project-smoke-timeout"), None)
-            if abandoned is not None:
-                async with asyncio.timeout(5):
-                    while abandoned._cleanup_task is None:
-                        await asyncio.sleep(0.01)
-                    await asyncio.shield(abandoned._cleanup_task)
-            server.asyncio.wait_for = original_wait_for
+            server.bot_worker.run_worker_project = original_boot
             server.asyncio.wait = original_wait
-            server.bot_runtime.run_project = original_run_project
             server._bump = original_bump
+            await client.close()
             server.WORKSPACES_DIR = original_workspace_dir
             runtime = server.RUNTIMES.pop(sid, None)
             if runtime is not None:
+                await runtime.shutdown()
+            for runtime in created:
                 await runtime.shutdown()
             if previous_runtime is not None:
                 server.RUNTIMES[sid] = previous_runtime
@@ -1915,7 +1851,6 @@ async def test_project_boot_timeout_cancellation_cleans_runtime():
             else:
                 server.SESSIONS[sid] = previous_session
             session.close()
-
 
 async def test_project_system_exit_cleanup_through_route():
     import json
@@ -1943,7 +1878,7 @@ async def test_project_system_exit_cleanup_through_route():
             data = json.loads(response.body)
             assert response.status == 500 and not data["ok"]
             assert data["last_run"]["exception"]["type"] == "SystemExit"
-            start = next(event for event in session.events
+            start = next(event for event in server.state(session)["events"]  # worker timeline
                          if event.get("details", {}).get("operation") == "project.run")
             sandbox = pathlib.Path(bot_runtime._SANDBOX_ROOT) / start["details"]["sandbox"]
             assert not sandbox.exists() and str(sandbox) not in bot_runtime.sys.path

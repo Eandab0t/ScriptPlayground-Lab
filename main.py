@@ -30,6 +30,7 @@ from aiohttp import ClientError, ClientSession, ClientTimeout, web
 from aiohttp.web_log import AccessLogger
 
 import bot_runtime
+import bot_worker
 import bridge
 import env_discovery
 from playground import (
@@ -43,10 +44,23 @@ from playground import (
     reload_script,
     run_scenario,
     run_script,
-    state,
     validate_scenario,
 )
+from playground import (
+    state as _pg_state,
+)
 from project_state import validate_project
+
+
+def state(session: Session) -> dict:
+    """Project (worker) sessions render the worker's latest state snapshot."""
+    cached = getattr(session, "_project_state", None)
+    if cached is not None:
+        snapshot = dict(cached)
+        snapshot["sid"] = session.sid
+        snapshot["revision"] = getattr(session, "_project_seq", 0)
+        return snapshot
+    return _pg_state(session)
 
 log = logging.getLogger("playground")
 _MODULE_DIR = Path(__file__).resolve().parent
@@ -456,10 +470,39 @@ class _ProjectShutdownPending(Exception):
     """A prior in-process project ignored cancellation and still owns the session."""
 
 
+_BOT_MODE_PATTERNS = (
+    re.compile(r"\b(?:commands\.Bot|discord\.Client)\s*\("),
+    re.compile(r"\bclass\s+\w+\s*\(\s*(?:commands\.Bot|discord\.Client)\s*\)"),
+    re.compile(r"\b(?:bot|client)\.run\s*\("),
+)
+
+
+def _looks_like_discord_bot(source: str) -> bool:
+    """Discord Bot Mode: real discord.py construction/run, not playground helpers."""
+    if "discord" not in source:
+        return False
+    return any(pattern.search(source) for pattern in _BOT_MODE_PATTERNS)
+
+
+async def _boot_editor_bot(session: Session, code: str) -> dict:
+    """Run editor buffer bot code in an ephemeral worker sandbox (Bot Mode)."""
+    await _shutdown_runtime(session)
+    session.restart()
+    staging = Path(bot_runtime._SANDBOX_ROOT) / f"editor-{session.sid}-{secrets.token_hex(4)}"
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / "bot.py").write_text(code, encoding="utf-8")
+    try:
+        return await _boot_workspace_project(session, staging)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
 async def _shutdown_runtime(session: Session) -> None:
     old = RUNTIMES.pop(session.sid, None)
     if old is not None:
         await old.shutdown()
+    session._project_state = None
     if bot_runtime.project_shutdown_pending(session):
         raise _ProjectShutdownPending("previous hosted project is still shutting down")
 
@@ -469,7 +512,9 @@ async def _boot_workspace_project(session: Session, folder: Path) -> dict:
     await _shutdown_runtime(session)
     session.restart()
     boot = asyncio.create_task(
-        bot_runtime.run_project(session, folder, on_exception=lambda: _bump(session.sid))
+        (bot_runtime.run_project if bot_runtime._is_node_project(folder)
+         else bot_worker.run_worker_project)(session, folder,
+                                             on_exception=lambda: _bump(session.sid))
     )
 
     async def cancel_boot() -> None:
@@ -715,6 +760,9 @@ async def get_state(request: web.Request) -> web.Response:
 async def set_user(request: web.Request) -> web.Response:
     session = _get_session(request)
     body = await request.json()
+    early = await _project_session_op(request, "set_user", args=[int(body.get("user_id"))])
+    if early is not None:
+        return early
     try:
         session.set_user(int(body.get("user_id")))
     except (AttributeError, TypeError, ValueError):
@@ -726,6 +774,14 @@ async def set_user(request: web.Request) -> web.Response:
 async def add_member(request: web.Request) -> web.Response:
     session = _get_session(request)
     body = await request.json()
+    early = await _project_session_op(
+        request, "add_member", args=[body.get("username")],
+        kwargs={key: body[key] for key in
+                ("display_name", "bio", "avatar_url", "banner_url",
+                 "accent_color", "status") if key in body},
+        event="member_join")
+    if early is not None:
+        return early
     try:
         profile = {key: body[key] for key in ("display_name", "bio", "avatar_url", "banner_url",
                                                "accent_color", "status") if key in body}
@@ -741,6 +797,12 @@ async def add_member(request: web.Request) -> web.Response:
 async def update_member_profile(request: web.Request) -> web.Response:
     session = _get_session(request)
     body = await request.json()
+    target_id = int(request.match_info["user_id"])
+    early = await _project_session_op(
+        request, "update_member_profile", args=[target_id, body],
+        kwargs={"event_user_id": target_id}, event="member_update")
+    if early is not None:
+        return early
     try:
         user_id = int(request.match_info["user_id"])
         before = _member_before_snapshot(session.guild.get_member(user_id)
@@ -772,7 +834,11 @@ async def _run_code(session: Session, body: dict) -> web.Response:
             folder = _workspace_dir(workspace)
         except (web.HTTPBadRequest, web.HTTPNotFound):
             return web.json_response({"ok": False, "error": f"unknown workspace {workspace!r}"}, status=404)
-        if _workspace_entry(folder) is not None:
+        entry = _workspace_entry(folder)
+        if entry is not None and not _looks_like_discord_bot(
+                entry.read_text(encoding="utf-8", errors="replace")):
+            # Script Mode: playground-helper bot.py workspaces keep the mock
+            # runtime; real discord.py bots fall through to the hosted boot.
             # Slice 1: bot.py workspaces run through the playground runtime
             # (imports, cogs, cog slash commands). Folders with a different
             # entry (main.py) keep the hosted-project boot below.
@@ -791,14 +857,37 @@ async def _run_code(session: Session, body: dict) -> web.Response:
             return web.json_response({"ok": False, "error": str(error)}, status=503)
         except Exception as error:  # noqa: BLE001 - details were logged to the timeline
             last_run = session.last_run or {}
+            exception = last_run.get("exception") or {}
+            # worker boots report the ORIGINAL exception type (TimeoutError, SyntaxError, ...)
+            summary = (f"{exception.get("type")}: {exception.get("message")}"
+                       if exception.get("type") else f"{type(error).__name__}: {error}")
             return web.json_response({
-                "ok": False, "error": f"{type(error).__name__}: {error}", "last_run": last_run or None,
+                "ok": False, "error": summary, "last_run": last_run or None,
             }, status=500)
         finally:
             _disarm_workspace_watch(session)  # hosted projects dispatch through the runtime
     code = body.get("code") or ""
     if not code.strip():
         return web.json_response({"ok": False, "error": "Nothing to run — the editor is empty."}, status=400)
+    if _looks_like_discord_bot(code):
+        # Discord Bot Mode: run the editor buffer as a real bot in a worker.
+        _disarm_workspace_watch(session)
+        try:
+            return web.json_response(await _boot_editor_bot(session, code))
+        except _ProjectBootDeadline:
+            _bump(session.sid)
+            return web.json_response({"ok": False, "error": "project boot exceeded 90s"}, status=504)
+        except _ProjectShutdownPending as error:
+            return web.json_response({"ok": False, "error": str(error)}, status=503)
+        except Exception as error:  # noqa: BLE001 - details were logged to the timeline
+            last_run = session.last_run or {}
+            exception = last_run.get("exception") or {}
+            # worker boots report the ORIGINAL exception type (TimeoutError, SyntaxError, ...)
+            summary = (f"{exception.get("type")}: {exception.get("message")}"
+                       if exception.get("type") else f"{type(error).__name__}: {error}")
+            return web.json_response({
+                "ok": False, "error": summary, "last_run": last_run or None,
+            }, status=500)
     _disarm_workspace_watch(session)  # editor-driven Run owns the runtime again
     name = (body.get("name") or "").strip()
     script_file = _script_path(name) if name and _script_path(name).is_file() else None
@@ -826,6 +915,10 @@ async def _run_workspace_file(session: Session, body: dict) -> web.Response:
         _workspace_file(workspace, filename)
         if not code.strip():
             return web.json_response({"ok": False, "error": "Nothing to run — the active file is empty."}, status=400)
+        if _looks_like_discord_bot(code):
+            return web.json_response(
+                {"ok": False, "error": "This file is a real discord.py bot — press Run to boot it in Discord Bot Mode."},
+                status=409)
         await _shutdown_runtime(session)
         session.restart()
         folder = _workspace_dir(workspace)
@@ -896,6 +989,10 @@ async def reload_code(request: web.Request) -> web.Response:
     code = body.get("code") or ""
     if not code.strip():
         return web.json_response({"ok": False, "error": "Nothing to reload — the editor is empty."}, status=400)
+    if _looks_like_discord_bot(code):
+        return web.json_response(
+            {"ok": False, "error": "This script is a real discord.py bot — press Run to boot it in Discord Bot Mode."},
+            status=409)
     result = await reload_script(session, code, run_main=bool(body.get("run_main")))
     _bump(session.sid)
     return web.json_response({**result, "state": state(session)})
@@ -905,10 +1002,41 @@ def _runtime(session: Session) -> bot_runtime.ProjectRuntime | bot_runtime.NodeP
     return RUNTIMES.get(session.sid)
 
 
+async def _project_session_op(request: web.Request, method: str,
+                              args: list | None = None,
+                              kwargs: dict | None = None,
+                              event: str | None = None) -> web.Response | None:
+    """Forward a UI-side Session mutation into the bot worker; None = no worker.
+
+    `event` names the gateway event the mutation implies ("reaction",
+    "member_join", ...). The worker applies the mutation and then feeds the
+    matching fake gateway payload to the real bot, in that order.
+    """
+    session = _get_session(request)
+    runtime = _runtime(session)
+    if runtime is None:
+        return None
+    try:
+        await runtime.session_op(method, args, kwargs, event)
+    except bot_worker.WorkerTimeout:
+        return web.json_response(
+            {"ok": False, "error": "bot stopped responding — worker terminated"}, status=504)
+    except Exception as error:  # noqa: BLE001 - mirrors handler-specific errors
+        return web.json_response({"ok": False, "error": str(error)}, status=400)
+    _bump(session.sid)
+    return web.json_response({"ok": True, "state": state(session)})
+
+
 async def react(request: web.Request) -> web.Response:
     """Toggle the active simulated user's reaction on a timeline message."""
     session = _get_session(request)
     body = await request.json()
+    early = await _project_session_op(
+        request, "toggle_reaction",
+        args=[str(body.get("message_id") or ""), str(body.get("emoji") or "")],
+        kwargs={"user_id": session.user_id, "actor": "user"}, event="reaction")
+    if early is not None:
+        return early
     try:
         added = session.toggle_reaction(str(body.get("message_id") or ""),
                                         str(body.get("emoji") or ""),
@@ -938,6 +1066,12 @@ async def voice(request: web.Request) -> web.Response:
     """Simulated voice state change (join/leave/mute/deafen) for the active user."""
     session = _get_session(request)
     body = await request.json()
+    early = await _project_session_op(
+        request, "voice_action",
+        kwargs={"action": str(body.get("action") or ""), "channel_id": body.get("channel_id")},
+        event="voice_state")
+    if early is not None:
+        return early
     try:
         result = session.voice_action(str(body.get("action") or ""),
                                       channel_id=body.get("channel_id"))
@@ -951,6 +1085,12 @@ async def upload(request: web.Request) -> web.Response:
     """Register a browser-side file upload (data URI; nothing leaves the machine)."""
     session = _get_session(request)
     body = await request.json()
+    early = await _project_session_op(
+        request, "add_upload",
+        args=[str(body.get("name") or "file"), int(body.get("size") or 0),
+              str(body.get("content_type") or ""), body.get("data_uri")])
+    if early is not None:
+        return early
     entry = session.add_upload(str(body.get("name") or "file"),
                                int(body.get("size") or 0),
                                str(body.get("content_type") or ""),
@@ -962,6 +1102,10 @@ async def upload(request: web.Request) -> web.Response:
 
 async def delete_upload(request: web.Request) -> web.Response:
     session = _get_session(request)
+    early = await _project_session_op(request, "delete_upload",
+                                      args=[int(request.match_info["index"])])
+    if early is not None:
+        return early
     try:
         session.delete_upload(int(request.match_info["index"]))
     except (KeyError, ValueError):
@@ -974,6 +1118,12 @@ async def create_channel(request: web.Request) -> web.Response:
     """User-driven channel creation (same model path bots use)."""
     session = _get_session(request)
     body = await request.json()
+    early = await _project_session_op(
+        request, "create_text_channel_ui",
+        args=[str(body.get("name") or ""), str(body.get("topic") or "")],
+        event="guild_channel_create")
+    if early is not None:
+        return early
     try:
         channel = session.create_text_channel_ui(str(body.get("name") or ""),
                                                   str(body.get("topic") or ""))
@@ -998,6 +1148,19 @@ async def moderate(request: web.Request) -> web.Response:
     user_id = str(body.get("user_id") or "")
     if not user_id.isdigit():
         return web.json_response({"ok": False, "error": "user_id required"}, status=400)
+    op_args = [int(user_id)]
+    if action == "timeout":
+        op_args.append(int(body.get("minutes") or 10))
+    method = {"kick": "kick_member", "leave": "remove_member", "ban": "ban_member",
+              "unban": "unban_member", "timeout": "timeout_member"}.get(action, "")
+    # the simulator recreates an unbanned user, so the world change is a join
+    event = {"kick_member": "member_remove", "remove_member": "member_remove",
+             "ban_member": "member_remove", "unban_member": "member_join",
+             "timeout_member": "member_update"}.get(method)
+    early = await _project_session_op(request, method, args=op_args,
+                                      kwargs={"event_user_id": int(user_id)}, event=event)
+    if early is not None:
+        return early
     member_before = session.guild.get_member(int(user_id))
     try:
         if action == "kick":
@@ -1029,6 +1192,10 @@ async def leave(request: web.Request) -> web.Response:
     user_id = str(body.get("user_id") or "")
     if not user_id.isdigit():
         return web.json_response({"ok": False, "error": "user_id required"}, status=400)
+    early = await _project_session_op(request, "remove_member", args=[int(user_id)],
+                                      event="member_remove")
+    if early is not None:
+        return early
     try:
         member = session.remove_member(int(user_id))
     except ValueError as error:
@@ -1042,6 +1209,12 @@ async def member_roles(request: web.Request) -> web.Response:
     """Grant/revoke a role on a simulated member (fires on_member_update)."""
     session = _get_session(request)
     body = await request.json()
+    early = await _project_session_op(
+        request, "revoke_role" if body.get("op") == "revoke" else "grant_role",
+        args=[int(body.get("user_id") or 0), int(body.get("role_id") or 0)],
+        kwargs={"event_user_id": int(body.get("user_id") or 0)}, event="member_update")
+    if early is not None:
+        return early
     try:
         user_id = int(body.get("user_id"))
         role_id = int(body.get("role_id"))
@@ -1063,6 +1236,12 @@ async def guild_roles(request: web.Request) -> web.Response:
     session = _get_session(request)
     body = await request.json()
     action = str(body.get("op") or "create")
+    early = await _project_session_op(
+        request, "delete_role" if action == "delete" else "create_role",
+        args=[int(body.get("role_id") or 0)] if action == "delete" else [str(body.get("name") or "")],
+        event="guild_role_delete" if action == "delete" else "guild_role_create")
+    if early is not None:
+        return early
     try:
         if action == "delete":
             role = session.delete_role(int(body.get("role_id")))
@@ -1077,10 +1256,33 @@ async def guild_roles(request: web.Request) -> web.Response:
                               "state": state(session)})
 
 
+async def delete_message(request: web.Request) -> web.Response:
+    """User-initiated message delete: world mutation *and* a real MESSAGE_DELETE."""
+    session = _get_session(request)
+    body = await request.json()
+    message_id = str(body.get("message_id") or "")
+    early = await _project_session_op(request, "delete_message", args=[message_id],
+                                      event="message_delete")
+    if early is not None:
+        return early
+    try:
+        session.delete_message(message_id, actor_id=session.user_id)
+    except (KeyError, ValueError, discord.Forbidden) as error:
+        return web.json_response({"ok": False, "error": str(error)}, status=400)
+    _notify_event(session, "message_delete", {"message_id": message_id})
+    _bump(session.sid)
+    return web.json_response({"ok": True, "state": state(session)})
+
+
 async def delete_channel(request: web.Request) -> web.Response:
     """User-driven channel deletion (fires on_guild_channel_delete)."""
     session = _get_session(request)
     body = await request.json()
+    early = await _project_session_op(request, "delete_channel_ui",
+                                      args=[str(body.get("channel_id") or "")],
+                                      event="guild_channel_delete")
+    if early is not None:
+        return early
     try:
         channel = session.delete_channel_ui(str(body.get("channel_id") or ""))
     except discord.Forbidden as error:
@@ -1102,6 +1304,20 @@ async def simulate_event(request: web.Request) -> web.Response:
     payload = body.get("payload") or {}
     if not isinstance(payload, dict):
         return web.json_response({"ok": False, "error": "payload must be an object"}, status=400)
+    runtime = _runtime(session)
+    if runtime is not None:
+        # Discord Bot Mode: hand the payload to the fake gateway, which feeds
+        # the real discord.py ConnectionState parser.
+        try:
+            delivered = await runtime.dispatch_event(kind, payload)
+        except bot_worker.WorkerTimeout:
+            return web.json_response(
+                {"ok": False, "error": "bot stopped responding — worker terminated"}, status=504)
+        except Exception as error:  # noqa: BLE001 - mirrors handler-specific errors
+            return web.json_response({"ok": False, "error": str(error)}, status=400)
+        _bump(session.sid)
+        return web.json_response({"ok": True, "delivered": delivered, "kind": kind,
+                                  "state": state(session)})
     result = await dispatch_event(session, kind, payload)
     _bump(session.sid)
     return web.json_response(result)
@@ -1281,6 +1497,14 @@ def enable_auto_shutdown(app: web.Application) -> None:
 
 async def on_startup(app: web.Application) -> None:
     global _WORKSPACE_WATCH_TASK
+
+    # Sandboxes whose worker process is provably gone (server was killed,
+    # machine rebooted). Metadata-free directories are never touched, so a
+    # second server cannot delete a live session's files.
+    swept = bot_worker.sweep_orphan_sandboxes()
+    if swept["removed"] or swept["kept"]:
+        log.info("sandbox sweep: %d orphaned removed, %d active kept, %d without metadata",
+                 len(swept["removed"]), len(swept["kept"]), len(swept["unknown"]))
     _bump._loop = asyncio.get_running_loop()
     if _WORKSPACE_WATCH_TASK is None or _WORKSPACE_WATCH_TASK.done():
         _WORKSPACE_WATCH_TASK = asyncio.create_task(_watch_workspace_files(app))
@@ -1380,6 +1604,7 @@ def build_app(*, auto_shutdown: bool = False, data_dir: Path | None = None) -> w
     app.router.add_post("/api/session/{sid}/members/roles", member_roles)
     app.router.add_post("/api/session/{sid}/roles", guild_roles)
     app.router.add_post("/api/session/{sid}/channels/delete", delete_channel)
+    app.router.add_post("/api/session/{sid}/messages/delete", delete_message)
     app.router.add_get("/api/session/{sid}/ws", websocket)
     if STATIC_DIR.exists():
         app.router.add_static("/static/", STATIC_DIR)

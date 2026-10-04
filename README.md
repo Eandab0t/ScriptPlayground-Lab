@@ -203,6 +203,34 @@ Everything else is *real discord.py*: build `discord.Embed`s, `discord.ui.View`s
 mocks only the transport — `interaction.response.send_message(...)`,
 `channel.send(...)`, `message.edit(...)` — and renders what you gave it.
 
+> **ScriptPlayground runs ordinary `discord.py` bots against an isolated,
+> offline simulated Discord environment.** It is not a Discord emulator and it
+> never connects to Discord. See `docs/COMPATIBILITY.md` for the honest support
+> matrix (including what is only partially simulated).
+
+## Two run modes
+
+**Discord Bot Mode** (default for real bots). Paste an ordinary `discord.py`
+bot into the editor — `commands.Bot`, `bot.run("fake-token")`, cogs, Views,
+Modals — and press **Run**. Simulated user actions (reactions, member joins
+and edits, voice, channel and role changes) reach the bot as real gateway
+events, so `on_raw_reaction_add`, `on_member_join`, `on_voice_state_update` and
+friends fire through discord.py's own dispatch. The module is imported inside an isolated **worker
+process** (private sandbox cwd, private `sys.path`, private event loop); all
+Discord networking is intercepted, so `bot.run()` never contacts discord.com
+and the token is a placeholder. Simulated messages, slash commands, component
+clicks and gateway events are dispatched through the *real* discord.py
+machinery (`bot.process_commands`, `Interaction`, `Command`), and everything
+the bot sends is recorded in the simulated world.
+
+**Script Mode** (legacy). The module-with-hooks style above: `async def main()`,
+`send(...)`, `on_click`, `app_commands` functions. Use it for UI prototyping of
+interactions without writing a full bot.
+
+The mode is detected from the source: code that constructs `commands.Bot` /
+`discord.Client` or calls `bot.run(...)` runs as a bot (including inside a
+`bot.py` workspace); everything else stays on the mock script runtime.
+
 ## What's mocked
 
 | Real Discord | Playground stand-in |
@@ -227,10 +255,15 @@ Members' IDs and names are listed in `playground.py` (`USER_ID`, `MEMBER_IDS`,
 
 ## Good to know
 
-- **Handlers run on a dedicated event-loop thread per session.** CPU-bound
-  startup code is interrupted by a deadline, while a wedged async script is
-  cancelled on timeout; **↻ Restart** also cancels the old runtime before
-  creating a new one.
+- **Script Mode handlers run on a dedicated event-loop thread per session.**
+  CPU-bound startup code is interrupted by a deadline, while a wedged async
+  script is cancelled on timeout; **↻ Restart** also cancels the old runtime
+  before creating a new one.
+- **Discord Bot Mode runs each bot in its own OS process** (see above). A wedged
+  or CPU-spinning bot is *killed* (not merely cancelled): the server enforces a
+  boot deadline and a per-operation deadline, then terminates — and kills — the
+  worker, so the server itself always stays responsive. **↻ Restart** or a new
+  **Run** launches a clean worker.
 - **Runtime state is bounded:** scripts are capped at 1 MB, the timeline retains
   2,000 messages, and the console retains 1,000 events. The browser uses the
   websocket for instant updates and falls back to polling only when it disconnects.
@@ -242,7 +275,16 @@ Members' IDs and names are listed in `playground.py` (`USER_ID`, `MEMBER_IDS`,
 - Mentions (`<@id>`, `<@&id>`, `<#id>`) resolve against the fixture members, roles, and live channels.
 - The old bot features (credits economy, script library/showcase, `/plot`,
   SQLite storage) were removed in the pivot — this is now a *UI prototyping
-  tool*, not a runnable bot. The git history still has them.
+  tool*, not a deployment target. The git history still has them.
+- **What this is (and is not):** it runs ordinary `discord.py` bots against an
+  *offline simulated Discord world* — real `discord.py` objects, fake network.
+  It never connects to real Discord and is not meant to be deployed. Voice is
+  event-only: `on_voice_state_update` fires, but no audio is transported. See
+  `docs/COMPATIBILITY.md` for the supported API surface and known limits.
+- **Some events need the intents the real library needs.** Reactions that
+  resolve the cached message (`on_reaction_add`, `on_message_delete`) need
+  `message_content`; member and voice events need the privileged `members`
+  intent. Without them discord.py drops the payload, exactly as it does live.
 
 ## Architecture
 
