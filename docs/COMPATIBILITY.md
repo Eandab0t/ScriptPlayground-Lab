@@ -78,10 +78,45 @@ Empty rows are not invitations to complete Discord.
 | Worker crash / CPU timeout / restart | terminate → kill | yes | n/a | Supported |
 | Typing | — | — | — | Not implemented |
 | Presence | — | — | — | Not implemented |
-| Threads | — | — | — | Not implemented |
+| Threads: `create_thread`, `fetch_channel`, `thread.send` | `POST /channels/{id}/threads`, `GET /channels/{id}`, `POST /channels/{id}/messages` | yes (create/archive/delete from the sidebar) | yes | Supported |
+| Thread gateway events | THREAD_CREATE / THREAD_UPDATE / THREAD_DELETE / THREAD_MEMBERS_UPDATE -> `parse_thread_*` | yes | yes | Supported |
 | Bulk message delete events | REST bulk delete mutates the world | no UI | no | Partially supported (world only, no event) |
 | Real voice audio (UDP/voice protocol) | — | — | — | Not simulated by design |
 | Real Discord gateway / REST | never contacted | — | — | Never contacted |
+
+### Threads: what is and is not modelled
+
+The threads above are proven by `tests/test_acceptance.py`. A few behaviours
+are real discord.py semantics that the simulator mirrors instead of hiding,
+and they are worth knowing before you rely on them:
+
+* **A bot-created thread is not in `guild._threads`.** Discord does not echo
+  `THREAD_CREATE` to the client that created the thread, and discord.py agrees:
+  `TextChannel.create_thread` returns a `Thread` without calling
+  `guild._add_thread`. So after `await channel.create_thread(...)`,
+  `bot.get_channel(thread.id)` is `None`; use `bot.fetch_channel(thread.id)`
+  or the returned object. This is the live library's behaviour.
+* **Threads reach `guild._threads` through the gateway.** When a *simulated
+  user* opens a thread from the browser, the resulting `THREAD_CREATE` is what
+  populates the cache. That is the only path that makes `guild.get_thread()`
+  work, and it is why the archive/delete lifecycle is driven from the UI.
+* **Archiving evicts the thread from the cache.** `parse_thread_update` calls
+  `guild._remove_thread(thread)` once `archived` is true, so a later delete of
+  that same thread reaches only `raw_thread_delete`, not `thread_delete`.
+  `on_thread_delete` therefore fires for a thread that is still live.
+* **`thread.message_count` only advances on `THREAD_UPDATE`.** Sending a
+  message into a thread does not change the cached count, exactly as on live
+  Discord.
+* **`THREAD_MEMBER_UPDATE` (join/leave yourself) is Wired, not Supported.**
+  `parse_thread_member_update` sets `thread.me` and dispatches no event, so
+  there is nothing for a bot callback to observe. `THREAD_MEMBERS_UPDATE` -
+  another member joining - does dispatch `thread_member_join`, and that is
+  Supported.
+
+Deliberately not implemented: forum channels and tags, thread starter messages,
+thread list sync and the active/archived thread listing endpoints, auto-archive
+timers, and any thread behaviour outside the five operations above. Empty rows
+remain backlog, not invitations.
 
 ### Worker termination taxonomy
 

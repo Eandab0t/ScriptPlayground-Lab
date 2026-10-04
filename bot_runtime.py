@@ -157,6 +157,13 @@ def sweep_orphan_sandboxes() -> dict:
     return {"removed": removed, "kept": kept, "unknown": unknown, "root": str(root)}
 
 
+def _iso(value) -> str:
+    """ISO-8601 for a payload field; discord.py parses these with parse_time."""
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
 def _wire_message_id(session_id: str) -> str:
     n = int(str(session_id).lstrip("m"))
     return str(_WIRE_BASE + n)
@@ -555,6 +562,9 @@ class ProjectTransport:
             ("PATCH", "/channels/{channel_id}"): self._patch_channel,
             ("DELETE", "/channels/{channel_id}"): self._delete_channel,
             ("POST", "/channels/{channel_id}/messages"): self._post_channel_messages,
+            # threads: discord.py start_thread_without_message / _with_message
+            ("POST", "/channels/{channel_id}/threads"): self._post_channel_threads,
+            ("POST", "/channels/{channel_id}/messages/{message_id}/threads"): self._post_message_threads,
             ("GET", "/channels/{channel_id}/messages"): self._get_channel_messages,
             ("POST", "/channels/{channel_id}/messages/bulk-delete"): self._post_bulk_delete,
             ("GET", "/channels/{channel_id}/messages/{message_id}"): self._get_channel_message,
@@ -650,7 +660,75 @@ class ProjectTransport:
             "communication_disabled_until": None, "flags": 0,
         }
 
+    def _thread_payload(self, thread: pg.MockThread, *, newly_created: bool = False) -> dict:
+        """A Thread object payload, shaped like the real gateway/REST body.
+
+        ``Thread._from_data`` needs parent_id/owner_id/message_count/
+        member_count plus a ``thread_metadata`` block; ``_update`` only needs
+        the metadata and a name, which is all THREAD_UPDATE carries.
+        """
+        payload = {
+            "id": str(thread.id),
+            "guild_id": str(GUILD_ID),
+            "parent_id": str(thread.parent_id),
+            "owner_id": str(thread.owner_id),
+            "name": thread.name,
+            "type": int(thread.thread_type),
+            "last_message_id": thread.last_message_id,
+            "message_count": int(thread.message_count),
+            "member_count": 1,
+            "total_message_sent": int(thread.message_count),
+            "rate_limit_per_user": 0,
+            "slowmode_delay": 0,
+            "flags": 0,
+            "applied_tags": [],
+            "thread_metadata": {
+                "archived": bool(thread.archived),
+                "auto_archive_duration": int(thread.auto_archive_duration),
+                "archive_timestamp": _iso(thread.archived_at or thread.created_at),
+                "create_timestamp": _iso(thread.created_at),
+                "locked": bool(thread.locked),
+                "invitable": bool(thread.invitable),
+            },
+            "member": {"id": str(self.session.guild.me.id),
+                       "join_timestamp": _iso(thread.created_at), "flags": 0},
+        }
+        if newly_created:
+            # Discord sets this flag on THREAD_CREATE. discord.py dispatches
+            # `thread_create` only when it is set, `thread_join` otherwise.
+            payload["newly_created"] = True
+        return payload
+
+    def gateway_thread_create_payload(self, thread: pg.MockThread, *, newly_created: bool) -> dict:
+        return self._thread_payload(thread, newly_created=newly_created)
+
+    def gateway_thread_update_payload(self, thread: pg.MockThread) -> dict:
+        return self._thread_payload(thread)
+
+    def gateway_thread_delete_payload(self, thread: pg.MockThread) -> dict:
+        """THREAD_DELETE carries ids and the channel type, nothing else."""
+        return {"id": str(thread.id), "guild_id": str(GUILD_ID),
+                "parent_id": str(thread.parent_id), "type": int(thread.thread_type)}
+
+    def gateway_thread_members_update_payload(self, thread: pg.MockThread, *,
+                                              added: list | None = None,
+                                              removed: list | None = None) -> dict:
+        added_ids = [str(uid) for uid in (added or [])]
+        return {
+            "id": str(thread.id),
+            "guild_id": str(GUILD_ID),
+            # RawThreadMembersUpdate reads this key in its constructor
+            "member_count": 1 + len(added_ids),
+            "added_members": [{"id": uid, "user_id": uid,
+                               "join_timestamp": _iso(thread.created_at), "flags": 0}
+                              for uid in added_ids],
+            "removed_member_ids": [str(uid) for uid in (removed or [])],
+        }
+
     def _channel_payload(self, channel: pg.MockChannel) -> dict:
+        # a thread is its own payload shape (type 11/12/10 + thread_metadata)
+        if getattr(channel, "is_thread", False):
+            return self._thread_payload(channel)
         role_ids = {role.id for role in self.session.guild.roles}
         return {
             "id": str(channel.id), "type": 0, "guild_id": str(GUILD_ID), "name": channel.name,
@@ -845,7 +923,10 @@ class ProjectTransport:
         return self.runtime.guild_payload(include_members=True)
 
     def _get_guild_channels(self, match, payload, params):
-        return [self._channel_payload(channel) for channel in self.session.channels.values()]
+        # Discord's GET /guilds/{id}/channels is guild channels only; threads
+        # arrive via the `threads` array on GUILD_CREATE or via THREAD_CREATE.
+        return [self._channel_payload(channel) for channel in self.session.channels.values()
+                if not getattr(channel, "is_thread", False)]
 
     def _post_guild_channels(self, match, payload, params):
         channel = self.session.make_channel(payload.get("name") or "new-channel")
@@ -947,6 +1028,8 @@ class ProjectTransport:
 
     def _patch_channel(self, match, payload, params):
         channel = self._channel_or_raise(match["channel_id"])
+        if getattr(channel, "is_thread", False):
+            return self._patch_thread(channel, payload or {})
         if payload.get("name"):
             channel.name = payload["name"]
         if "topic" in payload:
@@ -961,9 +1044,80 @@ class ProjectTransport:
         self.session._touch()
         return self._channel_payload(channel)
 
+    def _patch_thread(self, thread: pg.MockThread, body: dict) -> dict:
+        """``thread.edit(...)`` goes through PATCH /channels/{id}; Discord answers
+        with a Thread payload, which is what discord.py rebuilds the object from."""
+        if body.get("name"):
+            thread.name = str(body["name"])
+        if "auto_archive_duration" in body:
+            thread.auto_archive_duration = int(body["auto_archive_duration"] or 1440)
+        if "locked" in body:
+            thread.locked = bool(body["locked"])
+        if "invitable" in body:
+            thread.invitable = bool(body["invitable"])
+        if "archived" in body:
+            # world change first, gateway event second, so discord.py still
+            # diffs against its own pre-change cache entry
+            before = self.runtime._wire_thread(thread)
+            self.session.set_thread_archived(thread.id, bool(body["archived"]))
+            self.runtime._publish_thread_update(before, thread)
+        self.session._touch()
+        return self._thread_payload(thread)
+
     def _delete_channel(self, match, payload, params):
+        channel = self._channel_or_raise(match["channel_id"])
+        if getattr(channel, "is_thread", False):
+            return self._delete_thread(channel)
         self.session.delete_channel(match["channel_id"])
         return {}
+
+    def _delete_thread(self, thread: pg.MockThread) -> dict:
+        """Deleting a thread is a world change plus THREAD_DELETE, in that order,
+        so discord.py can resolve the cached Thread for ``on_thread_delete``."""
+        allowed, reason = thread.permission_check(self.session.guild.me, "manage_threads")
+        if not allowed:
+            raise discord.Forbidden(f"missing manage_threads permission ({reason})")
+        before = self.runtime._wire_thread(thread)
+        self.session.delete_thread(thread.id)
+        self.runtime._publish_thread_delete(before)
+        self.session.log("\U0001f5d1\ufe0f", f"REST delete thread -> {thread.name}", kind="action",
+                         details={"operation": "thread.delete", "thread": thread.name,
+                                  "transport": "project-rest", "status": "success"})
+        return {}
+
+    def _thread_parent(self, match) -> pg.MockChannel:
+        parent = self.session.channels.get(str(match["channel_id"]))
+        if parent is None or getattr(parent, "is_thread", False):
+            raise RuntimeError("transport: cannot start a thread in this channel")
+        return parent
+
+    def _new_thread(self, parent: pg.MockChannel, body: dict):
+        # Discord answers 403 when the caller lacks the thread permission.
+        allowed, reason = parent.permission_check(self.session.guild.me, "create_public_threads")
+        if not allowed:
+            raise discord.Forbidden(f"missing create_public_threads permission ({reason})")
+        body = body or {}
+        # type 12 is a private thread; a thread started from a message is always
+        # public, which is why start_thread_with_message sends no type at all.
+        thread = self.session.make_thread(
+            parent.id, str(body.get("name") or "thread"),
+            thread_type=12 if body.get("type") in (None, 12) else int(body["type"]),
+            auto_archive_duration=int(body.get("auto_archive_duration") or 1440))
+        thread.invitable = bool(body.get("invitable", True))
+        self.session.log("\U0001f9f5", f"REST create thread -> {thread.name}", kind="action",
+                         details={"operation": "thread.create", "thread": thread.name,
+                                  "channel": parent.name, "transport": "project-rest",
+                                  "status": "success"})
+        return thread
+
+    def _post_channel_threads(self, match, payload, params):
+        # Discord does NOT echo THREAD_CREATE to the client that created it, so
+        # no gateway event is published here - that matches the live behaviour.
+        return self._thread_payload(self._new_thread(self._thread_parent(match), payload))
+
+    def _post_message_threads(self, match, payload, params):
+        self._message_or_raise(match["message_id"])
+        return self._thread_payload(self._new_thread(self._thread_parent(match), payload))
 
     def _post_typing(self, match, payload, params):
         channel = self._channel_or_raise(match["channel_id"])
@@ -1522,8 +1676,15 @@ class ProjectRuntime:
             payload.update({
                 "members": [self.transport._member_payload(member) for member in guild.members],
                 "channels": [self.transport._channel_payload(channel)
-                             for channel in session.channels.values()],
-                "presences": [], "voice_states": [], "threads": [], "stage_instances": [],
+                             for channel in session.channels.values()
+                             if not getattr(channel, "is_thread", False)],
+                # GUILD_CREATE carries active threads separately, and
+                # discord.py seeds guild._threads from this key.
+                "threads": [self.transport._thread_payload(thread)
+                            for thread in session.channels.values()
+                            if getattr(thread, "is_thread", False)
+                            and not thread.archived],
+                "presences": [], "voice_states": [], "stage_instances": [],
                 "guild_scheduled_events": [], "large": False,
                 "member_count": len(guild.members),
             })
@@ -1583,6 +1744,9 @@ class ProjectRuntime:
             else:
                 cached._update(payload)
         for channel in self.session.channels.values():
+            # threads live in guild._threads, never in the channel cache
+            if getattr(channel, "is_thread", False):
+                continue
             payload = self.transport._channel_payload(channel)
             if guild.get_channel(channel.id) is None:
                 bot._connection.parse_channel_create(payload)
@@ -1910,6 +2074,11 @@ class ProjectRuntime:
         "guild_channel_delete": "parse_channel_delete",
         "guild_role_create": "parse_guild_role_create",
         "guild_role_delete": "parse_guild_role_delete",
+        "thread_create": "parse_thread_create",
+        "thread_join": "parse_thread_create",
+        "thread_update": "parse_thread_update",
+        "thread_delete": "parse_thread_delete",
+        "thread_members_update": "parse_thread_members_update",
     }
 
     def _gateway_payload(self, kind: str, payload: dict) -> dict:
@@ -1969,6 +2138,27 @@ class ProjectRuntime:
             if role_id <= 0:
                 raise ValueError("role no longer exists")
             return {"guild_id": str(GUILD_ID), "role_id": str(role_id)}
+        if kind in ("thread_create", "thread_join", "thread_update", "thread_delete",
+                    "thread_members_update"):
+            thread_id = str(payload.get("thread_id") or "")
+            thread = session.channels.get(thread_id)
+            if kind == "thread_delete":
+                # the world mutation already removed it, so take the pre-delete
+                # snapshot the UI path captured - same as guild_channel_delete
+                wire = self._wire_channels.get(thread_id)
+                if wire is not None:
+                    return wire
+            if thread is None or not getattr(thread, "is_thread", False):
+                raise ValueError("thread no longer exists")
+            if kind in ("thread_create", "thread_join"):
+                return self.transport.gateway_thread_create_payload(
+                    thread, newly_created=(kind == "thread_create"))
+            if kind == "thread_update":
+                return self.transport.gateway_thread_update_payload(thread)
+            if kind == "thread_delete":
+                return self.transport.gateway_thread_delete_payload(thread)
+            return self.transport.gateway_thread_members_update_payload(
+                thread, added=payload.get("added") or [], removed=payload.get("removed") or [])
         raise ValueError(f"unsupported event {kind!r}")
 
     def _member_or_raise(self, payload: dict) -> pg.MockMember:
@@ -2096,6 +2286,14 @@ class ProjectRuntime:
         if event == "voice_state":
             await self.dispatch_event("voice_state", {"user_id": user_id})
             return
+        if event in ("thread_create", "thread_join", "thread_update", "thread_delete",
+                     "thread_members_update"):
+            thread = result if isinstance(result, pg.MockThread) else None
+            payload: dict = {"thread_id": str(getattr(thread, "id", "") or "")}
+            if event == "thread_members_update":
+                payload["added"] = list(args[1]) if len(args) > 1 else []
+            await self.dispatch_event(event, payload)
+            return
         if event in ("guild_channel_create", "guild_channel_delete"):
             channel = result if isinstance(result, pg.MockChannel) else None
             channel_id = str(getattr(channel, "id", "") or "")
@@ -2106,6 +2304,29 @@ class ProjectRuntime:
             await self.dispatch_event(event, {"role_id": int(getattr(role, "id", 0) or 0)})
             return
         raise ValueError(f"unsupported UI event {event!r}")
+
+    def _wire_thread(self, thread: pg.MockThread) -> dict:
+        """Snapshot a thread's wire payload before a bot-side mutation."""
+        return self.transport._thread_payload(thread)
+
+    def _publish_thread_update(self, before: dict, thread: pg.MockThread) -> None:
+        """THREAD_UPDATE after a bot-side archive/unarchive.
+
+        Discord broadcasts thread updates to everyone who can see the thread,
+        including the bot that made the change, so this is a genuine event and
+        discord.py still does its own before/after diff against its cache.
+        """
+        bot = self.bot
+        if bot is None:
+            return
+        bot._connection.parse_thread_update(self.transport.gateway_thread_update_payload(thread))
+
+    def _publish_thread_delete(self, wire: dict) -> None:
+        """THREAD_DELETE after the world mutation, so the bot is told like live."""
+        bot = self.bot
+        if bot is None:
+            return
+        bot._connection.parse_thread_delete(wire)
 
     def _publish_message_update(self, before: dict, after: dict) -> None:
         """MESSAGE_UPDATE for a bot-side edit.

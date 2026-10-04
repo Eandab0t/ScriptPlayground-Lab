@@ -1154,6 +1154,99 @@ async def create_channel(request: web.Request) -> web.Response:
                               "state": state(session)})
 
 
+async def _thread_body(request: web.Request) -> dict:
+    """JSON body, tolerating an empty POST - `request.json()` raises on one."""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 - an empty body is a valid "no options" POST
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+async def create_thread(request: web.Request) -> web.Response:
+    """A simulated user opens a thread (the action that emits THREAD_CREATE)."""
+    session = _get_session(request)
+    body = await _thread_body(request)
+    channel_id = str(body.get("channel_id") or session.channel.id)
+    early = await _project_session_op(
+        request, "make_thread",
+        args=[channel_id, str(body.get("name") or "thread")],
+        event="thread_create")
+    if early is not None:
+        return early
+    try:
+        thread = session.make_thread(int(channel_id), str(body.get("name") or "thread"))
+    except KeyError as error:
+        return web.json_response({"ok": False, "error": str(error)}, status=404)
+    except discord.Forbidden as error:
+        return web.json_response({"ok": False, "error": str(error)}, status=403)
+    _notify_event(session, "thread_create", {"thread_id": thread.id})
+    _bump(session.sid)
+    return web.json_response({"ok": True,
+                              "thread": {"id": str(thread.id), "name": thread.name,
+                                         "parent_id": str(thread.parent_id)},
+                              "state": state(session)})
+
+
+async def archive_thread(request: web.Request) -> web.Response:
+    """Archiving a thread emits THREAD_UPDATE, which discord.py turns into
+    on_thread_update with a real before/after pair."""
+    session = _get_session(request)
+    thread_id = request.match_info["thread_id"]
+    body = await _thread_body(request)
+    archived = bool(body.get("archived", True))
+    early = await _project_session_op(
+        request, "set_thread_archived",
+        args=[thread_id, archived], event="thread_update")
+    if early is not None:
+        return early
+    try:
+        session.set_thread_archived(thread_id, archived)
+    except KeyError:
+        return web.json_response({"ok": False, "error": "thread not found"}, status=404)
+    _notify_event(session, "thread_update", {"thread_id": thread_id})
+    _bump(session.sid)
+    return web.json_response({"ok": True, "state": state(session)})
+
+
+async def delete_thread(request: web.Request) -> web.Response:
+    """Deleting a thread emits THREAD_DELETE."""
+    session = _get_session(request)
+    thread_id = request.match_info["thread_id"]
+    early = await _project_session_op(
+        request, "delete_thread", args=[thread_id], event="thread_delete")
+    if early is not None:
+        return early
+    try:
+        session.delete_thread(thread_id)
+    except KeyError:
+        return web.json_response({"ok": False, "error": "thread not found"}, status=404)
+    _notify_event(session, "thread_delete", {"thread_id": thread_id})
+    _bump(session.sid)
+    return web.json_response({"ok": True, "state": state(session)})
+
+
+async def thread_members(request: web.Request) -> web.Response:
+    """Adding a member to a thread emits THREAD_MEMBERS_UPDATE."""
+    session = _get_session(request)
+    thread_id = request.match_info["thread_id"]
+    body = await _thread_body(request)
+    user_id = str(body.get("user_id") or session.user_id)
+    added = [] if user_id == str(session.guild.me.id) else [user_id]
+    early = await _project_session_op(
+        request, "thread_members",
+        args=[thread_id, added], event="thread_members_update")
+    if early is not None:
+        return early
+    thread = session.channels.get(str(thread_id))
+    if thread is None or not getattr(thread, "is_thread", False):
+        return web.json_response({"ok": False, "error": "thread not found"}, status=404)
+    _notify_event(session, "thread_members_update",
+                  {"thread_id": thread_id, "added": added})
+    _bump(session.sid)
+    return web.json_response({"ok": True, "state": state(session)})
+
+
 async def moderate(request: web.Request) -> web.Response:
     """Kick / ban / unban / timeout a simulated member with permission checks."""
     session = _get_session(request)
@@ -1621,6 +1714,10 @@ def build_app(*, auto_shutdown: bool = False, data_dir: Path | None = None) -> w
     app.router.add_post("/api/session/{sid}/members/roles", member_roles)
     app.router.add_post("/api/session/{sid}/roles", guild_roles)
     app.router.add_post("/api/session/{sid}/channels/delete", delete_channel)
+    app.router.add_post("/api/session/{sid}/threads", create_thread)
+    app.router.add_post("/api/session/{sid}/threads/{thread_id}/archive", archive_thread)
+    app.router.add_post("/api/session/{sid}/threads/{thread_id}/delete", delete_thread)
+    app.router.add_post("/api/session/{sid}/threads/{thread_id}/members", thread_members)
     app.router.add_post("/api/session/{sid}/messages/delete", delete_message)
     app.router.add_get("/api/session/{sid}/ws", websocket)
     if STATIC_DIR.exists():

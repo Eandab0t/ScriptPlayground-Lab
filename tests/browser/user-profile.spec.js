@@ -1,6 +1,7 @@
 const { test, expect } = require('@playwright/test');
 const fs = require('node:fs');
 const path = require('node:path');
+const ROOT_DIR = path.resolve(__dirname, '..', '..');
 
 let workspacePath;
 async function holdWorkspaceList(page) {
@@ -886,4 +887,93 @@ test('channel creation and member moderation menus work against the mock', async
   await page.locator('.new-channel-btn').click();
   await page.keyboard.press('Escape'); // dialog closes without creating
   await expect(page.locator('#new-channel-overlay')).not.toHaveClass(/open/);
+});
+
+/* ------------------------------------------------------------------ threads
+ *
+ * The user-facing flow: open a thread from a channel, talk inside it, then
+ * archive and delete it. The UI actions hit the same
+ * /api/session/{sid}/threads routes the acceptance suite drives, so this is
+ * checking that the simulated world's thread state is genuinely reachable
+ * from the browser. Gateway dispatch is asserted through the session state
+ * rather than the DOM, because the event console is a debugging surface.
+ */
+test('a thread opens, takes messages, archives and deletes from the sidebar', async ({ page }) => {
+  const workerSource = [
+    'import discord',
+    'from discord.ext import commands',
+    '',
+    'bot = commands.Bot(command_prefix="!", intents=discord.Intents.default())',
+    '',
+    '@bot.event',
+    'async def on_thread_create(thread):',
+    '    for channel in bot.guilds[0].text_channels:',
+    '        await channel.send("thread opened: " + thread.name)',
+    '        return',
+    '',
+    'bot.run("fake-token")',
+  ].join(String.fromCharCode(10));
+
+  const name = `thread-flow-${process.pid}-${Date.now()}`;
+  workspacePath = fs.mkdtempSync(path.join(ROOT_DIR, 'bots', `${name}-`));
+  const workspaceName = path.basename(workspacePath);
+  fs.writeFileSync(path.join(workspacePath, 'bot.py'), workerSource);
+
+  await page.evaluate(() => loadWorkspaces());
+  await page.locator('#workspace-select').selectOption(workspaceName);
+  await page.locator('#btn-connect').click();
+  await expect(page.locator('#editor-filename')).toHaveText('bot.py');
+  const booted = page.waitForResponse((response) =>
+    response.url().includes('/api/session/') && response.url().endsWith('/project')
+      && response.request().method() === 'POST');
+  await page.locator('#btn-run').click();
+  expect((await (await booted).json()).ok).toBe(true);
+  await expect.poll(async () => page.evaluate(async () =>
+    (await fetch(`/api/session/${SID}/state`)).json()
+      .then((s) => s.events.some((e) => /is ready in worker process/.test(e.text || '')))),
+    { timeout: 90000 }).toBe(true);
+
+  const gatewayEvents = async () => page.evaluate(async () =>
+    (await fetch(`/api/session/${SID}/state`)).json()
+      .then((s) => s.events.map((e) => e.details && e.details.event).filter(Boolean)));
+
+  // open a thread from the channel's context menu
+  await page.locator('.channel-row', { hasText: 'playground' }).first()
+    .click({ button: 'right' });
+  page.once('dialog', (dialog) => dialog.accept('design-talk'));
+  await page.locator('.ctx-item', { hasText: 'Start a thread' }).click();
+
+  const threadRow = page.locator('.channel-row.thread-row', { hasText: 'design-talk' });
+  await expect(threadRow).toBeVisible({ timeout: 30000 });
+  // the real THREAD_CREATE reached the bot, whose handler answered in-channel
+  await expect.poll(async () => (await gatewayEvents()).includes('THREAD_CREATE'),
+    { timeout: 30000 }).toBe(true);
+  await expect(page.locator('#timeline')).toContainText('thread opened: design-talk', { timeout: 30000 });
+
+  // talk inside it: the composer already targets the selected thread
+  await threadRow.click();
+  await page.locator('#composer-input').fill('hello from inside the thread');
+  await page.locator('#composer-input').press('Enter');
+  await expect(page.locator('#timeline')).toContainText('hello from inside the thread', { timeout: 30000 });
+
+  // archive
+  await page.locator('.channel-row.thread-row', { hasText: 'design-talk' })
+    .click({ button: 'right' });
+  await page.locator('.ctx-item', { hasText: 'Archive thread' }).click();
+  await expect(page.locator('.channel-row.thread-row.archived')).toHaveCount(1, { timeout: 30000 });
+  await expect.poll(async () => (await gatewayEvents()).includes('THREAD_UPDATE'),
+    { timeout: 30000 }).toBe(true);
+
+  // reopen, then delete
+  await page.locator('.channel-row.thread-row', { hasText: 'design-talk' })
+    .click({ button: 'right' });
+  await page.locator('.ctx-item', { hasText: 'Reopen thread' }).click();
+  await expect(page.locator('.channel-row.thread-row.archived')).toHaveCount(0, { timeout: 30000 });
+
+  await page.locator('.channel-row.thread-row', { hasText: 'design-talk' })
+    .click({ button: 'right' });
+  await page.locator('.ctx-item', { hasText: 'Delete thread' }).click();
+  await expect(page.locator('.channel-row.thread-row')).toHaveCount(0, { timeout: 30000 });
+  await expect.poll(async () => (await gatewayEvents()).includes('THREAD_DELETE'),
+    { timeout: 30000 }).toBe(true);
 });

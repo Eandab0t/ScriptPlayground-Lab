@@ -68,6 +68,8 @@
   /* ---------- channel sidebar ---------- */
   #sidebar { background: var(--bg1); display: flex; flex-direction: column; border-right: 1px solid var(--border); }
   #channel-list { flex: 1; min-height: 0; overflow-y: auto; padding-bottom: 10px; }
+  .channel-row.thread-row { padding-left: 26px; font-size: 13px; opacity: .92; }
+  .channel-row.thread-row.archived { opacity: .5; }
   .guild-head { height: 48px; flex: none; padding: 0 16px; font-weight: 700; color: var(--txt-head); font-size: 15px;
                 display: flex; align-items: center; justify-content: space-between; cursor: pointer;
                 box-shadow: 0 1px 0 rgba(0,0,0,.2), 0 1.5px 0 rgba(0,0,0,.1); }
@@ -1173,7 +1175,8 @@ function render(st) {
   actAs.innerHTML = "";
   for (const user of st.users || []) actAs.appendChild(new Option(user.name, user.id));
   actAs.value = String(st.user.id);
-  if (!currentChannel || !st.channels.some((c) => c.id == currentChannel)) {
+  const viewable = [...(st.channels || []), ...(st.threads || [])];
+  if (!currentChannel || !viewable.some((c) => c.id == currentChannel)) {
     currentChannel = st.channels.length ? st.channels[0].id : null;
   }
   renderChannels(st);
@@ -2411,8 +2414,11 @@ function renderMembers(st) {
 }
 
 function channelName(st) {
-  const c = (st.channels || []).find((c) => c.id == currentChannel);
+  const c = [...(st.channels || []), ...(st.threads || [])].find((c) => c.id == currentChannel);
   return c ? c.name : (st.channel ? st.channel.name : "playground");
+}
+function currentThread(st) {
+  return (st.threads || []).find((t) => t.id == currentChannel) || null;
 }
 
 function renderChannels(st) {
@@ -2484,14 +2490,52 @@ function renderChannels(st) {
     row.oncontextmenu = (event) => {
       event.preventDefault();
       openCtxMenu(event.currentTarget, [{
+        label: "Start a thread (simulates THREAD_CREATE)", danger: false,
+        run: () => startThreadDialog(c.id),
+      }, {
         label: "Delete channel (simulates on_guild_channel_delete)", danger: true,
         run: () => post("channels/delete", { channel_id: c.id }),
       }]);
     };
     channelItems.appendChild(row);
+    for (const t of (st.threads || []).filter((t) => t.parent_id == c.id)) {
+      const trow = document.createElement("div");
+      trow.className = "channel-row thread-row" + (t.id == currentChannel ? " active" : "");
+      const hash = document.createElement("span");
+      hash.textContent = t.archived ? "□" : "#";
+      const label = document.createElement("span");
+      label.textContent = t.name;
+      trow.append(hash, label);
+      if (t.archived) trow.classList.add("archived");
+      const total = st.messages.filter((m) => m.channel == t.id).length;
+      if (t.id == currentChannel) {
+        seenCounts[t.id] = total;
+      } else if (total > (seenCounts[t.id] || 0)) {
+        const badge = document.createElement("span");
+        badge.className = "unread";
+        const unread = total - (seenCounts[t.id] || 0);
+        badge.textContent = unread > 9 ? "9+" : unread;
+        trow.appendChild(badge);
+      }
+      unreadCounts[t.id] = total - (seenCounts[t.id] || 0);
+      trow.onclick = () => { currentChannel = t.id; lastRevision = ""; render(lastState); };
+      trow.oncontextmenu = (event) => {
+        event.preventDefault();
+        openCtxMenu(event.currentTarget, [
+          { label: t.archived ? "Reopen thread" : "Archive thread", danger: false,
+            run: () => post(`threads/${t.id}/archive`, { archived: !t.archived }) },
+          { label: "Delete thread (simulates THREAD_DELETE)", danger: true,
+            run: () => post(`threads/${t.id}/delete`, {}) },
+        ]);
+      };
+      channelItems.appendChild(trow);
+    }
   }
-  const channel = (st.channels || []).find((item) => item.id == currentChannel) || st.channel;
-  $("#chat-head-name").textContent = "# " + channelName(st);
+  const channel = [...(st.channels || []), ...(st.threads || [])]
+    .find((item) => item.id == currentChannel) || st.channel;
+  const activeThread = currentThread(st);
+  $("#chat-head-name").textContent = "# " + channelName(st)
+    + (activeThread ? ` · thread in #${activeThread.parent_name}` : "");
   $("#head-topic").textContent = channel?.topic || "";
   $("#head-topic").hidden = !channel?.topic;
   composerInput.placeholder = `Message #${channelName(st)} — type !ping, !hello, or / for commands`
@@ -3749,6 +3793,12 @@ function memberModerationItems(member) {
   ].filter(Boolean);
   return items;
 }
+function startThreadDialog(channelId) {
+  const name = window.prompt("Thread name", "new-thread");
+  if (!name) return;
+  post("threads", { channel_id: channelId, name });
+}
+
 function openNewChannelDialog() { $("#new-channel-overlay").classList.add("open"); $("#nc-name").value = ""; $("#nc-topic").value = ""; $("#nc-name").focus(); }
 function closeNewChannelDialog() { $("#new-channel-overlay").classList.remove("open"); }
 $("#nc-cancel").onclick = closeNewChannelDialog;

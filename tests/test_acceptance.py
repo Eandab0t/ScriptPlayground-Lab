@@ -1498,6 +1498,442 @@ def test_worker_termination_taxonomy_is_explicit():
     assert set(bot_worker.TERMINATION_REASONS) == {
         "stopped", "boot_failed", "boot_timeout", "timeout", "bot_exception", "crashed"}
 
+# ============================================================== threads
+#
+# A thread is created two ways, and the difference is real discord.py
+# behaviour rather than a simulator shortcut:
+#
+#   * the BOT creates one over REST. Discord does not echo THREAD_CREATE back
+#     to the creator, and discord.py agrees: TextChannel.create_thread returns
+#     a Thread without calling guild._add_thread (channel.py), so the thread is
+#     deliberately NOT in guild._threads and bot.get_channel() cannot see it.
+#     This slice proves create_thread / fetch_channel / thread.send.
+#   * a SIMULATED USER opens one from the browser. That is where Discord
+#     genuinely emits THREAD_CREATE, so the thread enters guild._threads and
+#     the cached path becomes provable: guild.get_thread(), on_thread_update
+#     with a real before/after, on_thread_delete, and user messages resolving
+#     to a real discord.Thread via guild._resolve_channel (which searches
+#     _channels *then* _threads).
+
+THREAD_BOT = """import discord
+from discord.ext import commands
+
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# bot-created threads, keyed by label
+made = {}
+# thread the simulated user opened, captured from the gateway event
+seen = {}
+
+
+async def _say(text):
+    for channel in bot.guilds[0].text_channels:
+        await channel.send(text)
+        return
+
+
+@bot.event
+async def on_thread_create(thread):
+    seen["thread_id"] = thread.id
+    print(f"thread_create {thread.name} id={thread.id}")
+    await _say(f"on_thread_create {thread.name} parent={thread.parent.name}")
+
+
+@bot.event
+async def on_thread_update(before, after):
+    await _say(f"on_thread_update {before.archived}->{after.archived}")
+
+
+@bot.event
+async def on_thread_delete(thread):
+    await _say(f"on_thread_delete {thread.name}")
+
+
+@bot.event
+async def on_thread_member_join(member):
+    await _say(f"on_thread_member_join {member.thread.name}")
+
+
+@bot.command()
+async def mkthread(ctx):
+    thread = await ctx.channel.create_thread(name="bot-thread",
+                                             auto_archive_duration=60)
+    made["bot"] = thread
+    print("made", thread.name, thread.id)
+    await ctx.send(f"mkthread {thread.name}")
+
+
+@bot.command()
+async def fetchthread(ctx):
+    thread = made["bot"]
+    fetched = await bot.fetch_channel(thread.id)
+    guild = bot.guilds[0]
+    print("fetched", fetched.id, type(fetched).__name__)
+    await ctx.send(f"fetchthread {fetched.name} real={isinstance(fetched, discord.Thread)} "
+                   f"in_cache={guild.get_thread(fetched.id) is not None}")
+
+
+@bot.command()
+async def sayinthread(ctx):
+    await made["bot"].send("hello from the bot thread")
+    await ctx.send("said")
+
+
+@bot.command()
+async def threadstate(ctx):
+    thread = made["bot"]
+    await ctx.send(f"threadstate archived={thread.archived} messages={thread.message_count}")
+
+
+@bot.command()
+async def archivethread(ctx):
+    updated = await made["bot"].edit(archived=True)
+    print("archived", updated.archived)
+    await ctx.send(f"archivethread {updated.archived}")
+
+
+@bot.command()
+async def deletethread(ctx):
+    await made["bot"].delete()
+    await ctx.send("deletethread done")
+
+
+bot.run("fake-token")
+"""
+
+THREAD_COG_BOT = """import discord
+from discord.ext import commands
+
+intents = discord.Intents.default()
+intents.message_content = True
+
+
+class ThreadCog(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    @commands.Cog.listener()
+    async def on_thread_create(self, thread):
+        for channel in self.bot.guilds[0].text_channels:
+            await channel.send(f"cog-saw {thread.name}")
+            return
+
+    @commands.Cog.listener()
+    async def on_thread_update(self, before, after):
+        for channel in self.bot.guilds[0].text_channels:
+            await channel.send(f"cog-update {before.archived}->{after.archived}")
+            return
+
+    @commands.Cog.listener()
+    async def on_thread_delete(self, thread):
+        for channel in self.bot.guilds[0].text_channels:
+            await channel.send(f"cog-delete {thread.name}")
+            return
+
+
+class Bot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=intents)
+
+    async def setup_hook(self):
+        await self.add_cog(ThreadCog(self))
+
+
+bot = Bot()
+bot.run("fake-token")
+"""
+
+# a bot that resolves the *user-created* (cached) thread, so before/after
+# diffing is exercised against discord.py's own cache
+THREAD_USER_BOT = """import discord
+from discord.ext import commands
+
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+@bot.command()
+async def usercached(ctx):
+    guild = bot.guilds[0]
+    thread = next((t for t in guild._threads.values() if t.name == "user-thread"), None)
+    if thread is None:
+        await ctx.send(f"usercached missing cached={sorted(guild._threads)}")
+        return
+    await ctx.send(f"usercached {thread.name} id={thread.id} "
+                   f"archived={thread.archived} messages={thread.message_count}")
+
+
+bot.run("fake-token")
+"""
+
+# a bot that proves a user message inside a thread arrives as a real Thread
+THREAD_INBOUND_BOT = """import discord
+from discord.ext import commands
+
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+async def _say(text):
+    for channel in bot.guilds[0].text_channels:
+        await channel.send(text)
+        return
+
+
+@bot.event
+async def on_message(message):
+    if message.channel.__class__.__name__ == "Thread":
+        thread = message.channel
+        await _say(f"in-thread {message.content} thread={thread.name} "
+                   f"real={isinstance(thread, discord.Thread)} parent={thread.parent.name}")
+
+
+bot.run("fake-token")
+"""
+
+
+def _threads_in(st):
+    return st.get("threads") or []
+
+
+def _thread(st, name):
+    return next((t for t in _threads_in(st) if t.get("name") == name), None)
+
+
+def _user_thread(sid, name="user-thread", channel_id=None):
+    """Simulated user opens a thread (the UI action that emits THREAD_CREATE)."""
+    st, resp = call("POST", f"/api/session/{sid}/threads",
+                    {"channel_id": channel_id, "name": name})
+    assert st == 200, resp
+    # the worker path returns the generic {"ok", "state"} envelope, so read the
+    # created thread out of state - the same view the browser renders
+    state = resp.get("state") or call("GET", f"/api/session/{sid}/state")[1]
+    thread = _thread(state, name)
+    assert thread is not None, resp
+    return thread
+
+
+def _user_message(sid, content, thread_id):
+    st, resp = call("POST", f"/api/session/{sid}/message",
+                    {"content": content, "channel_id": thread_id})
+    assert st == 200, resp
+
+
+@pytest.mark.timeout(300)
+def test_bot_creates_fetches_and_sends_in_a_thread(server):
+    """create_thread -> fetch_channel -> thread.send, all through fake REST."""
+    sid = ready_session(THREAD_BOT, "thread bot ready")
+    st = send_and_expect(sid, "!mkthread", "mkthread bot-thread")
+    assert "hello from the bot thread" not in _text(st)
+    thread = _thread(st, "bot-thread")
+    assert thread is not None, f"thread missing from state: {_threads_in(st)}"
+    assert thread["parent_id"] == st["channel"]["id"], thread
+    assert thread["archived"] is False, thread
+
+    # fetch_channel goes through GET /channels/{id} and the real
+    # _threaded_channel_factory, so the bot gets a genuine discord.Thread
+    call("POST", f"/api/session/{sid}/message", {"content": "!fetchthread"})
+    st = wait_for(sid, lambda s: any("fetchthread bot-thread" in (m.get("content") or "")
+                                     for m in s.get("messages", [])),
+                  label="fetchthread reply")
+    reply = next(m["content"] for m in st["messages"]
+                 if "fetchthread bot-thread" in m["content"])
+    assert "real=True" in reply, reply
+    # a REST-created thread is deliberately absent from discord.py's thread
+    # cache, exactly like the live library
+    assert "in_cache=False" in reply, reply
+
+    send_and_expect(sid, "!sayinthread", "said")
+    st = wait_for(sid, lambda s: any(m.get("content") == "hello from the bot thread"
+                                     for m in s.get("messages", [])),
+                  label="thread message")
+    in_thread = next(m for m in st["messages"]
+                     if m.get("content") == "hello from the bot thread")
+    assert in_thread["channel"] == thread["id"], in_thread
+
+    call("POST", f"/api/session/{sid}/message", {"content": "!threadstate"})
+    st = wait_for(sid, lambda s: any("threadstate archived=" in (m.get("content") or "")
+                                     for m in s.get("messages", [])),
+                  label="threadstate reply")
+    reply = next(m["content"] for m in st["messages"]
+                 if "threadstate archived=" in m["content"])
+    assert "archived=False" in reply, reply
+    # a discord.py Thread only learns a new message_count from a THREAD_UPDATE
+    # payload, never from its own send - exactly like the live library
+    assert "messages=0" in reply, reply
+
+
+@pytest.mark.timeout(300)
+def test_user_opened_thread_reaches_the_bot_through_the_gateway(server):
+    """Browser -> THREAD_CREATE -> real parse_thread_create -> on_thread_create."""
+    sid = ready_session(THREAD_USER_BOT, "thread gateway bot ready")
+    thread = _user_thread(sid, "user-thread")
+    assert thread["id"], thread
+    # the command reads the thread back out of guild._threads, which only
+    # discord.py's own parse_thread_create populated
+    call("POST", f"/api/session/{sid}/message", {"content": "!usercached"})
+    st = wait_for(sid, lambda s: any("usercached user-thread" in (m.get("content") or "")
+                                     for m in s.get("messages", [])),
+                  label="on_thread_create reply")
+    reply = next(m["content"] for m in st["messages"]
+                 if "usercached user-thread" in m["content"])
+    # discord.py put the thread in guild._threads via parse_thread_create, so
+    # guild.get_thread() resolves it and the reply is not "missing"
+    assert "missing" not in reply, reply
+    assert f"id={thread['id']}" in reply, reply
+    assert "archived=False" in reply, reply
+    assert "messages=0" in reply, reply
+    # the simulated event was logged as a real gateway dispatch
+    dispatched = [e for e in st["events"]
+                  if e.get("details", {}).get("event") == "THREAD_CREATE"]
+    assert dispatched, [e.get("details") for e in st["events"]][-5:]
+    assert dispatched[-1]["details"]["status"] == "dispatched"
+
+
+@pytest.mark.timeout(300)
+def test_message_in_thread_reaches_the_bot_as_a_real_thread(server):
+    """A user message in a thread resolves through guild._resolve_channel."""
+    sid = ready_session(THREAD_INBOUND_BOT, "inbound thread bot ready")
+    thread = _user_thread(sid, "user-thread")
+    _user_message(sid, "ping from inside", thread["id"])
+    st = wait_for(sid, lambda s: any("in-thread" in (m.get("content") or "")
+                                     for m in s.get("messages", [])),
+                  label="in-thread reply")
+    reply = next(m["content"] for m in st["messages"] if "in-thread" in m["content"])
+    assert "real=True" in reply, reply
+    assert "parent=playground" in reply, reply
+
+
+@pytest.mark.timeout(360)
+def test_archive_and_delete_emit_thread_update_and_thread_delete(server):
+    """thread.edit(archived=True) and thread.delete() round-trip through REST."""
+    sid = ready_session(THREAD_USER_BOT, "archive bot ready")
+    thread = _user_thread(sid, "user-thread")
+
+    st, resp = call("POST", f"/api/session/{sid}/threads/{thread['id']}/archive")
+    assert st == 200, resp
+    # THREAD_UPDATE is the simulated user archiving, so assert the gateway
+    # dispatch and the world state; the before/after diff on the bot side is
+    # pinned by the cog-listener test below.
+    assert _thread(resp["state"], "user-thread")["archived"] is True, _threads_in(resp["state"])
+    dispatched = [e for e in resp["state"]["events"]
+                  if e.get("details", {}).get("event") == "THREAD_UPDATE"]
+    assert dispatched and dispatched[-1]["details"]["status"] == "dispatched", dispatched
+
+    st, resp = call("POST", f"/api/session/{sid}/threads/{thread['id']}/delete")
+    assert st == 200, resp
+    assert _thread(resp["state"], "user-thread") is None, _threads_in(resp["state"])
+    dispatched = [e for e in resp["state"]["events"]
+                  if e.get("details", {}).get("event") == "THREAD_DELETE"]
+    assert dispatched and dispatched[-1]["details"]["status"] == "dispatched", dispatched
+
+
+@pytest.mark.timeout(300)
+def test_thread_member_join_reaches_the_bot(server):
+    """THREAD_MEMBERS_UPDATE -> real parse_thread_members_update."""
+    sid = ready_session(THREAD_USER_BOT, "member join bot ready")
+    thread = _user_thread(sid, "user-thread")
+    st, resp = call("POST", f"/api/session/{sid}/threads/{thread['id']}/members",
+                    {"user_id": "111111111111111111"})
+    assert st == 200, resp
+    dispatched = [e for e in resp.get("state", {}).get("events", [])
+                  if e.get("details", {}).get("event") == "THREAD_MEMBERS_UPDATE"]
+    assert dispatched, resp.get("state", {}).get("events", [])[-5:]
+    assert dispatched[-1]["details"]["status"] == "dispatched"
+
+
+@pytest.mark.timeout(360)
+def test_cog_listener_receives_thread_gateway_events(server):
+    """A Cog.listener() sees thread_create / thread_update / thread_delete."""
+    sid = ready_session(THREAD_COG_BOT, "thread cog ready")
+    thread = _user_thread(sid, "user-thread")
+    st = wait_for(sid, lambda s: any("cog-saw" in (m.get("content") or "")
+                                     for m in s.get("messages", [])),
+                  label="cog on_thread_create")
+    assert any(m["content"] == "cog-saw user-thread" for m in st["messages"])
+
+    call("POST", f"/api/session/{sid}/threads/{thread['id']}/archive")
+    st = wait_for(sid, lambda s: any("cog-update" in (m.get("content") or "")
+                                     for m in s.get("messages", [])),
+                  label="cog on_thread_update")
+    assert any("cog-update False->True" == m["content"] for m in st["messages"])
+
+    # Archiving already dropped this thread from guild._threads, so deleting it
+    # would only reach `raw_thread_delete` - exactly like the live library.
+    # Prove `on_thread_delete` on a thread that is still live in the cache.
+    fresh = _user_thread(sid, "fresh-thread")
+    call("POST", f"/api/session/{sid}/threads/{fresh['id']}/delete")
+    st = wait_for(sid, lambda s: any("cog-delete" in (m.get("content") or "")
+                                     for m in s.get("messages", [])),
+                  label="cog on_thread_delete")
+    assert any(m["content"] == "cog-delete fresh-thread" for m in st["messages"])
+    assert _thread(st, "fresh-thread") is None, _threads_in(st)
+
+
+@pytest.mark.timeout(420)
+def test_threads_stay_inside_their_worker_and_survive_a_restart(server):
+    """Thread state is per-worker; a restart of A leaves B and C alone."""
+    a = ready_session(THREAD_BOT, "worker A ready")
+    b = ready_session(THREAD_BOT, "worker B ready")
+    c = ready_session(THREAD_BOT, "worker C ready")
+
+    for sid in (a, b, c):
+        send_and_expect(sid, "!mkthread", "mkthread bot-thread")
+
+    # each worker boots the same deterministic fixture world (exactly like
+    # CHANNEL_ID), so ids match across workers by design; what must not be
+    # shared is *state*, which the assertions below check by cross-observation
+    for label, sid in (("a", a), ("b", b), ("c", c)):
+        st = call("GET", f"/api/session/{sid}/state")[1]
+        found = _thread(st, "bot-thread")
+        assert found is not None, (label, _threads_in(st))
+        assert found["archived"] is False, (label, found)
+
+    # archiving in one worker must not touch the other two
+    st, resp = call("POST", f"/api/session/{b}/threads/{_thread(call('GET', f'/api/session/{b}/state')[1], 'bot-thread')['id']}/archive")
+    assert st == 200, resp
+    for label, sid in (("a", a), ("c", c)):
+        other = call("GET", f"/api/session/{sid}/state")[1]
+        assert _thread(other, "bot-thread")["archived"] is False, (label, other)
+    archived = call("GET", f"/api/session/{b}/state")[1]
+    assert _thread(archived, "bot-thread")["archived"] is True, _threads_in(archived)
+    # put B back the way it was so the restart checks below stay meaningful
+    call("POST", f"/api/session/{b}/threads/{_thread(archived, 'bot-thread')['id']}/delete")
+    assert _thread(call("GET", f"/api/session/{b}/state")[1], "bot-thread") is None
+    send_and_expect(b, "!mkthread", "mkthread bot-thread")
+
+    # a worker cannot see another worker's thread
+    call("POST", f"/api/session/{a}/threads", {"name": "only-in-a"})
+    st = call("GET", f"/api/session/{a}/state")[1]
+    assert _thread(st, "only-in-a") is not None, _threads_in(st)
+    for sid in (b, c):
+        other = call("GET", f"/api/session/{sid}/state")[1]
+        assert _thread(other, "only-in-a") is None, _threads_in(other)
+
+    # restarting A must not disturb B or C
+    st, resp = call("POST", f"/api/session/{a}/restart")
+    assert st == 200 and resp.get("ok"), resp
+    for sid in (b, c):
+        other = call("GET", f"/api/session/{sid}/state")[1]
+        assert _thread(other, "bot-thread") is not None, _threads_in(other)
+        assert _thread(other, "only-in-a") is None, _threads_in(other)
+
+    # A's threads are gone with its old world and its worker is a new process
+    fresh = call("GET", f"/api/session/{a}/state")[1]
+    assert _thread(fresh, "only-in-a") is None, _threads_in(fresh)
+    resp = run_bot(a, THREAD_BOT)
+    assert resp["ok"], resp
+    send_and_expect(a, "!mkthread", "mkthread bot-thread")
+    st = call("GET", f"/api/session/{a}/state")[1]
+    reborn = _thread(st, "bot-thread")
+    assert reborn is not None and reborn["archived"] is False, (reborn, _threads_in(st))
+
+
+
 @pytest.mark.timeout(240)
 def test_real_discord_network_is_never_contacted(server):
     sid = ready_session(NET_BOT, "net bot ready")

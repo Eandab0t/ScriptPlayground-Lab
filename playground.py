@@ -167,7 +167,8 @@ class MockGuild:
 
     @property
     def text_channels(self) -> list[MockChannel]:
-        return list(self._session.channels.values())
+        # discord.py keeps threads in guild._threads, never in guild._channels
+        return [c for c in self._session.channels.values() if not c.is_thread]
 
     def get_channel(self, channel_id: int) -> MockChannel | None:
         return self._session.channels.get(str(channel_id))
@@ -372,6 +373,8 @@ class MockMessage:
 
 
 class MockChannel:
+    is_thread = False
+
     def __init__(self, session: Session, channel_id: int, name: str):
         self._session = session
         self.id = channel_id
@@ -472,6 +475,65 @@ class MockChannel:
 
     def typing(self):
         return _NullAsyncCtx()
+
+
+class MockThread(MockChannel):
+    """A thread inside a text channel (Discord channel type 11/12/10).
+
+    Subclasses MockChannel because a thread *is* a channel for message
+    routing, permissions and the timeline; ``is_thread`` is what keeps it out
+    of ``guild.text_channels`` and the GUILD_CREATE ``channels`` array, which
+    is exactly where real Discord keeps the two families separate.
+    """
+
+    is_thread = True
+
+    def __init__(self, session: Session, thread_id: int, name: str, parent_id: int,
+                 *, owner_id: int, thread_type: int = 11,
+                 auto_archive_duration: int = 1440):
+        super().__init__(session, thread_id, name)
+        self.parent_id = parent_id
+        self.owner_id = owner_id
+        self.thread_type = thread_type
+        self.auto_archive_duration = auto_archive_duration
+        self.archived = False
+        self.locked = False
+        self.invitable = True
+        self.create_timestamp = _now()
+
+    @property
+    def parent(self) -> MockChannel | None:
+        return self._session.channels.get(str(self.parent_id))
+
+    @property
+    def archived_at(self) -> datetime | None:
+        return self.created_at if self.archived else None
+
+    def thread_messages(self) -> list[dict]:
+        key = str(self.id)
+        return [msg for msg in self._session.visible_messages(self._session.user_id)
+                if msg.get("channel") == key]
+
+    @property
+    def message_count(self) -> int:
+        return len(self.thread_messages())
+
+    @property
+    def last_message_id(self) -> str | None:
+        messages = self.thread_messages()
+        return messages[-1]["id"] if messages else None
+
+    async def delete(self) -> None:
+        """Deleting a thread needs manage_threads, not manage_channels."""
+        allowed, reason = self.permission_check(self.guild.me, "manage_threads")
+        if not allowed:
+            self._session.log("🚫", f"thread.delete blocked: missing manage_threads ({reason})",
+                              "warn", kind="action",
+                              details={"operation": "thread.delete", "thread": self.name,
+                                       "status": "denied", "permission": "manage_threads",
+                                       "reason": reason})
+            raise discord.Forbidden(_FORBIDDEN, f"missing manage_threads permission ({reason})")
+        self._session.delete_thread(self.id)
 
 
 class _NullAsyncCtx:
@@ -1227,6 +1289,7 @@ class Session:
         self.guild = MockGuild(self)
         self.channels: dict[str, MockChannel] = {}
         self.next_channel_id = 1
+        self.next_thread_id = 1
         self.revision = 0  # monotonic state key for cheap browser render checks
         self.channel = self.make_channel("playground")
         self.client = MockClient(self)
@@ -1776,13 +1839,83 @@ class Session:
                      details={"operation": "channel.delete", "channel": ch.name, "status": "blocked_last_channel"})
             return
         del self.channels[key]
-        for mid in [m for m, msg in self.messages.items() if msg.get("channel") == key]:
+        # deleting a text channel takes its threads with it, like Discord
+        child_ids = {str(c.id) for c in self.channels.values()
+                     if c.is_thread and c.parent_id == ch.id}
+        for child_id in child_ids:
+            del self.channels[child_id]
+        for mid in [m for m, msg in self.messages.items()
+                    if msg.get("channel") in {key} | child_ids]:
             msg = self.messages.pop(mid)
             msg["deleted"] = True
             if mid in self.order:
                 self.order.remove(mid)
         self.log("🗑️", f"channel #{ch.name} deleted", kind="action",
                  details={"operation": "channel.delete", "channel": ch.name, "status": "ok"})
+
+    def make_thread(self, parent_id: int, name: str, *, owner_id: int | None = None,
+                    thread_type: int = 11, auto_archive_duration: int = 1440) -> MockThread:
+        """A thread under `parent_id`.
+
+        Thread ids live in their own band, disjoint from text channels, so a
+        thread id can never collide with a channel id.
+        """
+        parent = self.channels.get(str(parent_id))
+        thread = MockThread(self, GUILD_ID + 1000 + self.next_thread_id,
+                            str(name or "thread").strip() or "thread", int(parent_id),
+                            owner_id=owner_id if owner_id is not None else self.user_id,
+                            thread_type=thread_type,
+                            auto_archive_duration=int(auto_archive_duration or 1440))
+        self.next_thread_id += 1
+        self.channels[str(thread.id)] = thread
+        where = parent.name if parent is not None else str(parent_id)
+        self.log("🧵", f"thread {thread.name} opened in #{where}", kind="action",
+                 details={"operation": "thread.create", "thread": thread.name,
+                          "channel": where, "status": "success"})
+        return thread
+
+    def set_thread_archived(self, thread_id, archived: bool = True) -> MockThread:
+        thread = self.channels.get(str(thread_id))
+        if thread is None or not thread.is_thread:
+            raise KeyError("unknown thread {thread_id}")
+        thread.archived = bool(archived)
+        self.log("🗒️" if archived else "📦",
+                 f"thread {thread.name} {'archived' if archived else 'unarchived'}",
+                 kind="action",
+                 details={"operation": "thread.archive" if archived else "thread.unarchive",
+                          "thread": thread.name,
+                          "status": "archived" if archived else "active"})
+        self._touch()
+        return thread
+
+    def delete_thread(self, thread_id) -> MockThread:
+        """Threads never count toward the "keep one channel" floor: a thread is
+        not a channel in Discord's own channel model either."""
+        key = str(thread_id)
+        thread = self.channels.get(key)
+        if thread is None or not thread.is_thread:
+            raise KeyError(f"unknown thread {thread_id}")
+        del self.channels[key]
+        for mid in [m for m, msg in self.messages.items() if msg.get("channel") == key]:
+            self.messages.pop(mid)["deleted"] = True
+            if mid in self.order:
+                self.order.remove(mid)
+        self.log("🗑️", f"thread {thread.name} deleted", kind="action",
+                 details={"operation": "thread.delete", "thread": thread.name, "status": "ok"})
+        self._touch()
+        return thread
+
+    def thread_members(self, thread_id, added: list | None = None) -> MockThread:
+        """Record member ids joining a thread (THREAD_MEMBERS_UPDATE)."""
+        thread = self.channels.get(str(thread_id))
+        if thread is None or not thread.is_thread:
+            raise KeyError(f"unknown thread {thread_id}")
+        if added:
+            self.log("\U0001f465", f"member joined thread {thread.name}", kind="action",
+                     details={"operation": "thread.member_add", "thread": thread.name,
+                              "status": "success"})
+        self._touch()
+        return thread
 
     def reset_channels(self) -> None:
         """Back to just #playground — a fresh Run bootstraps its own world."""
@@ -3069,8 +3202,16 @@ def state(session: Session) -> dict:
                     "topic": session.channel.topic},
         "revision": session.revision,
         # ids as strings: 18-digit snowflakes lose precision as JS numbers
+        # threads are a separate family in Discord, so they get their own key
         "channels": [{"id": str(c.id), "name": c.name, "topic": c.topic}
-                     for c in session.channels.values()],
+                     for c in session.channels.values() if not c.is_thread],
+        "threads": [{"id": str(c.id), "name": c.name, "parent_id": str(c.parent_id),
+                     "parent_name": c.parent.name if c.parent else None,
+                     "archived": c.archived, "locked": c.locked,
+                     "type": c.thread_type, "owner_id": str(c.owner_id),
+                     "message_count": c.message_count,
+                     "auto_archive_duration": c.auto_archive_duration}
+                    for c in session.channels.values() if c.is_thread],
         "roles": [{"id": str(r.id), "name": r.name}
                   for r in session.guild.roles if r.name != "@everyone"],
         "bot": {"id": session.guild.me.id, "name": session.guild.me.name},
