@@ -43,6 +43,18 @@ A feature is **Supported** only when an end-to-end test in
 means the code path exists and is reachable from the UI/API but is not pinned
 by its own test.
 
+### Compatibility Surface v1
+
+Compatibility Surface v1 is frozen as of October 4, 2026.
+
+"Supported" means the behavior is demonstrated by the real-bot acceptance
+suite through the worker/runtime path. A capability must not be promoted
+without an acceptance/integration test proving it.
+
+Rows marked Partial, Wired, Not implemented, or By design are deliberate
+backlog/limitations, not an implicit commitment to emulate all of Discord.
+Empty rows are not invitations to complete Discord.
+
 | Feature | Runtime path | Browser path | Bot callback tested | Status |
 |---|---|---|---|---|
 | `on_ready` | READY | yes | yes | Supported |
