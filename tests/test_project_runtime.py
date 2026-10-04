@@ -2,6 +2,10 @@
 
 Run: python -X utf8 -m pytest tests/test_project_runtime.py -x -q
 No network is touched; live tokens are scrubbed before any code runs.
+
+Three tests boot a real bot project out of ``bots/``. That directory is
+gitignored (real projects carry live tokens), so those tests skip on a checkout
+without them and run everywhere else. The rest use synthetic projects.
 """
 import asyncio
 from pathlib import Path
@@ -17,6 +21,23 @@ BOTS = ROOT / "bots"
 
 def _session() -> pg.Session:
     return pg.Session("proj-test")
+
+
+def _needs_workspace(name: str):
+    """Skip gate for the tests that boot a real project out of ``bots/``.
+
+    These are the only fixtures here that are not self-contained, and
+    ``bots/*`` is gitignored so a fresh checkout only carries the two tracked
+    samples. Without the gate the failure is a FileNotFoundError on the folder,
+    which reads like a broken test rather than a missing fixture.
+    """
+    present = (BOTS / name).is_dir() and any(
+        (BOTS / name / entry).is_file() for entry in ("bot.py", "main.py")
+    )
+    return pytest.mark.skipif(
+        not present,
+        reason=f"bots/{name} is not in this checkout (bots/* is gitignored: it holds live tokens)",
+    )
 
 
 async def _boot(name: str) -> tuple[pg.Session, "bot_runtime.ProjectRuntime"]:
@@ -66,6 +87,7 @@ def test_mini_bot_boot_and_command():
     asyncio.run(run())
 
 
+@_needs_workspace("E_XPV6")
 @pytest.mark.timeout(150)
 def test_e_xpv6_boots_with_cogs_and_syncs():
     async def run():
@@ -84,6 +106,7 @@ def test_e_xpv6_boots_with_cogs_and_syncs():
     asyncio.run(run())
 
 
+@_needs_workspace("JERKESS")
 @pytest.mark.timeout(150)
 def test_jerkess_module_run_boot():
     async def run():
@@ -102,6 +125,7 @@ def test_jerkess_module_run_boot():
     asyncio.run(run())
 
 
+@_needs_workspace("JERKESS")
 def test_sandbox_scrub_neutralizes_tokens():
     workspace = BOTS / "JERKESS"
     sandbox = bot_runtime._make_sandbox(workspace, "scrub-test")
