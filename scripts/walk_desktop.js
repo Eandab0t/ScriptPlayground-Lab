@@ -72,10 +72,14 @@ function browserWindowProcesses(port) {
   // under the sidebar, so its clicks are intercepted instead of hitting the
   // button. Walking the real 1600x980 layout keeps this test about the app.
   await win.waitForLoadState('domcontentloaded');
-  const { width, height } = win.viewportSize() ?? { width: 1600, height: 980 };
-  if (width < 1600 || height < 980) {
-    await win.setViewportSize({ width: 1600, height: 980 });
-  }
+  // Resize the BrowserWindow itself, not the page viewport: headless CI
+  // displays are small, and at narrow widths the message hover toolbar sits
+  // under the sidebar, so its clicks get intercepted instead of hitting the
+  // button. Walking the real 1600x980 layout keeps this test about the app.
+  await app.evaluate(({ BrowserWindow }, size) => {
+    for (const window of BrowserWindow.getAllWindows()) window.setSize(size.width, size.height);
+  }, { width: 1600, height: 980 });
+  await win.waitForTimeout(500);
   console.log("window:", await win.title());
 
   const connected = win.locator("#me-name");

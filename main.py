@@ -74,6 +74,8 @@ _SCENARIOS_SUBDIR = "scenarios"
 _MAIN_SCRIPT = "demo"
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_ -]{1,50}$")
 
+# How long a hosted project may take to boot before the worker is killed.
+_PROJECT_BOOT_SECONDS = 90
 _OAUTH_AUTHORIZE_URL = "https://discord.com/oauth2/authorize"
 _OAUTH_TOKEN_URL = "https://discord.com/api/oauth2/token"
 _OAUTH_USER_URL = "https://discord.com/api/users/@me"
@@ -527,7 +529,7 @@ async def _boot_workspace_project(session: Session, folder: Path) -> dict:
                 return
             await runtime.shutdown()
 
-    deadline = asyncio.get_running_loop().time() + 90
+    deadline = asyncio.get_running_loop().time() + _PROJECT_BOOT_SECONDS
     try:
         while True:
             remaining = deadline - asyncio.get_running_loop().time()
@@ -863,7 +865,9 @@ async def _run_code(session: Session, body: dict) -> web.Response:
             return web.json_response(await _boot_workspace_project(session, folder))
         except _ProjectBootDeadline:
             _bump(session.sid)
-            return web.json_response({"ok": False, "error": "project boot exceeded 90s"}, status=504)
+            return web.json_response(
+                {"ok": False, "error": f"project boot exceeded {_PROJECT_BOOT_SECONDS:g}s"},
+                status=504)
         except _ProjectShutdownPending as error:
             return web.json_response({"ok": False, "error": str(error)}, status=503)
         except Exception as error:  # noqa: BLE001 - details were logged to the timeline
@@ -887,7 +891,9 @@ async def _run_code(session: Session, body: dict) -> web.Response:
             return web.json_response(await _boot_editor_bot(session, code))
         except _ProjectBootDeadline:
             _bump(session.sid)
-            return web.json_response({"ok": False, "error": "project boot exceeded 90s"}, status=504)
+            return web.json_response(
+                {"ok": False, "error": f"project boot exceeded {_PROJECT_BOOT_SECONDS:g}s"},
+                status=504)
         except _ProjectShutdownPending as error:
             return web.json_response({"ok": False, "error": str(error)}, status=503)
         except Exception as error:  # noqa: BLE001 - details were logged to the timeline

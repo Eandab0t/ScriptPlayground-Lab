@@ -1814,14 +1814,12 @@ async def test_project_boot_timeout_cancellation_cleans_runtime():
             created.append(runtime)
             return runtime
 
-        async def short_wait(tasks, timeout=None):
-            if timeout == 90:
-                # The worker blocks for 600s, so this only has to be short enough
-                # to keep the test quick; it no longer races worker startup.
-                timeout = 5.0
-            return await original_wait(tasks, timeout=timeout)
-
-        server.asyncio.wait = short_wait
+        # Shrink the boot deadline at its source. Patching asyncio.wait used to
+        # do this, but it left the worker's own boot deadline racing it and on a
+        # slow runner the worker won, answering 500 "did not become ready"
+        # instead of the 504 this test is about. One deadline, no race.
+        original_boot_seconds = server._PROJECT_BOOT_SECONDS
+        server._PROJECT_BOOT_SECONDS = 3.0
         server.bot_worker.run_worker_project = slow_run_project
         server._bump = lambda changed_sid: bumps.append(changed_sid)
         app = server.web.Application()
@@ -1835,7 +1833,7 @@ async def test_project_boot_timeout_cancellation_cleans_runtime():
             )
             data = await response.json()
             assert response.status == 504 and not data["ok"], (response.status, data)
-            assert data["error"] == "project boot exceeded 90s", data
+            assert data["error"] == "project boot exceeded 3s", data
             # nothing survives the deadline: no runtime, no worker process
             assert server.RUNTIMES.get(sid) is None, sorted(server.RUNTIMES)
             for runtime in created:
@@ -1849,6 +1847,7 @@ async def test_project_boot_timeout_cancellation_cleans_runtime():
             server.bot_worker.run_worker_project = original_boot
             server.asyncio.wait = original_wait
             server._bump = original_bump
+            server._PROJECT_BOOT_SECONDS = original_boot_seconds
             await client.close()
             server.WORKSPACES_DIR = original_workspace_dir
             runtime = server.RUNTIMES.pop(sid, None)
