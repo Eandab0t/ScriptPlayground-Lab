@@ -841,9 +841,9 @@ async def _run_code(session: Session, body: dict) -> web.Response:
                 entry.read_text(encoding="utf-8", errors="replace")):
             # Script Mode: playground-helper bot.py workspaces keep the mock
             # runtime; real discord.py bots fall through to the hosted boot.
-            # Slice 1: bot.py workspaces run through the playground runtime
-            # (imports, cogs, cog slash commands). Folders with a different
-            # entry (main.py) keep the hosted-project boot below.
+            # A bot.py workspace runs through the playground runtime (imports,
+            # cogs, cog slash commands); folders with a different entry
+            # (main.py) keep the hosted-project boot below.
             _disarm_workspace_watch(session)  # editor-driven Run owns the runtime again
             code = body.get("code") or ""
             result = await run_script(session, code, workspace=workspace, workspace_root=folder,

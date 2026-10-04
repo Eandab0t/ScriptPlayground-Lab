@@ -487,8 +487,9 @@ class MockClient:
 
     Cogs follow the discord.py convention: ``await bot.add_cog(MyCog(bot))``
     registers the instance, and its app commands surface in the composer via
-    _collect_commands. Listeners are *stored* here (Slice 1); dispatch is not
-    wired yet.
+    _collect_commands. Listeners are stored per event name and replayed by
+    dispatch_event, so a cog's ``on_...`` handlers fire alongside the
+    module-level ones.
     """
 
     def __init__(self, session: Session):
@@ -1044,7 +1045,7 @@ def _collect_commands(session: Session, env: dict) -> None:
 
     Module-level @app_commands.command functions land in env.values(); cog
     commands are bound to their cog instance, so client.cogs is walked too.
-    Cog listeners were already stored by add_cog (dispatch is Slice 2).
+    Cog listeners are already stored by add_cog; dispatch_event replays them.
     """
     session.reset_commands()
     seen = set()
