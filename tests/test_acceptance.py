@@ -364,14 +364,32 @@ def test_view_button_callback_executes(server):
     assert clicked["author"]["bot"] is True
 
 
+# A Script-Mode workspace: the playground injects `send`, and there is no real
+# bot object to hand to a worker, so this routes to the mock layer instead of
+# Discord Bot Mode.
+SCRIPT_MODE_BOT = '''async def main():
+    await send("script mode workspace up")
+'''
+
+
 @pytest.mark.timeout(240)
 def test_workspace_routing_keeps_script_mode(server):
-    # a real discord.py bot.py workspace -> Discord Bot Mode (worker)
+    # Both workspaces are created here rather than borrowed from bots/. That
+    # directory is gitignored (real projects carry live tokens), so only the two
+    # tracked samples exist on a fresh checkout -- and the tracked demo_bot is a
+    # real commands.Bot, so it would not prove the Script Mode half anyway. The
+    # routing split is the whole point of this test, so neither half may depend
+    # on what happens to be in the folder.
     ws = "acceptance-workspace"
     ws_dir = ROOT / "bots" / ws
     ws_dir.mkdir(parents=True, exist_ok=True)
     (ws_dir / "bot.py").write_text(BASIC_BOT, encoding="utf-8")
+    script_ws = "acceptance-script-mode"
+    script_dir = ROOT / "bots" / script_ws
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "bot.py").write_text(SCRIPT_MODE_BOT, encoding="utf-8")
     try:
+        # a real discord.py bot.py workspace -> Discord Bot Mode (worker)
         _, r = call("POST", "/api/session")
         sid = r["sid"]
         _, resp = call("POST", f"/api/session/{sid}/run", {"workspace": ws})
@@ -379,12 +397,18 @@ def test_workspace_routing_keeps_script_mode(server):
         wait_for(sid, lambda s: any("is ready" in (e.get("text") or "") for e in s.get("events", [])),
                  label="workspace bot ready")
         send_and_expect(sid, "!ping", "Pong!")
+        # the playground's mock-helper workspace keeps Script Mode
+        _, r2 = call("POST", "/api/session")
+        _, resp2 = call("POST", f"/api/session/{r2['sid']}/run", {"workspace": script_ws})
+        assert resp2.get("ok") and resp2.get("mode") == "workspace", json.dumps(resp2)[:300]
+        # mode only proves the routing decision; this proves the workspace ran.
+        wait_for(r2["sid"],
+                 lambda s: any(m.get("content") == "script mode workspace up"
+                               for m in s.get("messages", [])),
+                 label="script-mode workspace boot")
     finally:
         shutil.rmtree(ws_dir, ignore_errors=True)
-    # the playground's mock-helper workspace keeps Script Mode
-    _, r2 = call("POST", "/api/session")
-    _, resp = call("POST", f"/api/session/{r2['sid']}/run", {"workspace": "demo"})
-    assert resp.get("ok") and resp.get("mode") == "workspace", json.dumps(resp)[:300]
+        shutil.rmtree(script_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- event bots
