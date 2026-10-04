@@ -847,7 +847,18 @@ async def _run_code(session: Session, body: dict) -> web.Response:
             result = await run_script(session, code, workspace=workspace, workspace_root=folder,
                                       workspace_file=None)
             _bump(session.sid)
-            return web.json_response({**result, "mode": "workspace", "commands": session.commands})
+            payload = {**result, "mode": "workspace", "commands": session.commands}
+            if not result.get("ok"):
+                # Same failure contract as the two boot paths below: the caller
+                # gets the exception summary and the diagnostics, not a bare
+                # 200 with ok=false. Success keeps its 200 and full result.
+                exception = (session.last_run or {}).get("exception") or {}
+                summary = (f"{exception.get('type')}: {exception.get('message')}"
+                           if exception.get("type") else str(result.get("error") or "run failed"))
+                payload["error"] = summary
+                payload["last_run"] = session.last_run or None
+                return web.json_response(payload, status=500)
+            return web.json_response(payload)
         try:
             return web.json_response(await _boot_workspace_project(session, folder))
         except _ProjectBootDeadline:

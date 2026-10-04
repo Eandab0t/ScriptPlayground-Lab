@@ -4,6 +4,7 @@ Run: python -X utf8 -m pytest tests/test_acceptance.py -q
 Boots the real aiohttp server on a private port and drives the same API the
 browser uses: POST /run -> worker boot -> READY -> !ping -> Pong!.
 """
+import contextlib
 import json
 import os
 import shutil
@@ -159,6 +160,22 @@ def wait_for(sid, predicate, timeout=60, label="condition"):
 def run_bot(sid, code):
     _, resp = call("POST", f"/api/session/{sid}/run", {"code": code})
     return resp
+
+
+def _kill_pid(pid):
+    """Kill a worker process the way the platform does it.
+
+    `taskkill` exists only on Windows, and the acceptance suite now runs on the
+    ubuntu CI job too, so the OS-native form is used elsewhere.
+    """
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True,
+                       timeout=30, check=False)
+        return
+    import signal
+
+    with contextlib.suppress(OSError, ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
 
 
 def ready_session(code, label="bot ready"):
@@ -621,8 +638,7 @@ def test_worker_crash_is_reported_and_the_session_recovers(server):
     wait_for(sid, lambda s: any("is ready" in (e.get("text") or "") for e in s.get("events", [])),
              label="crash-test bot ready")
     assert pid > 0
-    subprocess.run(["taskkill", "/PID", str(pid), "/F"],
-                   capture_output=True, timeout=30, check=False)
+    _kill_pid(pid)
     st = wait_for(sid, lambda s: any("worker" in (e.get("text") or "").lower()
                                      and ("crash" in (e.get("text") or "").lower()
                                           or "exited" in (e.get("text") or "").lower())
@@ -1046,6 +1062,417 @@ def test_one_sandbox_cannot_import_another(server):
     finally:
         shutil.rmtree(ws_dir, ignore_errors=True)
 
+# ---------------------------------------------- fourth pass: cog listeners
+
+COG_LISTENER_BOT = """import discord
+from discord.ext import commands
+
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+class AuditCog(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload):
+        channel = self.bot.get_channel(payload.channel_id)
+        if channel is not None:
+            await channel.send("cog raw reaction " + str(payload.emoji))
+
+    @commands.Cog.listener()
+    async def on_message_edit(self, before, after):
+        for channel in self.bot.guilds[0].text_channels:
+            await channel.send(f"cog edit {before.content}->{after.content}")
+            return
+
+
+@bot.event
+async def on_ready():
+    await bot.add_cog(AuditCog(bot))
+
+
+@bot.command()
+async def menu(ctx):
+    await ctx.send("cog target")
+
+
+@bot.command()
+async def swap(ctx):
+    message = await ctx.send("before")
+    await message.edit(content="after")
+
+
+bot.run("fake-token")
+"""
+
+
+@pytest.mark.timeout(240)
+def test_cog_listener_receives_gateway_reaction(server):
+    """UI reaction -> fake gateway -> Bot.dispatch -> cog listener -> fake REST."""
+    sid = ready_session(COG_LISTENER_BOT, "cog listener bot ready")
+    st = send_and_expect(sid, "!menu", "cog target")
+    target = next(m for m in st["messages"] if m["content"] == "cog target")
+
+    status, resp = call("POST", f"/api/session/{sid}/react",
+                        {"message_id": target["id"], "emoji": "\N{FIRE}"})
+    assert status == 200 and resp.get("ok"), resp
+    wait_for(sid, lambda s: "cog raw reaction \N{FIRE}" in _text(s),
+             label="cog on_raw_reaction_add reply")
+    # the listener is registered exactly once
+    st = call("GET", f"/api/session/{sid}/state")[1]
+    assert _messages(st).count("cog raw reaction \N{FIRE}") == 1, _messages(st)
+
+
+@pytest.mark.timeout(240)
+def test_cog_listener_receives_constructed_message_edit(server):
+    """MESSAGE_UPDATE reaches a cog listener with real before/after objects."""
+    sid = ready_session(COG_LISTENER_BOT, "cog listener bot ready")
+    send_and_expect(sid, "!swap", "after")
+    st = wait_for(sid, lambda s: "cog edit before->after" in _text(s),
+                  label="cog on_message_edit reply")
+    assert _messages(st).count("cog edit before->after") == 1, _messages(st)
+
+
+@pytest.mark.timeout(300)
+def test_cog_listener_loaded_as_extension_fires_on_ready(server):
+    """load_extension + a lifecycle listener, with no duplicate after a restart."""
+    ws = "acceptance-cogext"
+    ws_dir = ROOT / "bots" / ws
+    (ws_dir / "cogs").mkdir(parents=True, exist_ok=True)
+    (ws_dir / "cogs" / "__init__.py").write_text("", encoding="utf-8")
+    (ws_dir / "cogs" / "audit.py").write_text(
+        "from discord.ext import commands\n"
+        "\n"
+        "class Audit(commands.Cog):\n"
+        "    def __init__(self, bot):\n"
+        "        self.bot = bot\n"
+        "\n"
+        "    @commands.Cog.listener()\n"
+        "    async def on_ready(self):\n"
+        "        for channel in self.bot.guilds[0].text_channels:\n"
+        "            await channel.send('extension cog ready')\n"
+        "            return\n"
+        "\n"
+        "async def setup(bot):\n"
+        "    await bot.add_cog(Audit(bot))\n",
+        encoding="utf-8")
+    (ws_dir / "bot.py").write_text(
+        "import asyncio\n"
+        "import discord\n"
+        "from discord.ext import commands\n"
+        "\n"
+        "async def main():\n"
+        "    bot = commands.Bot(command_prefix='!', intents=discord.Intents.default())\n"
+        "    await bot.load_extension('cogs.audit')\n"
+        "    await bot.start('fake-token')\n"
+        "\n"
+        "asyncio.run(main())\n",
+        encoding="utf-8")
+    try:
+        _, r = call("POST", "/api/session")
+        sid = r["sid"]
+        _, resp = call("POST", f"/api/session/{sid}/run", {"workspace": ws}, timeout=140)
+        assert resp.get("ok") and resp.get("mode") == "project", json.dumps(resp)[:400]
+        assert "Audit" in resp.get("status", {}).get("cogs", []), resp.get("status")
+        wait_for(sid, lambda s: "extension cog ready" in _text(s),
+                 label="extension cog on_ready")
+        # a restart rebuilds the module tree: still exactly one listener
+        _, resp = call("POST", f"/api/session/{sid}/run", {"workspace": ws}, timeout=140)
+        assert resp.get("ok"), json.dumps(resp)[:300]
+        assert "Audit" in resp.get("status", {}).get("cogs", []), resp.get("status")
+        st = wait_for(sid, lambda s: "extension cog ready" in _text(s),
+                      label="extension cog on_ready after restart")
+        assert _messages(st).count("extension cog ready") == 1, _messages(st)
+    finally:
+        shutil.rmtree(ws_dir, ignore_errors=True)
+
+
+def _cog_worker_bot(tag):
+    """A bot whose cog owns a listener and whose sandbox owns one file."""
+    return (
+        "from pathlib import Path\n"
+        "import discord\n"
+        "from discord.ext import commands\n"
+        "\n"
+        "intents = discord.Intents.default()\n"
+        "intents.message_content = True\n"
+        "bot = commands.Bot(command_prefix='!', intents=intents)\n"
+        "\n"
+        f"class {tag.title()}Cog(commands.Cog):\n"
+        "    def __init__(self, bot):\n"
+        "        self.bot = bot\n"
+        "\n"
+        "    @commands.Cog.listener()\n"
+        "    async def on_raw_message_delete(self, payload):\n"
+        "        for channel in self.bot.guilds[0].text_channels:\n"
+        f"            await channel.send('{tag} cog saw a delete')\n"
+        "            return\n"
+        "\n"
+        "@bot.event\n"
+        "async def on_ready():\n"
+        f"    Path('seen-{tag}.txt').write_text('{tag}', encoding='utf-8')\n"
+        f"    await bot.add_cog({tag.title()}Cog(bot))\n"
+        "\n"
+        "@bot.command()\n"
+        "async def go(ctx):\n"
+        f"    others = sorted(p.name for p in Path('.').glob('seen-*.txt')\n"
+        f"                    if p.name != 'seen-{tag}.txt')\n"
+        f"    await ctx.send('{tag} isolation ' + (','.join(others) or 'alone'))\n"
+        "\n"
+        "bot.run('fake-token')\n"
+    )
+
+
+@pytest.mark.timeout(420)
+def test_three_workers_keep_cogs_listeners_and_sandboxes_isolated(server):
+    """Three simultaneous workers: separate cog, listener, sandbox and file."""
+    tags = ("alpha", "bravo", "charlie")
+    sids, pids = {}, {}
+    for tag in tags:
+        sids[tag] = ready_session(_cog_worker_bot(tag), f"{tag} ready")
+        pids[tag] = _worker_pid(sids[tag])
+        assert pids[tag] > 0, tag
+    assert len(set(pids.values())) == 3, pids
+
+    # every worker sees only its own sandbox file
+    for tag in tags:
+        st = send_and_expect(sids[tag], "!go", f"{tag} isolation alone")
+        assert f"{tag} isolation alone" in _text(st), _messages(st)
+
+    # each worker's delete listener fires for its own session only
+    for tag in tags:
+        sid = sids[tag]
+        st = send_and_expect(sid, "!go", f"{tag} isolation alone")
+        target = next(m for m in st["messages"] if m["content"] == f"{tag} isolation alone")
+        status, resp = call("POST", f"/api/session/{sid}/messages/delete",
+                            {"message_id": target["id"]})
+        assert status == 200 and resp.get("ok"), resp
+        wait_for(sid, lambda s, tag=tag: f"{tag} cog saw a delete" in _text(s),
+                 label=f"{tag} cog delete listener")
+    for tag in tags:
+        st = call("GET", f"/api/session/{sids[tag]}/state")[1]
+        foreign = [m for m in _messages(st)
+                   if "cog saw a delete" in m and not m.startswith(tag)]
+        assert not foreign, (tag, foreign)
+
+    # restarting one worker must not duplicate its listener or disturb the others
+    status, resp = call("POST", f"/api/session/{sids['bravo']}/restart")
+    assert status == 200 and resp.get("ok"), resp
+    resp = run_bot(sids["bravo"], _cog_worker_bot("bravo"))
+    assert resp.get("ok"), json.dumps(resp)[:300]
+    new_pid = resp["status"]["worker_pid"]
+    assert new_pid != pids["bravo"], (new_pid, pids["bravo"])
+    st = send_and_expect(sids["bravo"], "!go", "bravo isolation alone")
+    target = next(m for m in st["messages"] if m["content"] == "bravo isolation alone")
+    call("POST", f"/api/session/{sids['bravo']}/messages/delete",
+         {"message_id": target["id"]})
+    st = wait_for(sids["bravo"], lambda s: "bravo cog saw a delete" in _text(s),
+                  label="bravo cog delete listener after restart")
+    assert _messages(st).count("bravo cog saw a delete") == 1, _messages(st)
+
+    for tag in ("alpha", "charlie"):
+        st = send_and_expect(sids[tag], "!go", f"{tag} isolation alone")
+        assert f"{tag} isolation alone" in _text(st), _messages(st)
+
+
+# ------------------------------------------- fourth pass: sandbox lifecycle
+
+def _worker_pid(sid):
+    """The worker PID the browser shows, read back from the timeline."""
+    st = call("GET", f"/api/session/{sid}/state")[1]
+    for event in st.get("events", []):
+        text = str(event.get("text") or "")
+        if "bot is ready in worker process " in text:
+            return int(text.rsplit(" ", 1)[-1])
+    raise AssertionError("no worker PID in the timeline")
+
+
+def _sandboxes():
+    """(root, set of sandbox directory names) - what cleanup has to account for."""
+    import bot_runtime
+
+    root = Path(bot_runtime._SANDBOX_ROOT)
+    return root, {p.name for p in root.iterdir() if p.is_dir()}
+
+
+def _wait_for_no_new_sandboxes(before, timeout=45):
+    deadline = time.time() + timeout
+    leftover = _sandboxes()[1] - before
+    while leftover and time.time() < deadline:
+        time.sleep(0.3)
+        leftover = _sandboxes()[1] - before
+    return leftover
+
+
+@pytest.mark.timeout(300)
+def test_sandbox_is_removed_after_restart_and_boot_failure(server):
+    """A clean restart and a failed boot both remove what they created."""
+    _, before = _sandboxes()
+    sid = ready_session(BASIC_BOT, "restart-clean bot ready")
+    running = _sandboxes()[1] - before
+    assert running, "a booted bot must own a sandbox"
+
+    status, resp = call("POST", f"/api/session/{sid}/restart")
+    assert status == 200 and resp.get("ok"), resp
+    leftover = _wait_for_no_new_sandboxes(before)
+    assert not leftover, f"{sorted(leftover)} survived a clean restart"
+
+    _, r = call("POST", "/api/session")
+    bad = r["sid"]
+    _, before_bad = _sandboxes()
+    resp = run_bot(bad, "raise RuntimeError('boom at import')\n")
+    assert not resp.get("ok"), resp
+    leftover = _wait_for_no_new_sandboxes(before_bad)
+    assert not leftover, f"{sorted(leftover)} survived a boot failure"
+
+
+@pytest.mark.timeout(300)
+def test_sandbox_is_removed_when_the_worker_dies_unexpectedly(server):
+    """A killed worker owns its sandbox: it is removed, not left for the sweep."""
+    _, before = _sandboxes()
+    _, r = call("POST", "/api/session")
+    sid = r["sid"]
+    resp = run_bot(sid, BASIC_BOT)
+    assert resp["ok"], resp
+    pid = resp["status"]["worker_pid"]
+    deadline = time.time() + 30
+    while not (_sandboxes()[1] - before) and time.time() < deadline:
+        time.sleep(0.3)
+    running = _sandboxes()[1] - before
+    assert running, "a booted bot must own a sandbox"
+
+    _kill_pid(pid)
+    st = wait_for(sid, lambda s: any(
+        "crashed" in (e.get("text") or "").lower() for e in s.get("events", [])),
+        timeout=60, label="worker crash event")
+    crash = [e for e in st["events"]
+             if "crashed" in (e.get("text") or "").lower()][-1]
+    details = crash.get("details") or {}
+    assert details.get("status") == "worker_crash", details
+    assert details.get("termination") == "crashed", details
+    assert details.get("exit_code") not in (None, 0), details
+    assert "without reporting a fatal error" in (details.get("reason") or ""), details
+
+    leftover = _wait_for_no_new_sandboxes(before)
+    assert not leftover, f"{sorted(leftover)} survived a worker crash"
+
+
+def test_legacy_metadata_less_sandboxes_are_preserved_forever():
+    """Documented policy: no ownership proof -> never delete, never guess."""
+    import bot_runtime
+
+    root = Path(bot_runtime._SANDBOX_ROOT)
+    root.mkdir(parents=True, exist_ok=True)
+    legacy = root / f"pytest-legacy-{os.getpid()}"
+    corrupt = root / f"pytest-corrupt-{os.getpid()}"
+    foreign = root / f"pytest-foreign-{os.getpid()}"
+    for directory in (legacy, corrupt, foreign):
+        shutil.rmtree(directory, ignore_errors=True)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "bot.py").write_text("x", encoding="utf-8")
+    (corrupt / bot_runtime.SANDBOX_META).write_text("{not json", encoding="utf-8")
+    bot_runtime.write_sandbox_meta(foreign, session_id="s-other", worker_pid=os.getpid(),
+                                   server_instance_id="another-server-instance")
+    try:
+        for attempt in range(3):  # deterministic and idempotent across sweeps
+            report = bot_runtime.sweep_orphan_sandboxes()
+            for directory in (legacy, corrupt):
+                assert directory.exists(), f"{directory.name} deleted on sweep {attempt}: {report}"
+                assert directory.name in report["unknown"], report
+            assert foreign.exists(), (
+                f"a sandbox owned by a live worker under another server instance was "
+                f"deleted on sweep {attempt}: {report}")
+            assert foreign.name in report["kept"], report
+            assert not [n for n in report["removed"]
+                        if n in (legacy.name, corrupt.name, foreign.name)], report
+    finally:
+        for directory in (legacy, corrupt, foreign):
+            shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_worker_termination_taxonomy_is_explicit():
+    """Every exit reason is named, and a bot exception keeps its traceback."""
+    import bot_worker
+
+    class _Booted:
+        @staticmethod
+        def is_set():
+            return True
+
+    class _Session:
+        def __init__(self):
+            self.events = []
+            self._project_state = None
+
+        def log(self, icon, text, level=None, details=None):
+            self.events.append({"icon": icon, "text": text, "details": details})
+
+    def _handle(**kwargs):
+        session = _Session()
+        runtime = bot_worker.WorkerProjectRuntime.__new__(bot_worker.WorkerProjectRuntime)
+        runtime.session = session
+        runtime.process = None
+        runtime.on_exception = None
+        runtime._pending = {}
+        runtime._state = None
+        runtime._status = {}
+        runtime._closed = False
+        runtime._stopping = False
+        runtime._booted = _Booted()
+        runtime._mirrored = 0
+        runtime._inner_sandbox = None
+        runtime._termination = None
+        runtime._termination_reason = None
+        runtime._exit_code = None
+        runtime._fatal = None
+        for key, value in kwargs.items():
+            setattr(runtime, key, value)
+        return runtime
+
+    # 1. clean stop: named, explained, and not logged as a failure
+    runtime = _handle(_stopping=True)
+    runtime._classify_exit(0)
+    assert runtime.status()["termination"] == "stopped", runtime.status()
+    assert runtime.status()["termination_reason"]
+    assert not runtime.session.events, runtime.session.events
+
+    # 2. the bot's own code took the worker down: the traceback survives
+    fatal = {"error": "KeyError: 'nope'",
+             "traceback": "Traceback (most recent call last):\nKeyError: 'nope'"}
+    runtime = _handle(_fatal=fatal)
+    runtime._classify_exit(1)
+    status = runtime.status()
+    assert status["termination"] == "bot_exception", status
+    assert "KeyError" in status["termination_reason"], status
+    assert "Traceback" in status["traceback"], status
+    assert status["exit_code"] == 1, status
+    last = runtime.session.events[-1]["details"]
+    assert last["status"] == "bot_exception" and last["termination"] == "bot_exception", last
+    assert last["traceback"].startswith("Traceback"), last
+
+    # 3. no report at all: crash or external kill, never "stopped"
+    runtime = _handle()
+    runtime._classify_exit(1)
+    status = runtime.status()
+    assert status["termination"] == "crashed", status
+    assert "without reporting a fatal error" in status["termination_reason"], status
+    assert status["exit_code"] == 1, status
+    assert runtime.session.events[-1]["details"]["reason"] == status["termination_reason"]
+
+    # 4. a reason decided elsewhere is kept and not logged twice
+    runtime = _handle(_stopping=True, _termination="timeout",
+                      _termination_reason="no response to 'session' in 30s (worker killed)")
+    runtime._classify_exit(1)
+    assert runtime.status()["termination"] == "timeout", runtime.status()
+    assert runtime.status()["termination_reason"].startswith("no response")
+    assert not runtime.session.events, runtime.session.events
+
+    # 5. the taxonomy the UI can rely on
+    assert set(bot_worker.TERMINATION_REASONS) == {
+        "stopped", "boot_failed", "boot_timeout", "timeout", "bot_exception", "crashed"}
 
 @pytest.mark.timeout(240)
 def test_real_discord_network_is_never_contacted(server):

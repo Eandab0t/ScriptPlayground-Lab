@@ -2168,26 +2168,48 @@ async def _stop_main(session: Session) -> None:
 def _script_error_details(error: BaseException) -> dict:
     """Map a script exception to the last user-code frame for editor navigation."""
     session = _CURRENT_SESSION.get()
-    roots = ["<playground>"]
-    if getattr(session, "workspace_root", None) is not None:
-        roots.append(str(Path(session.workspace_root)))
+    workspace_root = getattr(session, "workspace_root", None)
+    root = Path(workspace_root).resolve() if workspace_root is not None else None
     filename = None
     line = None
-    if isinstance(error, SyntaxError) and error.filename in roots:
+    if isinstance(error, SyntaxError) and error.filename == "<playground>":
         filename, line = error.filename, error.lineno
     else:
-        frame = next((frame for frame in reversed(traceback.extract_tb(error.__traceback__ or None))
-                      if frame.filename in roots), None)
-        if frame is not None:
-            filename, line = frame.filename, frame.lineno
-            if roots[-1] != "<playground>" and filename.startswith(roots[-1]):
-                # Workspace file: report the workspace-relative path so the
-                # Problems panel can open workspace/file:line directly.
-                filename = Path(filename).relative_to(roots[-1]).as_posix()
+        # Walk outwards for the innermost frame that is user code: the editor
+        # buffer, or a file inside the workspace root. Containment, not string
+        # equality -- "<root>/bot.py" is never equal to "<root>".
+        for frame in reversed(traceback.extract_tb(error.__traceback__ or None)):
+            if frame.filename == "<playground>":
+                filename, line = frame.filename, frame.lineno
+                break
+            if root is None:
+                continue
+            try:
+                relative = Path(frame.filename).resolve().relative_to(root)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            # Workspace-relative path so the Problems panel can open
+            # workspace/file:line directly.
+            filename, line = relative.as_posix(), frame.lineno
+            break
     message = error.msg if isinstance(error, SyntaxError) else str(error)
-    return {"type": type(error).__name__, "message": message, "file": filename, "line": line}
-
-
+    details = {"type": type(error).__name__, "message": message,
+               "file": filename, "line": line}
+    traceback_text = "".join(
+        traceback.format_exception(type(error), error, error.__traceback__))
+    if workspace_root is not None:
+        # Same normalisation the worker path does: workspace paths become
+        # "<workspace>/file.py" so the Problems panel can link to them.
+        root = str(root)
+        for path in {root, root.replace("\\", "/"), root.replace("/", "\\")}:
+            message = message.replace(path, Path(workspace_root).name)
+            traceback_text = traceback_text.replace(path, Path(workspace_root).name)
+        traceback_text = re.sub(
+            r'(File "[^"]+")', lambda match: match.group(1).replace("\\", "/"), traceback_text)
+        details["workspace"] = Path(workspace_root).name
+    details["message"] = message
+    details["traceback"] = traceback_text
+    return details
 def _record_script_error(session: Session, error: Exception, started: float) -> None:
     """Expose callback failures through the same error panel as startup failures."""
     details = _script_error_details(error)

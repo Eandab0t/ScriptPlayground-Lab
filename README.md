@@ -119,9 +119,12 @@ Put a bot folder under `bots/<name>/` with a `main.py` or `bot.py` entry file, t
 **Bot folder → 📂 Connect** (the entry file is detected automatically and loaded into the editor).
 Pressing **Run** on a connected folder boots the **whole bot project offline**: the real `discord.py`
 login flow runs against a fake REST transport, so `setup_hook`, cog loading, `tree.sync`, `on_ready`,
-slash commands, component clicks, modals, and `on_message` handlers all execute exactly like
-production — no network is ever touched. Live tokens are scrubbed from the copied sandbox (`.env`
-and hardcoded values in source files) and replaced with a placeholder.
+cog listeners, slash commands, component clicks, modals, and `on_message` handlers all run through
+discord.py's own dispatch — no network is ever touched. That is the *supported* surface listed in
+`docs/COMPATIBILITY.md`, not the whole Discord API: the simulated world is deterministic and
+deliberately incomplete (no typing, presence, threads, bulk-delete gateway events, or real voice),
+and each claim in that file is backed by an end-to-end test. Live tokens are scrubbed from the
+copied sandbox (`.env` and hardcoded values in source files) and replaced with a placeholder.
 
 Node bots work too: a folder whose `package.json` depends on `discord.js` runs through a bundled
 `discord.js` shim (no `npm install` needed — requires `node` on PATH). Slash commands, embeds,
@@ -199,9 +202,11 @@ Helpers injected into your namespace: `send(...)` (posts to #playground),
 `.user`, `.guilds`, `.latency`), `discord` (the real module), and `Session`.
 
 Everything else is *real discord.py*: build `discord.Embed`s, `discord.ui.View`s,
-`discord.ui.Modal`s exactly as you would in a shipped bot. The playground
-mocks only the transport — `interaction.response.send_message(...)`,
-`channel.send(...)`, `message.edit(...)` — and renders what you gave it.
+`discord.ui.Modal`s with the same code you would write for a shipped bot. The
+playground mocks the transport — `interaction.response.send_message(...)`,
+`channel.send(...)`, `message.edit(...)` — and renders what you gave it. The
+objects are real; the *world behind them* is a simulator, so only the API surface
+listed in `docs/COMPATIBILITY.md` behaves the way the real service does.
 
 > **ScriptPlayground runs ordinary `discord.py` bots against an isolated,
 > offline simulated Discord environment.** It is not a Discord emulator and it

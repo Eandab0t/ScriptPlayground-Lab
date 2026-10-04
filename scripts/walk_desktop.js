@@ -67,6 +67,15 @@ function browserWindowProcesses(port) {
       : { args: [`--user-data-dir=${ELECTRON_PROFILE}`, path.join(ROOT)], env: { ...process.env } },
   );
   const win = await app.firstWindow();
+  // Pin the window to the app's own default (desktop/main.js). Headless CI
+  // displays are small, and at narrow widths the message hover toolbar sits
+  // under the sidebar, so its clicks are intercepted instead of hitting the
+  // button. Walking the real 1600x980 layout keeps this test about the app.
+  await win.waitForLoadState('domcontentloaded');
+  const { width, height } = win.viewportSize() ?? { width: 1600, height: 980 };
+  if (width < 1600 || height < 980) {
+    await win.setViewportSize({ width: 1600, height: 980 });
+  }
   console.log("window:", await win.title());
 
   const connected = win.locator("#me-name");

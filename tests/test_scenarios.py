@@ -175,9 +175,11 @@ async def test_scenario_handler_error_fails_with_runtime_context():
             "without permission denial, invalid input/target, missing handler, or script/runtime error"
         ), result
         assert result["runtime_state"]["messages"][-1]["content"] == "trigger", result
-        assert session.last_run["exception"] == {
+        assert {key: session.last_run["exception"][key]
+                for key in ("type", "message", "file", "line")} == {
             "type": "LookupError", "message": "callback boom", "file": "<playground>", "line": 4,
         }, result
+        assert "LookupError: callback boom" in session.last_run["exception"]["traceback"], result
         assert any(event.get("details", {}).get("status") == "script_error"
                    for event in result["runtime_state"]["recent_events"]), result
     finally:
@@ -384,9 +386,13 @@ async def test_script_error_maps_user_frame_and_syntax_line():
     try:
         runtime = await run_script(session, "async def main():\n    await send('before')\n    raise ValueError('boom')\n")
         assert runtime["ok"] is False
-        assert session.last_run["exception"] == {
-            "type": "ValueError", "message": "boom", "file": "<playground>", "line": 3,
-        }
+        # The exception payload also carries a formatted traceback (the worker
+        # path reports one too, and the Problems panel links from it), so assert
+        # the location fields individually rather than comparing whole dicts.
+        details = session.last_run["exception"]
+        assert details["type"] == "ValueError" and details["message"] == "boom", details
+        assert details["file"] == "<playground>" and details["line"] == 3, details
+        assert "ValueError: boom" in details["traceback"], details
         syntax = await run_script(session, "async def main():\n  broken =\n")
         assert syntax["ok"] is False
         assert session.last_run["exception"]["type"] == "SyntaxError"

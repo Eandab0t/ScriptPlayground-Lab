@@ -258,8 +258,10 @@ test('hosted Python import failures preserve HTTP 500 diagnostics in the UI', as
       && response.request().method() === 'POST');
   await page.locator('#btn-run').click();
   const response = await projectRun;
-  expect(response.status()).toBe(500);
   const runData = await response.json();
+  // Report the payload on failure: the mode and error explain why a run that
+  // should have been a 500 was not.
+  expect(response.status(), `status ${response.status()} body ${JSON.stringify(runData)}`).toBe(500);
   expect(runData.ok).toBe(false);
   expect(runData.error).toContain('ModuleNotFoundError');
   expect(runData.last_run).toMatchObject({
@@ -413,11 +415,12 @@ test('a transient workspace-list failure preserves saved workspace recovery stat
   await expect(appPage.locator('#code')).toHaveJSProperty('readOnly', true);
   await expect(appPage.locator('#btn-run')).toBeDisabled();
   await expect(appPage.locator('#btn-save')).toBeDisabled();
-  expect(await appPage.evaluate(() => ({
+  const recovered = await appPage.evaluate(() => ({
     code: localStorage.getItem('pg-code'),
     context: localStorage.getItem('pg-code-context'),
     workspace: JSON.parse(localStorage.getItem('pg-workspace-state')),
-  }))).toEqual({ code: unsavedBuffer, context: 'workspace', workspace: savedState });
+  }));
+  expect(recovered).toEqual({ code: unsavedBuffer, context: 'workspace', workspace: savedState });
 
   await appPage.unroute('**/api/workspaces');
   await appPage.reload();
@@ -448,11 +451,12 @@ test('a transient workspace-file failure preserves saved recovery state for retr
   await expect(appPage.locator('#code')).toHaveJSProperty('readOnly', true);
   await expect(appPage.locator('#btn-run')).toBeDisabled();
   await expect(appPage.locator('#btn-save')).toBeDisabled();
-  expect(await appPage.evaluate(() => ({
+  const recovered = await appPage.evaluate(() => ({
     code: localStorage.getItem('pg-code'),
     context: localStorage.getItem('pg-code-context'),
     workspace: JSON.parse(localStorage.getItem('pg-workspace-state')),
-  }))).toEqual({ code: unsavedBuffer, context: 'workspace', workspace: savedState });
+  }));
+  expect(recovered).toEqual({ code: unsavedBuffer, context: 'workspace', workspace: savedState });
 
   failFileRead = false;
   await appPage.reload();

@@ -26,6 +26,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import uuid
 from pathlib import Path
 
@@ -258,6 +259,15 @@ async def _worker_main(sandbox: Path, tag: str, display: str | None = None) -> i
             await handle(payload)
             if payload.get("type") == "shutdown":
                 return 0
+    except BaseException as error:  # noqa: BLE001 - report it, never swallow it
+        # Anything escaping handle() is the bot's own code (or a simulator bug)
+        # taking the worker down. stderr is buffered into log_buffer, so flush
+        # first or the traceback dies with the process.
+        flush_logs()
+        send({"type": "fatal",
+              "error": f"{type(error).__name__}: {error}",
+              "traceback": traceback.format_exc()})
+        return 1
     finally:
         pump_task.cancel()
         if worker is not None:  # crash / EOF: still remove the runtime's own copy
@@ -288,6 +298,14 @@ class WorkerBootFailed(RuntimeError):
 
 SERVER_INSTANCE_ID = uuid.uuid4().hex
 """Identifies this server process inside sandbox metadata."""
+
+TERMINATION_REASONS = ("stopped", "boot_failed", "boot_timeout", "timeout",
+                       "bot_exception", "crashed")
+"""Every reason a worker can be gone. status()["termination"] is one of these."""
+
+TERMINATION_REASONS = ("stopped", "boot_failed", "boot_timeout", "timeout",
+                       "bot_exception", "crashed")
+"""Every reason a worker can be gone. status()["termination"] is one of these."""
 
 
 class WorkerProjectRuntime:
@@ -323,8 +341,10 @@ class WorkerProjectRuntime:
         self._mirrored = 0  # server timeline events already folded into the snapshot
         self._inner_sandbox: str | None = None  # the worker's own copy (cleaned by us if killed)
         self.entry = "bot.py"
-        self._termination: str | None = None  # why the worker is gone (see _terminate_reason)
+        self._termination: str | None = None  # see _classify_exit for the taxonomy
+        self._termination_reason: str | None = None
         self._exit_code: int | None = None
+        self._fatal: dict | None = None  # the worker's own last-words report
 
     def _log_server(self, icon: str, text: str, details: dict | None = None) -> None:
         """Log a server-side lifecycle event and keep it in the rendered snapshot.
@@ -373,6 +393,7 @@ class WorkerProjectRuntime:
             reply = await self._request({"type": "boot"}, timeout=_BOOT_TIMEOUT, boot=True)
         except WorkerTimeout as error:
             self._termination = "boot_timeout"
+            self._termination_reason = f"worker did not answer boot in {_BOOT_TIMEOUT:.0f}s"
             self._kill(f"boot timeout after {_BOOT_TIMEOUT:.0f}s (worker killed)")
             raise RuntimeError(
                 "bot worker did not become ready in time and was terminated"
@@ -383,6 +404,7 @@ class WorkerProjectRuntime:
             raise RuntimeError(f"bot worker failed: {detail}")
         if not reply.get("ok"):  # the worker booted the module and it failed
             self._termination = "boot_failed"
+            self._termination_reason = str(reply.get("error") or "bot raised while booting")
             self._log_server("🚨", "bot failed to boot", {"operation": "worker.boot",
                                                            "status": "boot_failed",
                                                            "reason": reply.get("error")})
@@ -412,22 +434,64 @@ class WorkerProjectRuntime:
         finally:
             code = await process.wait()
             self._exit_code = code
-            if self._termination is None:
-                self._termination = "stopped" if self._stopping else "crashed"
+            self._classify_exit(code)
             for future in list(self._pending.values()):
                 if not future.done():
                     future.set_exception(ConnectionError(f"worker exited (code {code})"))
             self._pending.clear()
-            if not self._stopping and code != 0:
-                self._termination = "crashed"
-                self._log_server("💥", f"bot worker crashed (exit code {code})",
-                                 {"operation": "worker.exit", "status": "worker_crash",
-                                  "reason": f"worker exited with code {code}",
-                                  "exit_code": code, "pid": self.worker_pid})
-                if self.on_exception is not None:
-                    self.on_exception()
-            if self._closed:
+            if not self._stopping and code != 0 and self.on_exception is not None:
+                self.on_exception()
+            if self._closed or not self._stopping:
+                # A worker that dies unexpectedly owns its own sandbox too: do
+                # not leave it for the next startup sweep to guess about.
                 self._cleanup_sandbox()
+
+    def _classify_exit(self, code: int | None) -> None:
+        """Record exactly why the worker is gone, and say so once in the timeline.
+
+        Taxonomy (also documented in docs/COMPATIBILITY.md):
+
+            stopped         user asked for it / normal shutdown
+            boot_failed     the bot's own code raised while booting
+            boot_timeout    never answered the boot request in time
+            timeout         an operation missed its deadline (worker killed)
+            bot_exception   bot code raised outside a handled callback
+            crashed         exited with no fatal report: hard crash or external kill
+
+        Windows reports no signal number for a terminated process, so an external
+        kill and an unhandled hard crash are the same observation; the reason
+        string says so instead of guessing.
+        """
+        if self._exit_code is None:
+            self._exit_code = code  # this method owns "why is it gone, and how"
+        derived = self._termination is None  # nobody else has claimed this exit
+        if derived:
+            if self._fatal is not None:
+                self._termination = "bot_exception"
+                self._termination_reason = self._fatal["error"]
+            elif self._stopping:
+                self._termination = "stopped"
+                self._termination_reason = "worker stopped on request"
+            else:
+                self._termination = "crashed"
+                self._termination_reason = (
+                    f"worker exited with code {code} without reporting a fatal error "
+                    "(unhandled hard crash or external kill)"
+                )
+        if not derived or self._termination == "stopped":
+            return  # already reported where it was decided (timeout, boot failure)
+        details = {"operation": "worker.exit",
+                   "status": "worker_crash" if self._termination == "crashed"
+                             else "bot_exception",
+                   "termination": self._termination,
+                   "reason": self._termination_reason,
+                   "exit_code": code, "pid": self.worker_pid}
+        if self._fatal is not None:
+            details["traceback"] = self._fatal["traceback"]
+            text = f"bot code took the worker down — {self._fatal['error']}"
+        else:
+            text = f"bot worker crashed (exit code {code})"
+        self._log_server("💥", text, details)
 
     async def _handle_event(self, payload: dict) -> None:
         kind = payload.get("type")
@@ -436,6 +500,9 @@ class WorkerProjectRuntime:
         elif kind == "log":
             icon = payload.get("icon") or "🖨️"
             self.session.log(icon, str(payload.get("text") or ""))
+        elif kind == "fatal":
+            self._fatal = {"error": str(payload.get("error") or "worker died"),
+                           "traceback": str(payload.get("traceback") or "")}
         elif kind == "stopped" and not self._stopping:
             self._stopping = True
 
@@ -497,6 +564,7 @@ class WorkerProjectRuntime:
     def _kill(self, reason: str) -> None:
         self._stopping = True
         self._termination = "timeout"
+        self._termination_reason = reason
         self._log_server("🛑", f"bot worker terminated — {reason}",
                          {"operation": "worker.kill", "status": "worker_timeout",
                           "reason": reason, "pid": self.worker_pid})
@@ -520,6 +588,7 @@ class WorkerProjectRuntime:
             self._stopping = True
             if self._termination is None:
                 self._termination = "stopped"
+                self._termination_reason = "worker stopped on request"
             try:
                 await asyncio.wait_for(self._request({"type": "shutdown"}), timeout=_SHUTDOWN_GRACE)
             except (WorkerTimeout, ConnectionError, RuntimeError, asyncio.TimeoutError):
@@ -558,7 +627,14 @@ class WorkerProjectRuntime:
         # "user pressed stop", "the bot crashed", "it never booted" and
         # "it was killed for not answering".
         status["termination"] = self._termination
+        status["termination_reason"] = self._termination_reason
         status["exit_code"] = self._exit_code
+        if self._exit_code is not None and self._exit_code < 0:  # POSIX only
+            import signal as _signal
+
+            status["signal"] = _signal.Signals(-self._exit_code).name
+        if self._fatal is not None:
+            status["traceback"] = self._fatal["traceback"]
         return status
 
     async def dispatch_message(self, content: str, channel_id=None) -> None:

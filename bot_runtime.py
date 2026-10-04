@@ -126,9 +126,14 @@ def write_sandbox_meta(sandbox: Path, *, session_id: str, worker_pid: int,
 def sweep_orphan_sandboxes() -> dict:
     """Delete sandboxes whose recorded worker PID is demonstrably dead.
 
-    Conservative by construction: a sandbox without metadata (older builds, or
-    a project copied in by hand) is never touched, and a sandbox whose worker
-    PID is still alive is left alone even if a second server is running.
+    Conservative by construction: a sandbox whose worker PID is still alive is
+    left alone even if a second server instance is running it.
+
+    Legacy metadata-less directories (older builds, or a project copied in by
+    hand) are PRESERVED FOREVER -- the documented policy is "never delete by
+    age": there is no ownership proof, so there is no safe deletion rule. They
+    are reported under "unknown" every sweep, which is deterministic and
+    idempotent, so a user can delete them by hand knowing nothing else will.
     """
     removed, kept, unknown = [], [], []
     root = _SANDBOX_ROOT

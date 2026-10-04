@@ -808,9 +808,12 @@ async def main():
         s = Session("t-ws-deadline")
         try:
             result = await run_script(s, "", workspace="infinite_bot", workspace_root=folder, timeout=1.0)
-            assert result["ok"] is False
-            assert any("execution deadline" in event["text"] for event in s.events)
-            assert result["ms"] < 10_000  # ScriptStuck, not the outer runner timeout
+            assert result["ok"] is False, result
+            deadline_events = [event for event in s.events if "execution deadline" in event["text"]]
+            assert deadline_events, [event["text"] for event in s.events]
+            # ScriptStuck must win, not the outer runner timeout: a spinning
+            # worker on a loaded CI runner can take longer than it does locally.
+            assert result["ms"] < 10_000, f"took {result['ms']}ms: {result}"
         finally:
             s.close()
 
@@ -1793,8 +1796,13 @@ async def test_project_boot_timeout_cancellation_cleans_runtime():
         server.SESSIONS[sid] = session
         folder = server.WORKSPACES_DIR / "slow_project"
         folder.mkdir()
+        # Blocks during import, so the worker can never answer the boot request
+        # no matter how fast the runner is. A main() that merely awaits forever
+        # is not enough: script-mode boot does not wait for main() to finish, so
+        # the run succeeds and the test depends on startup being slow.
         (folder / "main.py").write_text(
-            "import asyncio\nasync def main():\n    await asyncio.Event().wait()\n", encoding="utf-8",
+            "import time\n\ntime.sleep(600)\n\nasync def main():\n    pass\n",
+            encoding="utf-8",
         )
         bumps = []
         created = []
@@ -1808,7 +1816,9 @@ async def test_project_boot_timeout_cancellation_cleans_runtime():
 
         async def short_wait(tasks, timeout=None):
             if timeout == 90:
-                timeout = 0.3
+                # The worker blocks for 600s, so this only has to be short enough
+                # to keep the test quick; it no longer races worker startup.
+                timeout = 5.0
             return await original_wait(tasks, timeout=timeout)
 
         server.asyncio.wait = short_wait
@@ -1824,15 +1834,17 @@ async def test_project_boot_timeout_cancellation_cleans_runtime():
                 f"/api/session/{sid}/run", json={"workspace": "slow_project"}
             )
             data = await response.json()
-            assert response.status == 504 and not data["ok"]
-            assert data["error"] == "project boot exceeded 90s"
+            assert response.status == 504 and not data["ok"], (response.status, data)
+            assert data["error"] == "project boot exceeded 90s", data
             # nothing survives the deadline: no runtime, no worker process
-            assert server.RUNTIMES.get(sid) is None
+            assert server.RUNTIMES.get(sid) is None, sorted(server.RUNTIMES)
             for runtime in created:
-                assert runtime.process is None or runtime.process.returncode is not None
-            assert session.last_run is None and state(session)["last_run"] is None
-            assert not any(event.get("cls") == "error" for event in session.events)
-            assert bumps and set(bumps) == {sid}
+                assert runtime.process is None or runtime.process.returncode is not None, (
+                    f"worker {runtime.worker_pid} outlived the boot deadline")
+            assert session.last_run is None and state(session)["last_run"] is None, session.last_run
+            errors = [event for event in session.events if event.get("cls") == "error"]
+            assert not errors, [event.get("text") for event in errors]
+            assert bumps and set(bumps) == {sid}, bumps
         finally:
             server.bot_worker.run_worker_project = original_boot
             server.asyncio.wait = original_wait
