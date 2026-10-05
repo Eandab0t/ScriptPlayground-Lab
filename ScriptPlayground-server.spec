@@ -14,6 +14,10 @@ a = Analysis(
         (str(root / "scripts"), "scripts"),
         (str(root / "assets"), "assets"),
         (str(root / "node_shim"), "node_shim"),
+        # Shipped as a *file*, not just a bundled module: workers are spawned
+        # with sys.executable, which is this binary when frozen, so the worker
+        # re-dispatches through main._run_frozen_worker() and runs this copy.
+        (str(root / "bot_worker.py"), "."),
     ],
     hiddenimports=["bot_runtime", "bridge", "env_discovery", "project_state"],
     hookspath=[],

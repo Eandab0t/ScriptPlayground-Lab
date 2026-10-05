@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import runpy
 import secrets
 import shutil
 import sys
@@ -1725,7 +1726,35 @@ def build_app(*, auto_shutdown: bool = False, data_dir: Path | None = None) -> w
     return app
 
 
+def _run_frozen_worker() -> bool:
+    """Re-dispatch this packaged binary as a bot worker, if that is what it is.
+
+    Workers are spawned with ``sys.executable`` (bot_worker.py), but inside a
+    PyInstaller bundle that is the server executable rather than a Python
+    interpreter. Without this branch the spawn re-enters the server, argparse
+    rejects the worker argv, and every bot in the packaged desktop app dies
+    during boot. The worker script ships beside the binary as data
+    (ScriptPlayground-server.spec), so process isolation survives packaging.
+    """
+    if not getattr(sys, "frozen", False):
+        return False
+    argv = sys.argv[1:]
+    # Exactly the spawn in bot_worker.py: `-X utf8 <script> <sandbox> <tag> <display>`.
+    if argv[:1] != ["-X"] or len(argv) < 3 or not argv[2].endswith("bot_worker.py"):
+        return False
+    script = Path(argv[2])
+    if not script.is_file():
+        return False
+    # bot_worker.main() reads argv[1:] as sandbox/tag/display and exits with the
+    # worker's own status, which SystemExit carries out through here.
+    sys.argv = [str(script), *argv[3:]]
+    runpy.run_path(str(script), run_name="__main__")
+    return True
+
+
 def main() -> None:
+    if _run_frozen_worker():
+        return
     parser = argparse.ArgumentParser(description="ScriptPlayground local web UI")
     parser.add_argument("--port", type=int, default=8741)
     parser.add_argument("--host", default="127.0.0.1")
