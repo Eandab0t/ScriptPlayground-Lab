@@ -42,6 +42,26 @@ function browserWindowProcesses(port) {
   }
 }
 
+// Count the packaged server binary. Inside the bundle the bot worker IS this
+// same executable (it re-dispatches through main._run_frozen_worker), so "the
+// bot booted" and "the bot booted in its own process" are different claims --
+// and only the second can be checked from outside the app.
+function serverProcessCount() {
+  try {
+    const output = execSync(
+      `powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object CommandLine | Select-Object Name,CommandLine | ConvertTo-Csv -NoTypeInformation"`,
+      { encoding: "utf8", windowsHide: true, maxBuffer: 32 * 1024 * 1024 },
+    ).toLowerCase();
+    let count = 0;
+    for (const line of output.split("\n")) {
+      if (line.includes("scriptplayground-server.exe")) count += 1;
+    }
+    return count;
+  } catch (error) {
+    throw new Error(`server process count failed (cannot verify): ${error.message.split("\n")[0]}`);
+  }
+}
+
 (async () => {
   const port = PACKAGED ? 8798 : 8797;
   process.env.SCRIPTPLAYGROUND_DATA_DIR = DATA_DIR;
@@ -59,6 +79,10 @@ function browserWindowProcesses(port) {
   console.log("== browser sweep BEFORE ==", JSON.stringify(browserWindowProcesses(port)));
   const launchedBrowser = browserWindowProcesses(port);
   if (launchedBrowser.length) throw new Error("browser already running before launch");
+  // Baseline, so the worker and cleanup assertions below are relative: a copy
+  // of the app already running on this machine must not decide them either way.
+  const serverProcsBefore = serverProcessCount();
+  console.log("== server processes before launch ==", serverProcsBefore);
 
   console.log("launching Electron app…", PACKAGED ? `(packaged: ${PACKAGED_EXE})` : "(dev)" );
   const app = await electron.launch(
@@ -105,8 +129,33 @@ function browserWindowProcesses(port) {
   await win.locator("#run-stats").filter({ hasText: "slash commands" }).waitFor({ timeout: 90000 });
   console.log("2. bot booted:", (await win.locator("#run-stats").textContent()).trim());
 
-  // 3) slash command /panel via the palette
+  // 3) the bot has to be alive in its OWN process, not inside the server
+  const serverProcsAfterRun = serverProcessCount();
+  if (PACKAGED && serverProcsAfterRun < serverProcsBefore + 1) {
+    throw new Error(
+      `no worker subprocess: server processes went ${serverProcsBefore} -> ${serverProcsAfterRun}`,
+    );
+  }
+  console.log(`3. worker subprocess alive (+${serverProcsAfterRun - serverProcsBefore} process)`);
+
+  // 4) prefix command from a simulated user -> bot.process_commands
   const composer = win.locator("#composer-input");
+  await composer.click();
+  await composer.pressSequentially("!ping");
+  await composer.press("Enter");
+  await win.locator(".msg").filter({ hasText: "Pong from the worker subprocess." }).last()
+    .waitFor({ timeout: 20000 });
+  console.log("4. !ping dispatched through discord.py — Pong visible");
+
+  // 5) cog listener: extension-loaded listeners must reach the worker too
+  await composer.click();
+  await composer.pressSequentially("!cog");
+  await composer.press("Enter");
+  await win.locator(".msg").filter({ hasText: "cog listener answered" }).last()
+    .waitFor({ timeout: 20000 });
+  console.log("5. cog listener answered from the worker");
+
+  // 6) slash command /panel via the palette
   await composer.click();
   await composer.pressSequentially("/panel");
   const item = win.locator("#palette .palette-item").first();
@@ -115,21 +164,21 @@ function browserWindowProcesses(port) {
   await win.locator("#cmd-send").click();
   const panelMsg = win.locator(".msg").filter({ hasText: "Control panel ready:" }).last();
   await panelMsg.waitFor({ timeout: 15000 });
-  console.log("3. /panel replied from the bot");
+  console.log("6. /panel replied from the bot");
 
-  // 4) click the bot's button
+  // 7) click the bot's button
   await panelMsg.locator(".btn", { hasText: "Wave" }).click();
   await win.locator(".msg").filter({ hasText: "waved from the desktop app!" }).last()
     .waitFor({ timeout: 15000 });
-  console.log("4. clicked Wave — bot replied (ephemeral)");
+  console.log("7. clicked Wave — bot replied (ephemeral)");
 
-  // 5) reactions: hover the panel message, add 🔥, expect a highlighted pill
+  // 8) reactions: hover the panel message, add 🔥, expect a highlighted pill
   await panelMsg.hover();
   await panelMsg.locator(`button[title="Add reaction"]`).click();
   await win.locator("#emoji-picker.open").waitFor({ timeout: 5000 });
   await win.locator("#emoji-picker.open .emoji-cell", { hasText: "🔥" }).first().click();
   await panelMsg.locator(".reaction-bar .reaction.me", { hasText: "🔥" }).waitFor({ timeout: 10000 });
-  console.log("5. reacted 🔥 from the hover toolbar — pill highlighted as me");
+  console.log("8. reacted 🔥 from the hover toolbar — pill highlighted as me");
 
   // 6) user settings overlay: panes switch, sound switch toggles, Escape closes
   await win.locator("#open-user-settings").click();
@@ -144,9 +193,21 @@ function browserWindowProcesses(port) {
   await soundSwitch.click();
   await win.keyboard.press("Escape");
   await win.locator("#user-settings-overlay").waitFor({ state: "hidden", timeout: 5000 });
-  console.log("6. user settings overlay: appearance + sound panes, switch toggled, Escape closed");
+  console.log("9. user settings overlay: appearance + sound panes, switch toggled, Escape closed");
 
-  // 7) the no-browser-window proof DURING the session
+  // 10) restart: the packaged worker has to boot again and still answer
+  await win.locator("#btn-restart").click();
+  await win.locator("#run-stats").filter({ hasText: "restarted" }).waitFor({ timeout: 30000 });
+  await win.getByRole("button", { name: "▶ Run", exact: true }).click();
+  await win.locator("#run-stats").filter({ hasText: "slash commands" }).waitFor({ timeout: 90000 });
+  await composer.click();
+  await composer.pressSequentially("!ping");
+  await composer.press("Enter");
+  await win.locator(".msg").filter({ hasText: "Pong from the worker subprocess." }).last()
+    .waitFor({ timeout: 20000 });
+  console.log("10. restarted the worker and answered !ping again");
+
+  // 11) the no-browser-window proof DURING the session
   const during = browserWindowProcesses(port);
   console.log("== browser sweep DURING ==", JSON.stringify(during));
   if (during.length) throw new Error(`browser windows opened: ${during.join(", ")}`);
@@ -160,6 +221,16 @@ function browserWindowProcesses(port) {
   const after = browserWindowProcesses(port);
   console.log("== browser sweep AFTER ==", JSON.stringify(after));
   if (after.length) throw new Error(`browser windows lingered: ${after.join(", ")}`);
+
+  // Clean shutdown: neither the server nor the worker may outlive the app.
+  // Compared against the baseline so a copy already running here is fine.
+  const serverProcsAfterClose = serverProcessCount();
+  console.log("== server processes after close ==", serverProcsAfterClose);
+  if (serverProcsAfterClose > serverProcsBefore) {
+    throw new Error(
+      `server or worker process outlived the app: ${serverProcsBefore} -> ${serverProcsAfterClose}`,
+    );
+  }
 
   console.log(`WALK-PASS (${PACKAGED ? "packaged" : "dev"}): full flow complete, zero browser windows opened`);
 })().catch((error) => {
