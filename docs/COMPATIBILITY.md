@@ -76,13 +76,40 @@ Empty rows are not invitations to complete Discord.
 | Modals | `send_modal` → modal submit | yes | yes | Supported |
 | Double interaction response | discord.py raises `InteractionResponded` | n/a | yes | Supported (real error surfaces) |
 | Worker crash / CPU timeout / restart | terminate → kill | yes | n/a | Supported |
-| Typing | — | — | — | Not implemented |
+| Typing: inbound | TYPING_START -> `parse_typing_start` -> `on_typing` / `on_raw_typing` | yes | yes | Supported |
+| Typing: outbound | `async with channel.typing()` -> `POST /channels/{id}/typing` | yes (composer indicator) | yes | Supported |
 | Presence | — | — | — | Not implemented |
 | Threads: `create_thread`, `fetch_channel`, `thread.send` | `POST /channels/{id}/threads`, `GET /channels/{id}`, `POST /channels/{id}/messages` | yes (create/archive/delete from the sidebar) | yes | Supported |
 | Thread gateway events | THREAD_CREATE / THREAD_UPDATE / THREAD_DELETE / THREAD_MEMBERS_UPDATE -> `parse_thread_*` | yes | yes | Supported |
 | Bulk message delete events | REST bulk delete mutates the world | no UI | no | Partially supported (world only, no event) |
 | Real voice audio (UDP/voice protocol) | — | — | — | Not simulated by design |
 | Real Discord gateway / REST | never contacted | — | — | Never contacted |
+
+### Typing: what is and is not modelled
+
+Both directions are proven by `tests/test_acceptance.py`, separately, because
+they are different contracts: a bot *receiving* typing is a gateway event, a
+bot *sending* typing is a REST call.
+
+- **Inbound** feeds the same `TYPING_START` body a real gateway sends. Two
+  details are load-bearing and both come from the installed library:
+  `timestamp` is Unix seconds, because `RawTypingEvent` feeds it straight to
+  `datetime.fromtimestamp()`; and `member` is included, because
+  `bot.run(token)` leaves `_chunk_guilds` False, so a real bot without the
+  members intent has an empty member cache. Real Discord sends the member for
+  exactly that case and `parse_typing_start` falls back to it — without it only
+  `on_raw_typing` fires and `on_typing` silently never does.
+- **Outbound** answers the real `POST /channels/{id}/typing`. The old
+  `trigger_typing` route was not a Discord route and was replaced rather than
+  kept as a second path.
+- Typing is **transient state, never a timeline entry**. The world keeps a
+  10s deadline per (channel, user) and prunes on read, so an indicator
+  disappears without a timer on either side. The composer indicator is
+  rendered from that world state, not from a local countdown.
+- **Not modelled**: typing rate limiting or the real 10s refresh cadence (a
+  single `channel.typing()` block produces one event, not one per refresh);
+  typing inside DMs, which has no DM model yet; and typing in voice channels,
+  which are UI-only state with no channel object.
 
 ### Threads: what is and is not modelled
 

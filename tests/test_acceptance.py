@@ -1933,6 +1933,177 @@ def test_threads_stay_inside_their_worker_and_survive_a_restart(server):
     assert reborn is not None and reborn["archived"] is False, (reborn, _threads_in(st))
 
 
+# --------------------------------------------------------------------------
+# Typing: TYPING_START and channel.typing() through the real library
+# --------------------------------------------------------------------------
+
+TYPING_BOT = """import discord
+from discord.ext import commands
+
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+@bot.event
+async def on_typing(channel, user, when):
+    await channel.send(f"typing seen {user.name} in {channel.name} year={when.year}")
+
+
+bot.run("fake-token")
+"""
+
+
+TYPING_COG_BOT = """import discord
+from discord.ext import commands
+
+intents = discord.Intents.default()
+intents.message_content = True
+
+
+class Watcher(commands.Cog):
+    @commands.Cog.listener()
+    async def on_typing(self, channel, user, when):
+        await channel.send(f"cog typing {user.name} in {channel.name}")
+
+
+class WatcherBot(commands.Bot):
+    async def setup_hook(self):
+        # a module-level setup() is the extension convention and never runs for
+        # the bot's own entry file; setup_hook is what actually gets awaited
+        await self.add_cog(Watcher())
+
+
+bot = WatcherBot(command_prefix="!", intents=intents)
+bot.run("fake-token")
+"""
+
+
+TYPING_SILENT_BOT = """import discord
+from discord.ext import commands
+
+# No on_typing handler: typing itself must never put anything in the timeline,
+# so this bot has to stay quiet or the assertion below measures the bot.
+bot = commands.Bot(command_prefix="!", intents=discord.Intents.default())
+
+bot.run("fake-token")
+"""
+
+
+TYPING_OUT_BOT = """import asyncio
+import discord
+from discord.ext import commands
+
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+@bot.command()
+async def typeit(ctx):
+    async with ctx.channel.typing():
+        await asyncio.sleep(0.3)
+    await ctx.send("typed")
+
+
+bot.run("fake-token")
+"""
+
+
+def _user_typing(sid, channel_id=None, user_id=None):
+    """Simulated user starts typing (the UI action that emits TYPING_START)."""
+    st, resp = call("POST", f"/api/session/{sid}/typing",
+                    {"channel_id": channel_id, "user_id": user_id})
+    assert st == 200, resp
+    return resp.get("state") or call("GET", f"/api/session/{sid}/state")[1]
+
+
+def _typing_in(st, channel_id=None):
+    return [t for t in (st.get("typing") or [])
+            if channel_id is None or t.get("channel_id") == str(channel_id)]
+
+
+@pytest.mark.timeout(300)
+def test_user_typing_reaches_the_bot_through_the_gateway(server):
+    """Browser -> TYPING_START -> real parse_typing_start -> on_typing."""
+    sid = ready_session(TYPING_BOT, "typing bot ready")
+    st = _user_typing(sid)
+    # the parser resolves the user through guild.get_member, so cross-checking
+    # the bot's answer against the simulator's own member list is what proves
+    # discord.py did the resolving rather than us handing it a name
+    assert _typing_in(st), st.get("typing")
+    typing_user = _typing_in(st)[0]
+    assert typing_user["bot"] is False, typing_user
+    who = typing_user["name"]
+
+    st = wait_for(sid, lambda s: any("typing seen" in (m.get("content") or "")
+                                     for m in s.get("messages", [])),
+                  label="on_typing reply")
+    reply = next(m["content"] for m in st["messages"] if "typing seen" in m["content"])
+    assert f"typing seen {who} in playground" in reply, (who, reply)
+    assert "year=" in reply, reply
+
+    dispatched = [e for e in st["events"]
+                  if e.get("details", {}).get("event") == "TYPING_START"]
+    assert dispatched, [e.get("details") for e in st["events"]][-5:]
+    assert dispatched[-1]["details"]["status"] == "dispatched"
+
+
+@pytest.mark.timeout(300)
+def test_cog_listener_receives_the_typing_event(server):
+    """@commands.Cog.listener() on_typing reaches an extension-loaded cog."""
+    sid = ready_session(TYPING_COG_BOT, "typing cog ready")
+    who = _typing_in(_user_typing(sid))[0]["name"]
+    st = wait_for(sid, lambda s: any("cog typing" in (m.get("content") or "")
+                                     for m in s.get("messages", [])),
+                  label="cog on_typing reply")
+    reply = next(m["content"] for m in st["messages"] if "cog typing" in m["content"])
+    assert f"cog typing {who} in playground" in reply, (who, reply)
+
+
+@pytest.mark.timeout(300)
+def test_bot_typing_indicator_reaches_the_simulated_world(server):
+    """async with channel.typing() -> real POST /channels/{id}/typing."""
+    sid = ready_session(TYPING_OUT_BOT, "typing out bot ready")
+    call("POST", f"/api/session/{sid}/message", {"content": "!typeit"})
+    st = wait_for(sid, lambda s: any("typed" == (m.get("content") or "")
+                                     for m in s.get("messages", [])),
+                  label="typing command reply")
+    # discord.py made the real HTTP call; the fake transport answered it and
+    # recorded the transient state
+    actions = [e for e in st["events"]
+               if e.get("details", {}).get("operation") == "channel.typing"]
+    assert actions, [e.get("details") for e in st["events"]][-8:]
+    assert actions[-1]["details"]["status"] == "success"
+    bot_typing = [t for t in _typing_in(st) if t["bot"]]
+    assert bot_typing, st.get("typing")
+    assert bot_typing[0]["name"] == "Playground Bot", bot_typing
+
+
+@pytest.mark.timeout(240)
+def test_typing_is_transient_and_creates_no_messages(server):
+    """Typing is UI state, never a timeline entry."""
+    sid = ready_session(TYPING_SILENT_BOT, "typing transient bot ready")
+    before = len(call("GET", f"/api/session/{sid}/state")[1]["messages"])
+    for _ in range(3):
+        _user_typing(sid)
+    after_state = call("GET", f"/api/session/{sid}/state")[1]
+    assert len(after_state["messages"]) == before, after_state["messages"]
+    # repeated typing from one user collapses to one entry
+    assert len(_typing_in(after_state)) == 1, after_state["typing"]
+
+
+@pytest.mark.timeout(420)
+def test_typing_does_not_leak_between_workers(server):
+    """Three workers, three worlds: typing in one is invisible to the others."""
+    a = ready_session(TYPING_BOT, "typing isolate a ready")
+    b = ready_session(TYPING_BOT, "typing isolate b ready")
+    c = ready_session(TYPING_BOT, "typing isolate c ready")
+    _user_typing(a)
+    for sid, label in ((b, "b"), (c, "c")):
+        st = call("GET", f"/api/session/{sid}/state")[1]
+        assert _typing_in(st) == [], (label, st["typing"])
+
 
 @pytest.mark.timeout(240)
 def test_real_discord_network_is_never_contacted(server):

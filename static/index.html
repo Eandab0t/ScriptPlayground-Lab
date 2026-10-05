@@ -1180,6 +1180,7 @@ function render(st) {
     currentChannel = st.channels.length ? st.channels[0].id : null;
   }
   renderChannels(st);
+  renderTyping(st);
   renderMembers(st);
   renderInspector(st);
 
@@ -3478,6 +3479,19 @@ function playSound(kind = "message") {
   } catch (_) { /* Audio is an optional UI enhancement. */ }
 }
 let typingTimer = null;
+function renderTyping(st) {
+  // Typed from the simulated world's own typing state, never from a local
+  // timer: the server prunes expired indicators, so a stale "is typing…" clears
+  // itself on the next poll instead of lingering after the user stopped.
+  const row = $("#typing-row");
+  if (!row) return;
+  const here = (st.typing || []).filter((t) => String(t.channel_id) == String(currentChannel));
+  if (!here.length) { row.hidden = true; return; }
+  const names = here.map((t) => t.name);
+  $("#typing-name").textContent =
+    names.length === 1 ? names[0] : names.length === 2 ? `${names[0]} and ${names[1]}` : "Several people";
+  row.hidden = false;
+}
 function showTyping(duration = 1400) {
   const row = $("#typing-row");
   if (!row) return;

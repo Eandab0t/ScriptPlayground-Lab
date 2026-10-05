@@ -36,6 +36,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 import types
 import typing
@@ -571,7 +572,7 @@ class ProjectTransport:
             ("PATCH", "/channels/{channel_id}/messages/{message_id}"): self._patch_channel_message,
             ("DELETE", "/channels/{channel_id}/messages/{message_id}"): self._delete_channel_message,
             ("POST", "/channels/{channel_id}/messages/{message_id}/reactions/{emoji}/@me"): self._post_reaction,
-            ("POST", "/channels/{channel_id}/trigger_typing"): self._post_typing,
+            ("POST", "/channels/{channel_id}/typing"): self._post_channel_typing,
             ("GET", "/applications/{application_id}/commands"): self._get_application_commands,
             ("POST", "/applications/{application_id}/commands"): self._post_application_command,
             ("PUT", "/applications/{application_id}/commands"): self._put_application_commands,
@@ -709,6 +710,28 @@ class ProjectTransport:
         """THREAD_DELETE carries ids and the channel type, nothing else."""
         return {"id": str(thread.id), "guild_id": str(GUILD_ID),
                 "parent_id": str(thread.parent_id), "type": int(thread.thread_type)}
+
+    def gateway_typing_start_payload(self, member: pg.MockMember, channel: pg.MockChannel) -> dict:
+        """TYPING_START carries ids, an epoch timestamp and the member.
+
+        Two details are load-bearing, both taken from the installed library:
+
+        * ``timestamp`` is Unix seconds, not ISO - RawTypingEvent feeds it
+          straight to ``datetime.fromtimestamp()``.
+        * ``member`` is present because ``bot.run(token)`` leaves
+          ``_chunk_guilds`` False, so a real bot without the members intent has
+          an empty member cache and ``guild.get_member()`` returns None. Real
+          Discord sends the member for exactly that case, and
+          ``parse_typing_start`` falls back to it; without it only
+          ``on_raw_typing`` fires and ``on_typing`` never does.
+        """
+        return {
+            "channel_id": str(channel.id),
+            "user_id": str(member.id),
+            "guild_id": str(GUILD_ID),
+            "timestamp": time.time(),
+            "member": self._member_payload(member),
+        }
 
     def gateway_thread_members_update_payload(self, thread: pg.MockThread, *,
                                               added: list | None = None,
@@ -1119,10 +1142,17 @@ class ProjectTransport:
         self._message_or_raise(match["message_id"])
         return self._thread_payload(self._new_thread(self._thread_parent(match), payload))
 
-    def _post_typing(self, match, payload, params):
+    def _post_channel_typing(self, match, payload, params):
+        """``async with channel.typing():`` - discord.py's real REST call.
+
+        The indicator is transient state in the simulated world, not a message,
+        and expires on its own after Session.TYPING_TTL_SECONDS.
+        """
         channel = self._channel_or_raise(match["channel_id"])
+        self.session.start_typing(self.session.guild.me.id, channel.id)
         self.session.log("⌨️", f"bot is typing in #{channel.name}", kind="action",
-                         details={"operation": "trigger_typing", "channel": channel.name, "status": "success"})
+                         details={"operation": "channel.typing", "channel": channel.name,
+                                  "status": "success"})
         return {}
 
     # ------------------------------------------------ messages
@@ -2079,6 +2109,7 @@ class ProjectRuntime:
         "thread_update": "parse_thread_update",
         "thread_delete": "parse_thread_delete",
         "thread_members_update": "parse_thread_members_update",
+        "typing_start": "parse_typing_start",
     }
 
     def _gateway_payload(self, kind: str, payload: dict) -> dict:
@@ -2159,6 +2190,13 @@ class ProjectRuntime:
                 return self.transport.gateway_thread_delete_payload(thread)
             return self.transport.gateway_thread_members_update_payload(
                 thread, added=payload.get("added") or [], removed=payload.get("removed") or [])
+        if kind == "typing_start":
+            channel_id = str(payload.get("channel_id") or "")
+            channel = session.channels.get(channel_id)
+            if channel is None:
+                raise ValueError("typing channel no longer exists")
+            return self.transport.gateway_typing_start_payload(
+                self._member_or_raise(payload), channel)
         raise ValueError(f"unsupported event {kind!r}")
 
     def _member_or_raise(self, payload: dict) -> pg.MockMember:
@@ -2257,6 +2295,11 @@ class ProjectRuntime:
             return
         if event == "message_delete":
             await self.dispatch_event("message_delete", {"message_id": args[0]})
+            return
+        if event == "typing_start":
+            await self.dispatch_event("typing_start", {
+                "user_id": args[0] if args else user_id,
+                "channel_id": str(args[1]) if len(args) > 1 else str(session.channel.id)})
             return
         if event == "member_join":
             member = result if isinstance(result, pg.MockMember) else session.guild.get_member(user_id)

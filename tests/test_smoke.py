@@ -3055,5 +3055,21 @@ async def main() -> None:
     print(f"\nall {len(tests)} checks passed")
 
 
+async def test_typing_state_expires_on_its_own() -> None:
+    """A typing indicator is transient: the world prunes it without a timer."""
+    s = Session("typing-ttl")
+    s.start_typing(1, ttl=5.0)
+    s.start_typing(2, ttl=0.01)
+    assert sorted(s.active_typing()) == sorted([(s.channel.id, 1), (s.channel.id, 2)])
+    await asyncio.sleep(0.05)
+    # the short-lived one is gone; the long-lived one is untouched
+    assert s.active_typing() == [(s.channel.id, 1)]
+    s.start_typing(1, ttl=0.01)
+    await asyncio.sleep(0.05)
+    # an emptied window is dropped rather than left behind as an empty dict
+    assert s.active_typing() == []
+    assert s.typing_users == {}
+
+
 if __name__ == "__main__":
     asyncio.run(main())

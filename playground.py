@@ -1290,6 +1290,10 @@ class Session:
         self.channels: dict[str, MockChannel] = {}
         self.next_channel_id = 1
         self.next_thread_id = 1
+        # Typing is transient UI state, never a timeline entry. Discord keeps a
+        # typing indicator for 10s; we keep the same deadline per (channel, user)
+        # and prune on read, so an expired indicator disappears without a timer.
+        self.typing_users: dict[int, dict[int, float]] = {}
         self.revision = 0  # monotonic state key for cheap browser render checks
         self.channel = self.make_channel("playground")
         self.client = MockClient(self)
@@ -1852,6 +1856,34 @@ class Session:
                 self.order.remove(mid)
         self.log("🗑️", f"channel #{ch.name} deleted", kind="action",
                  details={"operation": "channel.delete", "channel": ch.name, "status": "ok"})
+
+    # ------------------------------------------------ typing
+
+    TYPING_TTL_SECONDS = 10.0
+    """How long a typing indicator lives, matching Discord's own window."""
+
+    def start_typing(self, user_id: int, channel_id: int | None = None,
+                     *, ttl: float | None = None) -> None:
+        """Record that ``user_id`` is typing in a channel right now."""
+        target = int(channel_id if channel_id is not None else self.channel.id)
+        window = self.typing_users.setdefault(target, {})
+        window[int(user_id)] = time.monotonic() + (
+            self.TYPING_TTL_SECONDS if ttl is None else ttl)
+
+    def active_typing(self) -> list[tuple[int, int]]:
+        """(channel_id, user_id) pairs still typing; prunes what has expired."""
+        now = time.monotonic()
+        alive: list[tuple[int, int]] = []
+        for channel_id in list(self.typing_users):
+            window = self.typing_users[channel_id]
+            for user_id in list(window):
+                if window[user_id] <= now:
+                    del window[user_id]
+                else:
+                    alive.append((channel_id, user_id))
+            if not window:
+                del self.typing_users[channel_id]
+        return alive
 
     def make_thread(self, parent_id: int, name: str, *, owner_id: int | None = None,
                     thread_type: int = 11, auto_archive_duration: int = 1440) -> MockThread:
@@ -3174,6 +3206,14 @@ def _member_details_json(session: Session) -> list[dict]:
     return details
 
 
+def _typing_name(session: Session, user_id: int) -> str:
+    """Display name for a typing indicator; bots and unknown ids still render."""
+    member = session.guild.get_member(int(user_id))
+    if member is not None:
+        return member.display_name
+    return session.guild.me.name if int(user_id) == session.guild.me.id else str(user_id)
+
+
 def state(session: Session) -> dict:
     msgs = []
     for mid in session.order:
@@ -3212,6 +3252,11 @@ def state(session: Session) -> dict:
                      "message_count": c.message_count,
                      "auto_archive_duration": c.auto_archive_duration}
                     for c in session.channels.values() if c.is_thread],
+        # pruned on read: an expired indicator simply stops being reported
+        "typing": [{"channel_id": str(channel_id), "user_id": str(user_id),
+                    "name": _typing_name(session, user_id),
+                    "bot": user_id == session.guild.me.id}
+                   for channel_id, user_id in session.active_typing()],
         "roles": [{"id": str(r.id), "name": r.name}
                   for r in session.guild.roles if r.name != "@everyone"],
         "bot": {"id": session.guild.me.id, "name": session.guild.me.name},

@@ -1164,6 +1164,32 @@ async def _thread_body(request: web.Request) -> dict:
     return body if isinstance(body, dict) else {}
 
 
+async def start_typing(request: web.Request) -> web.Response:
+    """A simulated user starts typing (the action that emits TYPING_START).
+
+    The gateway event is dispatched through the real worker so a bot's
+    ``on_typing`` fires from discord.py's own ``parse_typing_start``; this
+    route only records the transient indicator in the simulated world.
+    """
+    session = _get_session(request)
+    body = await _thread_body(request)
+    channel_id = str(body.get("channel_id") or session.channel.id)
+    user_id = int(body.get("user_id") or session.user_id)
+    member = session.guild.get_member(user_id)
+    if member is None:
+        return web.json_response({"ok": False, "error": "member no longer exists"}, status=404)
+    session.start_typing(user_id, int(channel_id))
+    early = await _project_session_op(
+        request, "start_typing",
+        args=[user_id, channel_id],
+        event="typing_start")
+    if early is not None:
+        return early
+    _notify_event(session, "typing_start", {"user_id": user_id, "channel_id": channel_id})
+    _bump(session.sid)
+    return web.json_response({"ok": True, "state": state(session)})
+
+
 async def create_thread(request: web.Request) -> web.Response:
     """A simulated user opens a thread (the action that emits THREAD_CREATE)."""
     session = _get_session(request)
@@ -1715,6 +1741,7 @@ def build_app(*, auto_shutdown: bool = False, data_dir: Path | None = None) -> w
     app.router.add_post("/api/session/{sid}/members/roles", member_roles)
     app.router.add_post("/api/session/{sid}/roles", guild_roles)
     app.router.add_post("/api/session/{sid}/channels/delete", delete_channel)
+    app.router.add_post("/api/session/{sid}/typing", start_typing)
     app.router.add_post("/api/session/{sid}/threads", create_thread)
     app.router.add_post("/api/session/{sid}/threads/{thread_id}/archive", archive_thread)
     app.router.add_post("/api/session/{sid}/threads/{thread_id}/delete", delete_thread)
