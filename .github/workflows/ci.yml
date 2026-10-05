@@ -19,17 +19,27 @@ env:
 
 jobs:
   python:
-    name: Python suites
+    name: Python ${{ matrix.python }} suites
     # Pinned: ubuntu-latest migrates to Ubuntu 26 on 2026-10-19 and the script
     # watchdog depends on Linux thread scheduling, so an unpinned image turns a
     # platform move into an unexplained test failure.
+    #
+    # 3.11 is the documented floor, not a preference. aiohttp 3.14 declares
+    # Requires-Python >=3.10, and bot_runtime.py uses asyncio.timeout(), which
+    # is 3.11+. So 3.9 was never installable and 3.10 never bootable; the
+    # README used to claim 3.9+ on no evidence. Every supported version runs
+    # the fast suites, and only the newest runs the expensive real-bot gate.
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
           cache: pip
 
       - name: Install Python dependencies
@@ -40,7 +50,10 @@ jobs:
         # same thing without any commit. See requirements-dev.txt.
         run: python -m pip install -r requirements-dev.txt
 
+      # Lint once, on the canonical version: ruff's result does not depend on
+      # the interpreter, and running it twice only adds minutes.
       - name: Ruff lint
+        if: matrix.python == '3.12'
         run: ruff check .
 
       - name: Smoke suites (auto-discovered)
@@ -54,12 +67,14 @@ jobs:
       # This is the suite docs/COMPATIBILITY.md points at: it boots a real
       # discord.py bot in a real worker and proves the callback fires. A feature
       # may only be listed as "Supported" when a test here proves it, so this
-      # gate and the matrix have to move together.
+      # gate and the matrix have to move together. It boots a real subprocess
+      # per case, so it runs on one version rather than the whole matrix.
       - name: Real-bot acceptance suite (compatibility matrix proof)
+        if: matrix.python == '3.12'
         run: python -X utf8 -m pytest tests/test_acceptance.py -q
 
       # `--ignore` because `testpaths = tests` already collects the acceptance
-      # module: without it these 33 tests run twice in the same job. The gate
+      # module: without it these tests run twice in the same job. The gate
       # above is the authoritative run.
       - name: Full suite (everything except the acceptance gate above)
         run: python -X utf8 -m pytest -q --ignore=tests/test_acceptance.py

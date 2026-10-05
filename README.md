@@ -16,7 +16,9 @@ Write plain `discord.py` code in the web editor, press **Run**, and see exactly 
 
 ## Quick start
 
-Requires Python 3.9 or newer. From the project root:
+Requires Python 3.11 or newer (tested on 3.11 and 3.12). The floor is set by
+the runtime, not by preference: `aiohttp 3.14` requires `>=3.10`, and the
+runtime uses `asyncio.timeout()`, which is 3.11+. From the project root:
 
 ```bash
 python -m venv .venv
@@ -70,7 +72,7 @@ Categories=Development;IDE;
 
 ## Beta status and support
 
-This checkout is a **pre-release 1.0 Beta candidate**, not a stable 1.0 release. The `v0.9.0-baseline` tag marks the audit starting point, not this current worktree. Requires Python 3.9+ and discord.py 2.6+ for Components V2. Known limits: one simulated guild with fixed fixture users and roles; no Discord gateway, REST bot transport, or voice; Python scripts are not isolated; and the UI is dark-first and desktop-oriented.
+This checkout is a **pre-release 1.0 Beta candidate**, not a stable 1.0 release. The `v0.9.0-baseline` tag marks the audit starting point, not this current worktree. Requires Python 3.11+ and discord.py 2.6+ for Components V2. Known limits: one simulated guild with fixed fixture users and roles; no Discord gateway, REST bot transport, or voice; Python scripts are not isolated; and the UI is dark-first and desktop-oriented.
 
 Use the support or issue-reporting channel provided by whoever supplied this checkout; this README does not assume a public issue-tracker URL. Include your OS, Python version, launch command, a traceback, and a minimal reproduction. Remove tokens, client secrets, cookies, and webhook URLs from reports.
 
