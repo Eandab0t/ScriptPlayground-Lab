@@ -122,7 +122,7 @@ login flow runs against a fake REST transport, so `setup_hook`, cog loading, `tr
 cog listeners, slash commands, component clicks, modals, and `on_message` handlers all run through
 discord.py's own dispatch — no network is ever touched. That is the *supported* surface listed in
 `docs/COMPATIBILITY.md`, not the whole Discord API: the simulated world is deterministic and
-deliberately incomplete (no typing, presence, threads, bulk-delete gateway events, or real voice),
+deliberately incomplete (no typing, presence, bulk-delete gateway events, or real voice),
 and each claim in that file is backed by an end-to-end test. Live tokens are scrubbed from the
 copied sandbox (`.env` and hardcoded values in source files) and replaced with a placeholder.
 
@@ -220,8 +220,9 @@ bot into the editor — `commands.Bot`, `bot.run("fake-token")`, cogs, Views,
 Modals — and press **Run**. Simulated user actions (reactions, member joins
 and edits, voice, channel and role changes) reach the bot as real gateway
 events, so `on_raw_reaction_add`, `on_member_join`, `on_voice_state_update` and
-friends fire through discord.py's own dispatch. The module is imported inside an isolated **worker
-process** (private sandbox cwd, private `sys.path`, private event loop); all
+`on_thread_create` and friends fire through discord.py's own dispatch. The module
+is imported inside an isolated **worker process** (private sandbox cwd, private
+`sys.path`, private event loop); all
 Discord networking is intercepted, so `bot.run()` never contacts discord.com
 and the token is a placeholder. Simulated messages, slash commands, component
 clicks and gateway events are dispatched through the *real* discord.py
@@ -245,6 +246,7 @@ The mode is detected from the source: code that constructs `commands.Bot` /
 | `discord.Message` | `MockMessage` (edit / delete / reply / react / pin) |
 | Guild, members, roles | Fixed fixtures: **You**, Alice, Bob, Carol, 3 roles |
 | Channels | Scripts call `await guild.create_text_channel("name")` (name normalized, dupes get `-2`), `channel.send(...)`, `channel.delete()`; the sidebar lists channels with unread badges and switches timelines |
+| Threads | Bots call `await channel.create_thread(...)`, `thread.send(...)`, `thread.edit(archived=...)`, `thread.delete()`; user-opened threads arrive as THREAD_CREATE. The sidebar nests them under the parent channel with archive / reopen / delete, and `THREAD_UPDATE` / `THREAD_DELETE` / `THREAD_MEMBERS_UPDATE` reach cog listeners |
 | Files / attachments | Real inline thumbnails for small images (data URIs); other files as name chips |
 | Embed media | `set_image` / `set_thumbnail` render; `attachment://` URLs resolve against the message's files |
 | Select menus | String multi-selects plus `UserSelect` / `RoleSelect` / `ChannelSelect` / `MentionableSelect`, all clickable |

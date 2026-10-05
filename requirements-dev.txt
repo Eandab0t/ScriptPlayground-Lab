@@ -1,0 +1,16 @@
+# Exact versions CI installs. requirements.txt pins the simulator runtime; this
+# pins the tools that decide whether the suites pass, so a green run always
+# means the same thing on the same commit.
+#
+# pytest-asyncio backs `asyncio_mode = auto` in pytest.ini (the smoke and
+# scenario suites define their cases as `async def test_*`), and pytest-timeout
+# backs the @pytest.mark.timeout guards the acceptance suite relies on so a
+# hung worker cannot hang the job.
+pytest==9.1.1
+pytest-asyncio==1.4.0
+pytest-timeout==2.4.0
+ruff==0.16.6
+
+# Build-only: the packaged-release CI job runs `npm run dist`, whose PyInstaller
+# step imports the runtime from requirements.txt. Not needed to run the tests.
+pyinstaller==6.21.0

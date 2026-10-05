@@ -237,7 +237,7 @@ This covers the operations already represented in the playground. It does not cl
 - No permission-management UI.
 - No multi-guild state.
 - No voice or stage model.
-- No threads, DMs, webhooks, forums, scheduled events, rate limits, or intent simulation.
+- No DMs, webhooks, forums, scheduled events, rate limits, or intent simulation.
 - OAuth sessions are memory-only, do not survive restart, and do not provide guild discovery, account settings, real Discord data access, or real Discord actions. Callback-query redaction is guaranteed by the production `web.run_app()` wiring, not by arbitrary embedding callers that choose aiohttp's default access logger.
 - Some mock methods are intentionally shallow and may accept arguments that real Discord would reject.
 

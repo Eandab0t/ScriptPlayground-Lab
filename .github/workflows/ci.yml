@@ -36,11 +36,9 @@ jobs:
         run: python -m pip install -r requirements.txt
 
       - name: Install dev tools (not in requirements.txt)
-        # pytest-asyncio backs `asyncio_mode = auto` in pytest.ini (the smoke and
-        # scenario suites define their cases as `async def test_*`), and
-        # pytest-timeout backs the @pytest.mark.timeout guards the acceptance
-        # suite relies on so a hung worker cannot hang the job.
-        run: python -m pip install pytest pytest-asyncio pytest-timeout ruff
+        # Pinned: an unpinned test toolchain lets a green run stop meaning the
+        # same thing without any commit. See requirements-dev.txt.
+        run: python -m pip install -r requirements-dev.txt
 
       - name: Ruff lint
         run: ruff check .
@@ -156,6 +154,67 @@ jobs:
           name: desktop-walk-logs
           path: |
             .test-artifacts/desktop-walk/
+            ~/AppData/Local/ScriptPlayground/ScriptPlayground.log
+          if-no-files-found: ignore
+          retention-days: 5
+
+  packaged:
+    name: Packaged release (PyInstaller + Electron)
+    # The `desktop` job above walks the dev checkout, so it never exercises what
+    # users actually download: PyInstaller's bundled interpreter, electron-
+    # builder's extraResources wiring, the packaged resource paths, or the
+    # bundled node_shim. This job builds the real artifact and walks that exact
+    # binary, which is the release check docs/DESKTOP_BUILD.md describes.
+    #
+    # Push-only on purpose: `npm run dist` is minutes of CPU for a check that
+    # only matters once the tree is heading somewhere. PRs get the dev walk.
+    if: github.event_name == 'push'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install Python dependencies
+        # requirements-dev.txt carries the PyInstaller pin; requirements.txt
+        # supplies the runtime modules the frozen server must bundle.
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install -r requirements-dev.txt
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Install Playwright chromium (drives the Electron shell)
+        run: npx playwright install chromium
+
+      - name: Build the packaged desktop app
+        run: npm run dist
+
+      - name: Walk the packaged executable end to end
+        run: npm run walk:packaged
+
+      - name: Upload packaged walk artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: packaged-walk-logs
+          path: |
+            .test-artifacts/desktop-walk-packaged/
             ~/AppData/Local/ScriptPlayground/ScriptPlayground.log
           if-no-files-found: ignore
           retention-days: 5
