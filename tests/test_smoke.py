@@ -2339,12 +2339,15 @@ async def test_data_dir_bootstrap_preserves_user_files():
         server.DATA_DIR, server.SCRIPTS_DIR, server.WORKSPACES_DIR = original
 
 
-async def test_browser_process_close_uses_five_second_grace():
+async def test_browser_process_close_stops_server_when_profile_not_in_use():
+    """When the browser child exits and no browser uses the app-mode profile,
+    the launcher still shuts the server down after the close grace.
+    """
     import launcher
 
     original_grace, original_interval = launcher._BROWSER_EXIT_GRACE, launcher._BROWSER_POLL_INTERVAL
-    launcher._BROWSER_EXIT_GRACE = 0.01
-    launcher._BROWSER_POLL_INTERVAL = 0.001
+    launcher._BROWSER_EXIT_GRACE = 0.05
+    launcher._BROWSER_POLL_INTERVAL = 0.01
 
     class FakeProcess:
         exited = False
@@ -2354,17 +2357,77 @@ async def test_browser_process_close_uses_five_second_grace():
 
     process = FakeProcess()
     stop = asyncio.Event()
-    task = asyncio.create_task(launcher._wait_for_browser_exit(process, stop))
+
+    original_scan = launcher._browser_processes_using_profile
     try:
-        await asyncio.sleep(0.005)
+        launcher._browser_processes_using_profile = lambda profile: 0
+        task = asyncio.create_task(launcher._wait_for_browser_exit(process, stop))
+        await asyncio.sleep(0.02)
         process.exited = True
-        await asyncio.wait_for(task, timeout=0.2)
+        await asyncio.wait_for(task, timeout=0.5)
         assert stop.is_set()
     finally:
         if not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        launcher._browser_processes_using_profile = original_scan
         launcher._BROWSER_EXIT_GRACE, launcher._BROWSER_POLL_INTERVAL = original_grace, original_interval
+
+
+async def test_browser_process_exit_does_not_stop_server_when_profile_still_in_use():
+    """When the browser child exits but a browser process still uses the app-mode
+    profile (Edge delegation to an existing instance), the launcher must keep the
+    server alive and must not set the stop event.
+    """
+    import launcher
+
+    original_grace = launcher._BROWSER_EXIT_GRACE
+    original_interval = launcher._BROWSER_POLL_INTERVAL
+    original_absence_grace = launcher._BROWSER_EXIT_AFTER_CHILD_EXITED_GRACE
+    launcher._BROWSER_EXIT_GRACE = 0.05
+    launcher._BROWSER_POLL_INTERVAL = 0.01
+    launcher._BROWSER_EXIT_AFTER_CHILD_EXITED_GRACE = 0.05
+
+    class FakeProcess:
+        exited = False
+
+        def poll(self):
+            return 0 if self.exited else None
+
+    process = FakeProcess()
+    stop = asyncio.Event()
+
+    original_scan = launcher._browser_processes_using_profile
+    try:
+        # First report the profile in use, then abandon it.
+        abandon_at = asyncio.get_running_loop().time() + 0.10
+
+        def scanning(profile):
+            now = asyncio.get_running_loop().time()
+            if now < abandon_at:
+                return 1 # profile still in use
+            return 0 # profile abandoned
+
+        launcher._browser_processes_using_profile = scanning
+        task = asyncio.create_task(launcher._wait_for_browser_exit(process, stop))
+        await asyncio.sleep(0.05)
+        process.exited = True
+        # The task should still be running: the profile was in use when the child
+        # exited, so the launcher must not have stopped the server yet.
+        await asyncio.sleep(0.05)
+        assert not stop.is_set()
+        assert not task.done()
+        # Let the profile be abandoned and the absence grace elapse.
+        await asyncio.wait_for(task, timeout=1.0)
+        assert stop.is_set()
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        launcher._browser_processes_using_profile = original_scan
+        launcher._BROWSER_EXIT_GRACE = original_grace
+        launcher._BROWSER_POLL_INTERVAL = original_interval
+        launcher._BROWSER_EXIT_AFTER_CHILD_EXITED_GRACE = original_absence_grace
 
 
 async def test_desktop_auto_shutdown_ignores_startup_without_clients():

@@ -50,7 +50,21 @@ Environment knobs: `SCRIPTPLAYGROUND_PYTHON` (interpreter path), `SCRIPTPLAYGROU
 
 ### Legacy launchers
 
-The optional Windows executable bundle is built with `scripts/build_windows.ps1`; see `docs/DESKTOP_BUILD.md` for packaging and data-location details. To use the Python launcher instead, double-click `ScriptPlayground.bat`. It activates `.venv` when present, then runs `python launcher.py` in the same console. Chrome/Edge app mode is preferred; when unavailable, the default browser is used and the server shuts down 30 seconds after the last UI WebSocket disconnects. For app mode, the spawned browser process is monitored, followed by a 5-second restart grace period. `python main.py` (terminal mode) refuses to start a second instance if one already listens on the port and no longer opens a duplicate browser tab in that case.
+The optional Windows executable bundle is built with `scripts/build_windows.ps1`; see `docs/DESKTOP_BUILD.md` for packaging and data-location details. To use the Python launcher instead, double-click `ScriptPlayground.bat`. It activates `.venv` when present, then runs `python launcher.py` in the same console. Chrome/Edge app mode is preferred; when unavailable, the default browser is used and the server shuts down 30 seconds after the last UI WebSocket disconnects. `python main.py` (terminal mode) refuses to start a second instance if one already listens on the port and no longer opens a duplicate browser tab in that case.
+
+#### App-mode shutdown detection (launcher.py)
+
+For app mode, the launcher opens the browser with a dedicated `--user-data-dir` profile and monitors whether any browser process is still anchored to that profile, rather than treating the spawned child process's exit as proof that the app window closed. This matters on Windows: Edge can delegate an `--app=` launch to an already-running Edge instance, which makes the spawned child exit immediately while the app window stays open. The old behavior (shut down ~5s after the child exits) would kill the server under a live window in that case.
+
+The launcher now uses a three-state check:
+
+- **Profile in use** (one or more `msedge.exe`/`chrome.exe` processes report a `--user-data-dir` ending with our profile leaf) → the server stays alive. The app window is still open, or the launcher cannot prove it is gone.
+- **Profile not in use** (no browser process references the profile) → the server shuts down after the normal close grace.
+- **Scan failed** (no `psutil`, or the process list cannot be read) → the server stays alive. Without a reliable view of other processes' command lines, the launcher cannot prove the app window is gone, so it errs on the side of keeping the server running.
+
+When the profile is in use (or the scan failed) at child exit, the launcher keeps polling. Once the profile is observed as unused, an abandonment grace (`_BROWSER_EXIT_AFTER_CHILD_EXITED_GRACE`, 2.0s) starts; if no browser reclaims the profile during that grace, the server shuts down. The grace clock starts at first confirmed absence, not at child exit, so a long-running app session does not leave the launcher waiting after every transient browser restart.
+
+**Optional dependency — `psutil`.** The profile scan uses `psutil` if it is installed. Without `psutil`, the launcher cannot read other processes' command lines and falls into the conservative "scan failed" path: the server stays alive until it is shut down by the websocket auto-shutdown path (last client disconnects) or by a signal/window close. This is safe against premature shutdown, but it means a packaged build that does not bundle `psutil` will not auto-shutdown on app-window close — it will keep running until the last browser tab disconnects or the process is killed. Package maintainers who want the app-window-close shutdown behavior should ensure `psutil` is available in the runtime environment (for example, add it to `requirements.txt` or the PyInstaller spec).
 
 When using a packaged exe, scripts, workspaces, scenarios, and designs are stored under `%LOCALAPPDATA%\ScriptPlayground` on Windows and survive upgrades. `--data-dir PATH` / `SCRIPTPLAYGROUND_DATA_DIR` can override this location. A first launch seeds built-in scripts, scenarios, and designs without replacing user files.
 

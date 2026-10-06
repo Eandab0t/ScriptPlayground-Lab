@@ -9,6 +9,8 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
+import types
 import webbrowser
 from pathlib import Path
 
@@ -19,6 +21,71 @@ import main as server
 log = logging.getLogger("playground.launcher")
 _BROWSER_EXIT_GRACE = 5.0
 _BROWSER_POLL_INTERVAL = 1.0
+_BROWSER_EXIT_AFTER_CHILD_EXITED_GRACE = 2.0
+
+
+def _import_psutil() -> types.ModuleType | None:
+    """Optional helper: only used for the app-mode close heuristic."""
+    if "psutil" in sys.modules:
+        return sys.modules["psutil"]
+    try:
+        import psutil as _psutil
+
+        sys.modules["psutil"] = _psutil
+        return _psutil
+    except ImportError:
+        return None
+
+
+def _browser_processes_using_profile(profile_dir: Path) -> int:
+    """Count browser processes whose --user-data-dir ends with our profile leaf.
+
+    Edge/Chrome can delegate an app-mode launch to an already-running instance,
+    which makes the spawned child exit while the app window stays open. Treating
+    child exit as "app closed" is therefore wrong; the real signal is whether any
+    browser process is still anchored to our profile.
+    """
+    target_leaf = profile_dir.name
+    try:
+        psutil = _import_psutil()
+        if psutil is not None:
+            try:
+                count = 0
+                for proc in psutil.process_iter(["name", "cmdline"]):
+                    try:
+                        name = proc.info["name"]
+                        cmdline = proc.info["cmdline"] or []
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                        continue
+                    if name and name.lower() in {"msedge.exe", "msedge", "chrome.exe", "chrome", "google-chrome", "google-chrome-stable"}:
+                        if _user_data_dir_leaf(cmdline) == target_leaf:
+                            count += 1
+                return count
+            except Exception:
+                log.debug("browser profile scan via psutil failed", exc_info=True)
+
+        log.debug(
+            "no psutil or no working process-command-line scan; keeping the server alive rather than killing a live app window"
+        )
+        # Conservative: without a reliable command-line view we cannot prove the
+        # app window is gone, so do not shut the server down on child exit.
+        return -1
+    except Exception:
+        log.debug("browser profile scan failed", exc_info=True)
+        return -1
+
+
+def _user_data_dir_leaf(cmdline: list[str] | str) -> str | None:
+    """Return the leaf of the --user-data-dir value, or None if not found."""
+    if isinstance(cmdline, str):
+        cmdline = cmdline.split()
+    for i, arg in enumerate(cmdline):
+        if arg.startswith("--user-data-dir="):
+            value = arg.split("=", 1)[1]
+            return Path(value).name
+        if arg == "--user-data-dir" and i + 1 < len(cmdline):
+            return Path(cmdline[i + 1]).name
+    return None
 
 
 def _browser_command() -> list[str] | None:
@@ -61,16 +128,70 @@ def _launch_browser(url: str) -> subprocess.Popen | None:
 
 
 async def _wait_for_browser_exit(process: subprocess.Popen, stop: asyncio.Event) -> None:
+    profile = server.DATA_DIR / "browser-profile"
+    profile.mkdir(parents=True, exist_ok=True)
+    loop = asyncio.get_running_loop()
+
+    # Phase 1: the spawned browser child is still alive. Poll it as before, but
+    # also keep the stop signal in view so a deliberate launcher shutdown is not
+    # blocked by the polling loop.
     while process.poll() is None and not stop.is_set():
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=_BROWSER_POLL_INTERVAL)
-        except asyncio.TimeoutError:
-            pass
-    if not stop.is_set():
+        await asyncio.sleep(_BROWSER_POLL_INTERVAL)
+
+    # The child exited. On Windows, Edge can delegate an app-mode launch to an
+    # already-running instance, which makes the child exit while the app window
+    # stays open. Treat child exit as a suspicious signal, not proof of close.
+    if stop.is_set():
+        return
+
+    # Phase 2: is any browser process still anchored to our profile?
+    # Tri-state result: >0 means in use, 0 means not in use, <0 means the scan
+    # failed and we cannot prove whether the app window is still open.
+    using = _browser_processes_using_profile(profile)
+    if using == 0:
+        # No browser uses the profile. Apply the normal close grace.
         try:
             await asyncio.wait_for(stop.wait(), timeout=_BROWSER_EXIT_GRACE)
         except asyncio.TimeoutError:
             stop.set()
+        return
+
+    # The profile is either still in use (using > 0) or we could not scan it
+    # (using < 0). In both cases keep the server alive: the app window may still
+    # be open, or we cannot prove it is gone.
+    if using > 0:
+        log.info(
+            "browser child exited quickly but a browser process still uses the app-mode profile; keeping the server alive"
+        )
+    else:
+        log.debug(
+            "browser child exited and the profile scan did not return a definitive result; keeping the server alive"
+        )
+
+    # Keep serving until we can prove the profile is abandoned, then shut down.
+    # The grace clock starts at the first confirmed absence, not at the last
+    # sighting of the profile in use, so a long-running app session does not
+    # leave the launcher waiting 2s after every transient browser restart.
+    profile_absent_since: float | None = None
+    while not stop.is_set():
+        await asyncio.sleep(_BROWSER_POLL_INTERVAL)
+        using = _browser_processes_using_profile(profile)
+        if using > 0:
+            profile_absent_since = None
+            continue
+        if using < 0:
+            # Scan failed; cannot prove the app window is gone.
+            continue
+        # No browser process uses the profile anymore.
+        if profile_absent_since is None:
+            profile_absent_since = loop.time()
+        elapsed = loop.time() - profile_absent_since
+        if elapsed >= _BROWSER_EXIT_AFTER_CHILD_EXITED_GRACE:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=_BROWSER_EXIT_GRACE)
+            except asyncio.TimeoutError:
+                stop.set()
+            return
 
 
 async def run(port: int, data_dir: Path | None = None) -> int:
