@@ -942,7 +942,7 @@ async def _run_code(session: Session, body: dict) -> web.Response:
             last_run = session.last_run or {}
             exception = last_run.get("exception") or {}
             # worker boots report the ORIGINAL exception type (TimeoutError, SyntaxError, ...)
-            summary = (f"{exception.get("type")}: {exception.get("message")}"
+            summary = (f"{exception.get('type')}: {exception.get('message')}"
                        if exception.get("type") else f"{type(error).__name__}: {error}")
             return web.json_response({
                 "ok": False, "error": summary, "last_run": last_run or None,
@@ -968,7 +968,7 @@ async def _run_code(session: Session, body: dict) -> web.Response:
             last_run = session.last_run or {}
             exception = last_run.get("exception") or {}
             # worker boots report the ORIGINAL exception type (TimeoutError, SyntaxError, ...)
-            summary = (f"{exception.get("type")}: {exception.get("message")}"
+            summary = (f"{exception.get('type')}: {exception.get('message')}"
                        if exception.get("type") else f"{type(error).__name__}: {error}")
             return web.json_response({
                 "ok": False, "error": summary, "last_run": last_run or None,
