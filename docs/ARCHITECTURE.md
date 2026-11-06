@@ -35,6 +35,8 @@ When `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET`, and `DISCORD_REDIRECT_URI` ar
 
 OAuth identity is separate from `Session.active_user`: it does not populate simulated members, read guilds, call the gateway, or send REST operations on the user's behalf. Tokens and client secrets never enter browser state or session JSON. Callback provider failures are returned as generic errors. The production `web.run_app()` entry point uses `_AccessLogger` to omit the callback query string so authorization codes and state values are not logged; callers embedding `build_app()` must configure that access logger explicitly. State/session data is intentionally memory-only for this local tool; the event-loop execution model is not a security sandbox.
 
+The server is local-only: `main.py` refuses any non-loopback `--host`, and the `_LocalOriginGuard` middleware rejects non-loopback `Host` headers (DNS rebinding) and cross-origin state-changing requests or WebSocket upgrades (drive-by POSTs from web pages). `/api/health` returns `{"application": "ScriptPlayground"}` so all three launchers (`main.py`, `launcher.py`, `desktop/main.js`) can tell a healthy instance from an unrelated service occupying the port.
+
 ## Runtime flow
 
 ```text

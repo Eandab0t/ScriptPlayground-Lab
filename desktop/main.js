@@ -152,13 +152,17 @@ function freePort(start) {
   });
 }
 
-async function portReachable(port) {
-  return new Promise((resolve) => {
-    const socket = net.connect({ host: HOST, port, timeout: 800 });
-    socket.once("connect", () => { socket.destroy(); resolve(true); });
-    socket.once("timeout", () => { socket.destroy(); resolve(false); });
-    socket.once("error", () => resolve(false));
-  });
+async function scriptplaygroundRunning(port) {
+  // Health check, not a bare TCP probe: an unrelated service on the port
+  // must never be mistaken for an existing ScriptPlayground server.
+  try {
+    const response = await fetch(`http://${HOST}:${port}/api/health`, { signal: AbortSignal.timeout(800) });
+    if (!response.ok) return false;
+    const payload = await response.json();
+    return payload.application === "ScriptPlayground";
+  } catch {
+    return false; // nothing there, or still starting
+  }
 }
 
 async function pickPort() {
@@ -174,7 +178,7 @@ function serverCommand(port) {
   if (app.isPackaged) {
     const exe = path.join(process.resourcesPath, "server", "ScriptPlayground-server.exe");
     if (!fs.existsSync(exe)) return { missing: exe };
-    // --auto-shutdown stops the server 30s after the last UI disconnects, so a
+    // --auto-shutdown stops the server 5s after the last UI disconnects, so a
     // crashed shell can never leave an orphaned server behind.
     return {
       command: exe,
@@ -257,7 +261,7 @@ function startServer(port) {
 async function waitForServer(port, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (await portReachable(port)) return true;
+    if (await scriptplaygroundRunning(port)) return true;
     if (spawnFailed || (serverProcess === null && process.env.SCRIPTPLAYGROUND_NO_SERVER !== "1")) return false;
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
@@ -327,10 +331,12 @@ if (!gotLock) {
 
   app.whenReady().then(async () => {
     ensureStartMenuShortcut();
-    let attached = await portReachable(BASE_PORT);
+    let attached = await scriptplaygroundRunning(BASE_PORT);
     if (attached) {
-      log("attaching to a server already listening on", BASE_PORT);
+      log("attaching to ScriptPlayground on", BASE_PORT);
     } else {
+      // Port occupied by something else, or free — pickPort skips busy ports,
+      // so a foreign service on BASE_PORT can never be attached to.
       const port = await pickPort();
       if (port !== BASE_PORT) log("port", BASE_PORT, "busy/unreachable — using", port);
       serverPort = port;

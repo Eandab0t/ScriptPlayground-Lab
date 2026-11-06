@@ -11,7 +11,7 @@ npm run dist
 
 `npm run dist` builds the headless server with PyInstaller (`ScriptPlayground-server.spec` → `dist/server-build/server/ScriptPlayground-server.exe`) and then packages the Electron shell with electron-builder. The distributable is **`release\win-unpacked\ScriptPlayground.exe`** (one-folder build; a folder of server resources sits beside it under `resources\server\`). Double-click it to run — one native window, no browser, no console.
 
-The shell spawns the frozen server with `--auto-shutdown`, so the server stops itself 30 seconds after the last UI disconnects even if the window process dies; closing the window normally tree-kills the server immediately. User data (scripts, workspaces, scenarios, designs) persists in `%LOCALAPPDATA%\ScriptPlayground\`; the seeded `demo_bot` sample and bundled resources are read-only.
+The shell spawns the frozen server with `--auto-shutdown`, so the server stops itself 5 seconds after the last UI disconnects even if the window process dies; closing the window normally tree-kills the server immediately. User data (scripts, workspaces, scenarios, designs) persists in `%LOCALAPPDATA%\ScriptPlayground\`; the seeded `demo_bot` sample and bundled resources are read-only.
 
 ### Native notifications and tray
 

@@ -8,6 +8,7 @@ Most checks use throwaway Session objects without network access; the OAuth chec
 """
 
 import asyncio
+import json
 import os
 import pathlib
 import subprocess
@@ -255,6 +256,241 @@ async def test_print_and_send_helpers():
     await run_script(s, "print('to console')\nasync def main():\n    await send('via helper')")
     assert any("to console" in e["text"] for e in s.events)
     assert last_msg(s)["content"] == "via helper"
+
+
+async def test_desktop_shutdown_waits_for_ui_websockets():
+    from aiohttp import web
+
+    import main as server
+
+    original_clients = {sid: set(clients) for sid, clients in server.WS_CLIENTS.items()}
+    original_grace = server._DESKTOP_CLOSE_GRACE
+    original_interval = server._DESKTOP_POLL_INTERVAL
+    server.WS_CLIENTS.clear()
+    server._DESKTOP_CLOSE_GRACE = 0.03
+    server._DESKTOP_POLL_INTERVAL = 0.005
+    app = web.Application()
+    server.enable_auto_shutdown(app)
+    watcher = app[server._DESKTOP_SHUTDOWN_WATCHER]
+    try:
+        await asyncio.sleep(0.02)
+        assert not app[server._DESKTOP_SHUTDOWN_REQUESTED].is_set()
+
+        class ConnectedSocket:
+            closed = False
+
+        first = ConnectedSocket()
+        second = ConnectedSocket()
+        server.WS_CLIENTS.update({"first": {first}, "second": {second}})
+        app[server._DESKTOP_CLIENT_CONNECTED] = True
+        app[server._DESKTOP_LAST_CLIENT_DISCONNECT] = None
+        await asyncio.sleep(0.01)
+        assert not app[server._DESKTOP_SHUTDOWN_REQUESTED].is_set()
+
+        server.WS_CLIENTS["first"].clear()
+        await asyncio.sleep(0.04)
+        assert not app[server._DESKTOP_SHUTDOWN_REQUESTED].is_set()
+        server.WS_CLIENTS["second"].clear()
+        app[server._DESKTOP_LAST_CLIENT_DISCONNECT] = asyncio.get_running_loop().time()
+        await asyncio.wait_for(app[server._DESKTOP_SHUTDOWN_REQUESTED].wait(), timeout=0.2)
+    finally:
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
+        server.WS_CLIENTS.clear()
+        server.WS_CLIENTS.update(original_clients)
+        server._DESKTOP_CLOSE_GRACE = original_grace
+        server._DESKTOP_POLL_INTERVAL = original_interval
+
+
+async def test_second_instance_checks_scriptplayground_health_marker():
+    import socket
+    import threading
+
+    import launcher
+    import main as server
+
+    original_status = server._server_status
+    opened = []
+    original_open = launcher._open_default_browser
+    try:
+        server._server_status = lambda host, port: True
+        launcher._open_default_browser = opened.append
+        assert launcher._existing_server(8741) == 0
+        assert opened == ["http://127.0.0.1:8741/"]
+        server._server_status = lambda host, port: False
+        assert launcher._existing_server(8741) == 1
+        server._server_status = lambda host, port: None
+        assert launcher._existing_server(8741) is None
+    finally:
+        server._server_status = original_status
+        launcher._open_default_browser = original_open
+
+
+    def serve(payload, status=200):
+        ready = threading.Event()
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+
+        def respond():
+            ready.set()
+            connection, _ = listener.accept()
+            connection.recv(4096)
+            body = json.dumps(payload).encode()
+            connection.sendall(
+                f"HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body
+            )
+            connection.close()
+            listener.close()
+
+        thread = threading.Thread(target=respond, daemon=True)
+        thread.start()
+        ready.wait()
+        return port, thread
+
+    port, thread = serve({"application": "ScriptPlayground", "status": "ok"})
+    assert server._server_status("127.0.0.1", port) is True
+    thread.join(timeout=1)
+
+    port, thread = serve({"application": "other", "status": "ok"})
+    assert server._server_status("127.0.0.1", port) is False
+    thread.join(timeout=1)
+
+    with socket.socket() as free:
+        free.bind(("127.0.0.1", 0))
+        unused_port = free.getsockname()[1]
+    assert server._server_status("127.0.0.1", unused_port) is None
+
+
+async def test_health_route_has_app_specific_marker():
+    import main as server
+
+    response = await server.health(None)
+    assert json.loads(response.body) == {"application": "ScriptPlayground", "status": "ok"}
+
+
+async def test_loopback_host_detection():
+    import main as server
+
+    assert server._loopback_host("127.0.0.1:8741")
+    assert server._loopback_host("localhost:8741")
+    assert server._loopback_host("[::1]:8741")
+    assert server._loopback_host("localhost")
+    assert server._loopback_host("::1")
+    assert not server._loopback_host("evil.example:8741")
+    assert not server._loopback_host("0.0.0.0")
+    assert not server._loopback_host("192.168.1.5:8741")
+
+
+async def test_local_origin_guard_blocks_cross_site_and_rebinding():
+    import urllib.error
+    import urllib.request
+
+    from aiohttp import web
+
+    import main as server
+
+    app = server.build_app()
+    runner = web.AppRunner(app, access_log_class=server._AccessLogger)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    base = f"http://127.0.0.1:{port}"
+
+    def post(extra_headers):
+        headers = {"Content-Type": "application/json", **extra_headers}
+        return urllib.request.Request(f"{base}/api/session", data=b"{}", headers=headers)
+
+    try:
+        # Local tools send no Origin: still allowed. Blocking client calls run
+        # in a thread — the server shares this test's event loop.
+        created = json.load(await asyncio.to_thread(urllib.request.urlopen, post({}), timeout=5))
+        assert created.get("sid")
+
+        # The bundled UI posts same-origin: allowed.
+        response = await asyncio.to_thread(urllib.request.urlopen, post({"Origin": base}), timeout=5)
+        assert response.status == 200
+
+        # A drive-by webpage POSTs cross-origin: refused.
+        try:
+            await asyncio.to_thread(urllib.request.urlopen, post({"Origin": "https://evil.example"}), timeout=5)
+            raise AssertionError("cross-origin POST was accepted")
+        except urllib.error.HTTPError as err:
+            assert err.code == 403
+
+        # DNS rebinding shows up as a non-loopback Host: refused.
+        try:
+            await asyncio.to_thread(urllib.request.urlopen, post({"Host": "evil.example"}), timeout=5)
+            raise AssertionError("non-loopback Host was accepted")
+        except urllib.error.HTTPError as err:
+            assert err.code == 403
+    finally:
+        await runner.cleanup()
+
+
+async def test_main_rejects_non_loopback_host():
+    import sys
+
+    import main as server
+
+    original_argv = sys.argv
+    try:
+        sys.argv = ["main.py", "--host", "0.0.0.0"]
+        try:
+            server.main()
+            rejected = False
+        except SystemExit as err:
+            rejected = err.code not in (None, 0)
+        assert rejected, "main() bound a non-loopback host"
+    finally:
+        sys.argv = original_argv
+
+
+async def test_python_floor_is_enforced():
+    import main as server
+
+    for version in ((3, 10, 9), (3, 9, 0)):
+        try:
+            server._ensure_python_floor(version)
+            raise AssertionError(f"floor not enforced for {version}")
+        except SystemExit as err:
+            assert "3.11" in str(err)
+    server._ensure_python_floor()  # current interpreter passes
+
+
+async def test_browser_child_exit_falls_back_only_before_ui_connects():
+    from aiohttp import web
+
+    import launcher
+    import main as server
+
+    class Child:
+        def poll(self):
+            return 0
+
+    app = web.Application()
+    app[server._DESKTOP_CLIENT_CONNECTED] = False
+    app["scriptplayground_browser_started"] = asyncio.get_running_loop().time() - 0.5
+    app["scriptplayground_url"] = "http://127.0.0.1:8741/"
+    opened = []
+    original_open = launcher._open_default_browser
+    try:
+        launcher._open_default_browser = opened.append
+        await launcher._wait_for_browser_exit(Child(), app)
+        assert opened == ["http://127.0.0.1:8741/"]
+        opened.clear()
+        app[server._DESKTOP_CLIENT_CONNECTED] = True
+        await launcher._wait_for_browser_exit(Child(), app)
+        assert opened == []
+
+        app[server._DESKTOP_CLIENT_CONNECTED] = False
+        app["scriptplayground_browser_started"] = asyncio.get_running_loop().time() - 3
+        await launcher._wait_for_browser_exit(Child(), app)
+        assert opened == ["http://127.0.0.1:8741/"]
+    finally:
+        launcher._open_default_browser = original_open
 
 
 async def test_discord_desktop_shell_contract():
@@ -1406,6 +1642,7 @@ async def test_script_library_roundtrip():
 
             code = json.loads((await server.get_script(_FakeReq(match={"name": "my bot"}))).body)["code"]
             assert code == '"""Doc here."""\nx = 1\n'
+            assert list(server.SCRIPTS_DIR.glob("*.tmp")) == []  # atomic saves leave no temp files
 
             r = await server.save_script(_FakeReq(body={"name": "../evil", "code": "1"}))
             assert r.status == 400  # path escape rejected
@@ -2337,97 +2574,6 @@ async def test_data_dir_bootstrap_preserves_user_files():
             assert user_script.read_text(encoding="utf-8") == "# keep my version"
     finally:
         server.DATA_DIR, server.SCRIPTS_DIR, server.WORKSPACES_DIR = original
-
-
-async def test_browser_process_close_stops_server_when_profile_not_in_use():
-    """When the browser child exits and no browser uses the app-mode profile,
-    the launcher still shuts the server down after the close grace.
-    """
-    import launcher
-
-    original_grace, original_interval = launcher._BROWSER_EXIT_GRACE, launcher._BROWSER_POLL_INTERVAL
-    launcher._BROWSER_EXIT_GRACE = 0.05
-    launcher._BROWSER_POLL_INTERVAL = 0.01
-
-    class FakeProcess:
-        exited = False
-
-        def poll(self):
-            return 0 if self.exited else None
-
-    process = FakeProcess()
-    stop = asyncio.Event()
-
-    original_scan = launcher._browser_processes_using_profile
-    try:
-        launcher._browser_processes_using_profile = lambda profile: 0
-        task = asyncio.create_task(launcher._wait_for_browser_exit(process, stop))
-        await asyncio.sleep(0.02)
-        process.exited = True
-        await asyncio.wait_for(task, timeout=0.5)
-        assert stop.is_set()
-    finally:
-        if not task.done():
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        launcher._browser_processes_using_profile = original_scan
-        launcher._BROWSER_EXIT_GRACE, launcher._BROWSER_POLL_INTERVAL = original_grace, original_interval
-
-
-async def test_browser_process_exit_does_not_stop_server_when_profile_still_in_use():
-    """When the browser child exits but a browser process still uses the app-mode
-    profile (Edge delegation to an existing instance), the launcher must keep the
-    server alive and must not set the stop event.
-    """
-    import launcher
-
-    original_grace = launcher._BROWSER_EXIT_GRACE
-    original_interval = launcher._BROWSER_POLL_INTERVAL
-    original_absence_grace = launcher._BROWSER_EXIT_AFTER_CHILD_EXITED_GRACE
-    launcher._BROWSER_EXIT_GRACE = 0.05
-    launcher._BROWSER_POLL_INTERVAL = 0.01
-    launcher._BROWSER_EXIT_AFTER_CHILD_EXITED_GRACE = 0.05
-
-    class FakeProcess:
-        exited = False
-
-        def poll(self):
-            return 0 if self.exited else None
-
-    process = FakeProcess()
-    stop = asyncio.Event()
-
-    original_scan = launcher._browser_processes_using_profile
-    try:
-        # First report the profile in use, then abandon it.
-        abandon_at = asyncio.get_running_loop().time() + 0.10
-
-        def scanning(profile):
-            now = asyncio.get_running_loop().time()
-            if now < abandon_at:
-                return 1 # profile still in use
-            return 0 # profile abandoned
-
-        launcher._browser_processes_using_profile = scanning
-        task = asyncio.create_task(launcher._wait_for_browser_exit(process, stop))
-        await asyncio.sleep(0.05)
-        process.exited = True
-        # The task should still be running: the profile was in use when the child
-        # exited, so the launcher must not have stopped the server yet.
-        await asyncio.sleep(0.05)
-        assert not stop.is_set()
-        assert not task.done()
-        # Let the profile be abandoned and the absence grace elapse.
-        await asyncio.wait_for(task, timeout=1.0)
-        assert stop.is_set()
-    finally:
-        if not task.done():
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        launcher._browser_processes_using_profile = original_scan
-        launcher._BROWSER_EXIT_GRACE = original_grace
-        launcher._BROWSER_POLL_INTERVAL = original_interval
-        launcher._BROWSER_EXIT_AFTER_CHILD_EXITED_GRACE = original_absence_grace
 
 
 async def test_desktop_auto_shutdown_ignores_startup_without_clients():

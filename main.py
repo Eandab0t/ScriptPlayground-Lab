@@ -24,7 +24,7 @@ import threading
 import time
 import webbrowser
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import discord
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
@@ -34,6 +34,43 @@ import bot_runtime
 import bot_worker
 import bridge
 import env_discovery
+
+
+def _loopback_host(netloc: str) -> bool:
+    """True for 127.0.0.1 / localhost / ::1, with or without a port."""
+    if netloc.startswith("["):  # [::1]:8741
+        host = netloc[1:netloc.index("]")]
+    elif netloc.count(":") == 1:  # 127.0.0.1:8741
+        host = netloc.split(":", 1)[0]
+    else:
+        host = netloc  # bare hostname or bare IPv6
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+@web.middleware
+class _LocalOriginGuard:
+    """Refuse browser requests that did not come from the local UI.
+
+    The server executes Python on POST /run, so a drive-by webpage (CSRF) or a
+    DNS-rebinding request must not be able to reach it. Browsers attach an
+    Origin header to cross-site POSTs and to WebSocket upgrades, and DNS
+    rebinding shows up as a non-loopback Host. Local tools (curl, tests, the
+    launcher) send no Origin and are unaffected.
+    """
+
+    async def __call__(self, request: web.Request, handler) -> web.Response:
+        protected = request.method in {"POST", "PUT", "DELETE"} or (
+            request.method == "GET" and request.path.endswith("/ws")
+        )
+        if protected:
+            if not _loopback_host(request.host):
+                return web.Response(status=403, text="ScriptPlayground only accepts loopback requests")
+            origin = request.headers.get("Origin")
+            if origin and urlsplit(origin).netloc != request.host:
+                return web.Response(status=403, text="Cross-origin request refused")
+        return await handler(request)
+
+
 from playground import (
     Session,
     _member_before_snapshot,
@@ -75,6 +112,21 @@ _SCENARIOS_SUBDIR = "scenarios"
 _MAIN_SCRIPT = "demo"
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_ -]{1,50}$")
 
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    """Temp file + fsync + rename so a partial file is never exposed.
+
+    os.fsync() flushes file contents to disk (Windows: _commit) before the
+    rename, improving save durability. The rename itself is atomic, but
+    complete power-loss durability of the filesystem rename is not guaranteed.
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
 # How long a hosted project may take to boot before the worker is killed.
 _PROJECT_BOOT_SECONDS = 90
 _OAUTH_AUTHORIZE_URL = "https://discord.com/oauth2/authorize"
@@ -83,27 +135,38 @@ _OAUTH_USER_URL = "https://discord.com/api/users/@me"
 _AUTH_COOKIE = "scriptplayground_auth"
 _OAUTH_STATE_COOKIE = "scriptplayground_oauth_state"
 _OAUTH_STATE_TTL = 600
-_DESKTOP_CLOSE_GRACE = 30.0
-_DESKTOP_POLL_INTERVAL = 0.25
+_DESKTOP_CLOSE_GRACE = 5.0
+_DESKTOP_POLL_INTERVAL = 2.0
 _AUTO_SHUTDOWN = "scriptplayground_auto_shutdown"
 _DATA_DIR_KEY = "scriptplayground_data_dir"
 _DESKTOP_SHUTDOWN_REQUESTED = "scriptplayground_shutdown_requested"
 
 
-def _server_already_running(host: str, port: int) -> bool:
-    """True when another ScriptPlayground instance already listens on host:port.
-
-    Without this guard, every `python main.py` (or exe launch) with a server
-    still up opened yet another browser tab — the "running a new bot opens a
-    window" complaint. With it, a relaunch focuses nothing and opens nothing.
-    """
+def _server_status(host: str, port: int) -> bool | None:
+    """Return True for ScriptPlayground, False for another listener, None if free."""
+    import http.client
     import socket
 
     try:
-        with socket.create_connection((host, port), timeout=0.4):
-            return True
+        sock = socket.create_connection((host, port), timeout=0.4)
     except OSError:
+        return None
+
+    connection = http.client.HTTPConnection(host, port, timeout=0.4)
+    connection.sock = sock
+    try:
+        connection.request("GET", "/api/health")
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+        return (
+            response.status == 200
+            and isinstance(payload, dict)
+            and payload.get("application") == "ScriptPlayground"
+        )
+    except (OSError, ValueError, http.client.HTTPException):
         return False
+    finally:
+        connection.close()
 
 
 _DESKTOP_CLIENT_CONNECTED = "scriptplayground_client_connected"
@@ -306,6 +369,10 @@ def _notify_event(session: Session, kind: str, payload: dict) -> None:
 
 async def index(_request: web.Request) -> web.FileResponse:
     return web.FileResponse(STATIC_DIR / "index.html")
+
+
+async def health(_request: web.Request) -> web.Response:
+    return web.json_response({"application": "ScriptPlayground", "status": "ok"})
 
 
 async def create_session(_request: web.Request) -> web.Response:
@@ -585,7 +652,7 @@ async def save_workspace_file(request: web.Request) -> web.Response:
     if not code.strip():
         return web.json_response({"ok": False, "error": "Refusing to save empty code."}, status=400)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(code, encoding="utf-8")
+    _write_text_atomic(path, code)
     return web.json_response({"ok": True, "name": filename})
 
 
@@ -641,7 +708,7 @@ async def save_script(request: web.Request) -> web.Response:
     path = SCRIPTS_DIR / f"{name}.py"
     existed = path.exists()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(code, encoding="utf-8")
+    _write_text_atomic(path, code)
     return web.json_response({"ok": True, "name": name, "existed": existed})
 
 
@@ -685,7 +752,7 @@ async def save_scenario(request: web.Request) -> web.Response:
     path = _scenario_path(scenario["name"])
     existed = path.exists()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(scenario, indent=2) + "\n", encoding="utf-8")
+    _write_text_atomic(path, json.dumps(scenario, indent=2) + "\n")
     return web.json_response({"ok": True, "name": scenario["name"], "existed": existed})
 
 
@@ -727,7 +794,7 @@ async def bridge_design_to_code(request: web.Request) -> web.Response:
     if name:
         if not _SAFE_NAME.match(name):
             return web.json_response({"ok": False, "error": "invalid save name"}, status=400)
-        _design_path(name).write_text(json.dumps(body["design"], indent=2), encoding="utf-8")
+        _write_text_atomic(_design_path(name), json.dumps(body["design"], indent=2))
     return web.json_response({"ok": True, "code": code})
 
 
@@ -1616,12 +1683,13 @@ async def _watch_desktop_clients(app: web.Application) -> None:
         if not app[_DESKTOP_CLIENT_CONNECTED]:
             continue
         if not any(WS_CLIENTS.values()):
-            disconnected_at = app[_DESKTOP_LAST_CLIENT_DISCONNECT]
-            if disconnected_at is None:
+            if app[_DESKTOP_LAST_CLIENT_DISCONNECT] is None:
                 app[_DESKTOP_LAST_CLIENT_DISCONNECT] = loop.time()
-            elif loop.time() - disconnected_at >= _DESKTOP_CLOSE_GRACE:
+            elif loop.time() - app[_DESKTOP_LAST_CLIENT_DISCONNECT] >= _DESKTOP_CLOSE_GRACE:
                 app[_DESKTOP_SHUTDOWN_REQUESTED].set()
                 return
+        else:
+            app[_DESKTOP_LAST_CLIENT_DISCONNECT] = None
 
 
 def enable_auto_shutdown(app: web.Application) -> None:
@@ -1645,7 +1713,7 @@ async def on_startup(app: web.Application) -> None:
     _bump._loop = asyncio.get_running_loop()
     if _WORKSPACE_WATCH_TASK is None or _WORKSPACE_WATCH_TASK.done():
         _WORKSPACE_WATCH_TASK = asyncio.create_task(_watch_workspace_files(app))
-    if app.get(_AUTO_SHUTDOWN):
+    if app.get(_AUTO_SHUTDOWN) and _DESKTOP_SHUTDOWN_WATCHER not in app:
         enable_auto_shutdown(app)
 
 
@@ -1683,7 +1751,7 @@ async def on_cleanup(app: web.Application) -> None:
 
 
 def build_app(*, auto_shutdown: bool = False, data_dir: Path | None = None) -> web.Application:
-    app = web.Application()
+    app = web.Application(middlewares=[_LocalOriginGuard()])
     app[_AUTO_SHUTDOWN] = auto_shutdown
     if data_dir is not None:
         configure_data_directory(data_dir)
@@ -1693,6 +1761,7 @@ def build_app(*, auto_shutdown: bool = False, data_dir: Path | None = None) -> w
     app.on_cleanup.append(on_cleanup)
     app.on_shutdown.append(shutdown_sessions)
     app.router.add_get("/", index)
+    app.router.add_get("/api/health", health)
     app.router.add_get("/api/auth/status", auth_status)
     app.router.add_get("/auth/discord/login", discord_login)
     app.router.add_get("/auth/discord/callback", discord_callback)
@@ -1779,9 +1848,17 @@ def _run_frozen_worker() -> bool:
     return True
 
 
+def _ensure_python_floor(version_info: tuple | None = None) -> None:
+    """bot_runtime.py needs asyncio.timeout(), which is 3.11+; fail loudly here."""
+    if (version_info or sys.version_info) < (3, 11):
+        raise SystemExit(f"Python 3.11+ is required (found {sys.version.split()[0]}). "
+                         "See the README Quick start for setup.")
+
+
 def main() -> None:
     if _run_frozen_worker():
         return
+    _ensure_python_floor()
     parser = argparse.ArgumentParser(description="ScriptPlayground local web UI")
     parser.add_argument("--port", type=int, default=8741)
     parser.add_argument("--host", default="127.0.0.1")
@@ -1789,6 +1866,13 @@ def main() -> None:
     parser.add_argument("--auto-shutdown", action="store_true", help="stop after all UI sockets close")
     parser.add_argument("--data-dir", type=Path, help="override the persistent user data directory")
     args = parser.parse_args()
+
+    if not _loopback_host(args.host):
+        parser.error(
+            f"--host {args.host!r} is not a loopback address (127.0.0.1, localhost, ::1). "
+            "ScriptPlayground executes arbitrary Python and has no remote authentication, "
+            "so it refuses to bind a network interface."
+        )
 
     if args.data_dir:
         configure_data_directory(args.data_dir)
@@ -1801,9 +1885,14 @@ def main() -> None:
     data_dir = None
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     url = f"http://{args.host}:{args.port}/"
-    if _server_already_running(args.host, args.port):
+    existing = _server_status(args.host, args.port)
+    if existing is True:
         log.info("ScriptPlayground is already running at %s — not starting a second instance", url)
+        if not args.no_browser:
+            webbrowser.open(url)
         return
+    if existing is False:
+        parser.exit(1, f"error: port {args.port} is in use by another service ({args.host})\n")
     if not args.no_browser:
         threading.Timer(0.6, webbrowser.open, args=(url,)).start()
     log.info("ScriptPlayground listening on %s", url)

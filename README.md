@@ -44,27 +44,19 @@ Playwright starts a local simulator server for the tests; no Discord account or 
 
 ## Desktop app (Electron)
 
-`npm install && npm start` runs ScriptPlayground as a **real desktop application**: one native window, a taskbar icon, its own process — no browser tabs. The Electron shell starts the Python server headlessly (`python -X utf8 main.py --no-browser`), opens a single window pointed at it, and shuts the server down when the window closes. If a server is already listening on the port, the shell attaches to it instead of spawning a second one, so relaunching the app never piles up windows and running bots never opens anything outside the app. Same-origin popups (the Embeder builder) stay inside the window; external links (Discord OAuth sign-in) open in the system browser.
+`npm install && npm start` runs ScriptPlayground as a **real desktop application** (requires Node 24, the version CI tests, and Python 3.11+ with the project dependencies): one native window, a taskbar icon, its own process - no browser tabs. The Electron shell starts the Python server headlessly (`python -X utf8 main.py --no-browser`), opens a single window pointed at it, and shuts the server down when the window closes. If a healthy ScriptPlayground server is already on the port (verified via `/api/health`), the shell attaches to it instead of spawning a second one, so relaunching the app never piles up windows and running bots never opens anything outside the app; an unrelated service on the port is skipped for the next free port. Same-origin popups (the Embeder builder) stay inside the window; external links (Discord OAuth sign-in) open in the system browser.
 
 Environment knobs: `SCRIPTPLAYGROUND_PYTHON` (interpreter path), `SCRIPTPLAYGROUND_PORT` (base port; the shell scans upward if it is busy), `SCRIPTPLAYGROUND_NO_SERVER=1` (attach-only dev mode). Build the distributable with `npm run dist` — it compiles the server bundle via PyInstaller (`ScriptPlayground-server.spec`) and packages everything with electron-builder; output lands in `release/win-unpacked/`, with the server, `static/`, `embeder/`, `scripts/`, `assets/`, and `node_shim/` shipped as read-only resources and user data kept in `%LOCALAPPDATA%\ScriptPlayground` (override with `--data-dir` / `SCRIPTPLAYGROUND_DATA_DIR`).
 
 ### Legacy launchers
 
-The optional Windows executable bundle is built with `scripts/build_windows.ps1`; see `docs/DESKTOP_BUILD.md` for packaging and data-location details. To use the Python launcher instead, double-click `ScriptPlayground.bat`. It activates `.venv` when present, then runs `python launcher.py` in the same console. Chrome/Edge app mode is preferred; when unavailable, the default browser is used and the server shuts down 30 seconds after the last UI WebSocket disconnects. `python main.py` (terminal mode) refuses to start a second instance if one already listens on the port and no longer opens a duplicate browser tab in that case.
+The optional Windows executable bundle is built with `scripts/build_windows.ps1`; see `docs/DESKTOP_BUILD.md` for packaging and data-location details. To use the Python launcher instead, double-click `ScriptPlayground.bat`. It activates `.venv` when present, then runs `python launcher.py` in the same console. Chrome/Edge app mode is preferred; if unavailable or delegated without a connected UI, the default browser opens. In launcher mode, shutdown tracking starts only after a UI WebSocket connects and stops the server when there are no connected UI tabs across all sessions for five seconds (checked every two seconds). Plain `python main.py` keeps running as before. If the port is occupied, a ScriptPlayground health marker opens the existing URL; another service produces a clear error.
 
 #### App-mode shutdown detection (launcher.py)
 
-For app mode, the launcher opens the browser with a dedicated `--user-data-dir` profile and monitors whether any browser process is still anchored to that profile, rather than treating the spawned child process's exit as proof that the app window closed. This matters on Windows: Edge can delegate an `--app=` launch to an already-running Edge instance, which makes the spawned child exit immediately while the app window stays open. The old behavior (shut down ~5s after the child exits) would kill the server under a live window in that case.
+The launcher does not use the spawned Edge/Chrome process as proof that the window closed: those browsers can delegate app-mode launches to an already-running instance and exit while the app window remains open. A child that exits in under two seconds leaves the server running if a UI WebSocket has connected; if no UI has connected yet, the launcher opens the URL in the default browser. Browser process scanning is not used to decide shutdown.
 
-The launcher now uses a three-state check:
-
-- **Profile in use** (one or more `msedge.exe`/`chrome.exe` processes report a `--user-data-dir` ending with our profile leaf) → the server stays alive. The app window is still open, or the launcher cannot prove it is gone.
-- **Profile not in use** (no browser process references the profile) → the server shuts down after the normal close grace.
-- **Scan failed** (no `psutil`, or the process list cannot be read) → the server stays alive. Without a reliable view of other processes' command lines, the launcher cannot prove the app window is gone, so it errs on the side of keeping the server running.
-
-When the profile is in use (or the scan failed) at child exit, the launcher keeps polling. Once the profile is observed as unused, an abandonment grace (`_BROWSER_EXIT_AFTER_CHILD_EXITED_GRACE`, 2.0s) starts; if no browser reclaims the profile during that grace, the server shuts down. The grace clock starts at first confirmed absence, not at child exit, so a long-running app session does not leave the launcher waiting after every transient browser restart.
-
-**Optional dependency — `psutil`.** The profile scan uses `psutil` if it is installed. Without `psutil`, the launcher cannot read other processes' command lines and falls into the conservative "scan failed" path: the server stays alive until it is shut down by the websocket auto-shutdown path (last client disconnects) or by a signal/window close. This is safe against premature shutdown, but it means a packaged build that does not bundle `psutil` will not auto-shutdown on app-window close — it will keep running until the last browser tab disconnects or the process is killed. Package maintainers who want the app-window-close shutdown behavior should ensure `psutil` is available in the runtime environment (for example, add it to `requirements.txt` or the PyInstaller spec).
+Shutdown is based on the app's existing `WS_CLIENTS` sets across all sessions. Tracking starts at the first UI WebSocket connection; after the last connected tab disconnects, the launcher requests shutdown once the global client count remains zero for five seconds, polling about every two seconds. Keeping this global is intentional: a second app tab/session must keep the shared server alive. Closing all browser windows disconnects their tabs; killing the browser process is also expected to disconnect them. Plain `python main.py` does not enable this automatic shutdown behavior.
 
 When using a packaged exe, scripts, workspaces, scenarios, and designs are stored under `%LOCALAPPDATA%\ScriptPlayground` on Windows and survive upgrades. `--data-dir PATH` / `SCRIPTPLAYGROUND_DATA_DIR` can override this location. A first launch seeds built-in scripts, scenarios, and designs without replacing user files.
 
@@ -77,7 +69,7 @@ For Linux desktops, save this as `~/.local/share/applications/scriptplayground.d
 Type=Application
 Name=ScriptPlayground
 Comment=Local Discord bot UI playground
-Exec=/path/to/ScirptPlayground/.venv/bin/python /path/to/ScirptPlayground/launcher.py
+Exec=/path/to/ScriptPlayground/.venv/bin/python /path/to/ScriptPlayground/launcher.py
 Path=/path/to/ScirptPlayground
 Icon=/path/to/ScirptPlayground/assets/icon.svg
 Terminal=true
@@ -86,7 +78,7 @@ Categories=Development;IDE;
 
 ## Beta status and support
 
-This checkout is a **pre-release 1.0 Beta candidate**, not a stable 1.0 release. The `v0.9.0-baseline` tag marks the audit starting point, not this current worktree. Requires Python 3.11+ and discord.py 2.6+ for Components V2. Known limits: one simulated guild with fixed fixture users and roles; no Discord gateway, REST bot transport, or voice; Python scripts are not isolated; and the UI is dark-first and desktop-oriented.
+This checkout is a **1.0 release candidate**. The `v0.9.0-baseline` tag marks the audit starting point, not this current worktree. Requires Python 3.11+ (tested on 3.11 and 3.12) and discord.py 2.6+ for Components V2. Windows is the most-exercised platform (the CI desktop and packaged-release walks run there); the server and browser suites also run on Linux in CI; macOS is untested. Known limits: one simulated guild with fixed fixture users and roles; no Discord gateway, REST bot transport, or voice; Python scripts are not isolated; and the UI is dark-first and desktop-oriented.
 
 Use the support or issue-reporting channel provided by whoever supplied this checkout; this README does not assume a public issue-tracker URL. Include your OS, Python version, launch command, a traceback, and a minimal reproduction. Remove tokens, client secrets, cookies, and webhook URLs from reports.
 
@@ -278,6 +270,10 @@ Members' IDs and names are listed in `playground.py` (`USER_ID`, `MEMBER_IDS`,
 
 ## Good to know
 
+- **Security — the server runs arbitrary Python.** The HTTP server refuses any non-loopback `--host` (it has no remote authentication), and a request guard rejects non-loopback `Host` headers (DNS rebinding) and cross-origin state-changing requests / WebSocket upgrades (drive-by POSTs from web pages). Local tools that send no `Origin` header are unaffected.
+
+  The simulator's Python scripts themselves run with your account's permissions and can access local files, the network, and available credentials — scripts are **not sandboxed**. Run only code you trust.
+
 - **Script Mode handlers run on a dedicated event-loop thread per session.**
   CPU-bound startup code is interrupted by a deadline, while a wedged async
   script is cancelled on timeout; **↻ Restart** also cancels the old runtime
@@ -292,7 +288,7 @@ Members' IDs and names are listed in `playground.py` (`USER_ID`, `MEMBER_IDS`,
   websocket for instant updates and falls back to polling only when it disconnects.
 - The editor autosaves to `localStorage`; **Ctrl+Enter** runs. Cozy message display groups nearby messages from the same author; Compact keeps each message header visible.
 - The chat timeline updates existing message rows by message ID instead of rebuilding the whole list; genuinely new messages use short motion only, and `prefers-reduced-motion` disables entrance/interaction animation.
-- Library **Save** writes to `scripts/<name>.py`; `demo.py` is the fresh-page default.
+- Library **Save** writes to `scripts/<name>.py` (saves use a temporary file, flush its contents to disk with `fsync()` and replace the destination atomically; this prevents partially written files from being exposed and improves save durability — complete power-loss durability of the filesystem rename is not guaranteed); `demo.py` is the fresh-page default.
 - Ephemeral messages render in the timeline with an "only visible to you" note.
 - Message **edits** are tracked (`(edited ×n)`); deleted messages vanish.
 - Mentions (`<@id>`, `<@&id>`, `<#id>`) resolve against the fixture members, roles, and live channels.
